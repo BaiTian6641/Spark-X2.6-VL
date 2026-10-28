@@ -527,9 +527,9 @@ datasets==4.3.0 \
     #   trl
     #   unsloth
     #   unsloth-zoo
-diffusers==0.35.2 \
-    --hash=sha256:30ecd552303edfcfe1724573c3918a8462ee3ab4d529bdbd4c0045f763affded \
-    --hash=sha256:d50d5e74fdd6dcf55e5c1d304bc52cc7c2659abd1752740d736d7b54078b4db5
+diffusers==0.38.0 \
+    --hash=sha256:18e53f9e539096320470f62c6360a6fd5727ff28cffda566265316e13fcdb612 \
+    --hash=sha256:1e094ec5c16f18c42fb89d37f07a94cf9aab3ebbe527ab059c609597b8857626
     # via
     #   -r colab/stage1/requirements.in
     #   unsloth
