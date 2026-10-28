@@ -1,6 +1,6 @@
 # One-shot image/frame full fine-tune on Colab
 
-Use [`Spark_Formal_Full_Finetune.ipynb`](Spark_Formal_Full_Finetune.ipynb). It replaces the former gated all-modality launcher, now archived as [`Spark_Formal_Omni_Gated.ipynb`](Spark_Formal_Omni_Gated.ipynb), and does **not** call its CPU preflight, qualification, instructor, Drive, or checkpoint-recovery gates.
+Open [`Spark_Formal_Full_Finetune.ipynb`](https://colab.research.google.com/github/BaiTian6641/Spark-X2.6-VL/blob/codex/formal-colab/colab/Spark_Formal_Full_Finetune.ipynb) in Colab. The source file is [`colab/Spark_Formal_Full_Finetune.ipynb`](Spark_Formal_Full_Finetune.ipynb). It replaces the former gated all-modality launcher, now archived as [`Spark_Formal_Omni_Gated.ipynb`](Spark_Formal_Omni_Gated.ipynb), and does **not** call its CPU preflight, qualification, instructor, Drive, or checkpoint-recovery gates.
 
 ## What it runs
 
