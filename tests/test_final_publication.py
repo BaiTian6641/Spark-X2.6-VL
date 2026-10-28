@@ -21,6 +21,8 @@ class Hub:
         self.uploads=0
         self.lose_response=False
         self.api_tokens=[]
+        self.missing_lfs=set()
+        self.streams=[]
 
     def whoami(self):
         return {'name':'TassP0lar'}
@@ -41,7 +43,7 @@ class Hub:
         siblings=[]
         if files_metadata:
             for name,payload in self.history[revision].items():
-                lfs=SimpleNamespace(sha256=hashlib.sha256(payload).hexdigest()) if name.endswith('.safetensors') else None
+                lfs=SimpleNamespace(sha256=hashlib.sha256(payload).hexdigest()) if name.endswith('.safetensors') and name not in self.missing_lfs else None
                 siblings.append(SimpleNamespace(rfilename=name,size=len(payload),lfs=lfs))
         return SimpleNamespace(private=self.private,sha=revision,siblings=siblings)
 
@@ -72,6 +74,13 @@ class Store:
         self.receipts.append((read(path),kind))
 
 
+
+def rewrite_release(out):
+    files=manifest(out)
+    files['files']=[f for f in files['files'] if f['path']!='MODEL_RELEASE.json']
+    files['total_bytes']=sum(f['bytes'] for f in files['files'])
+    write(out/'MODEL_RELEASE.json',{'schema_version':1,'campaign_id':CONFIG['campaign_id'],'binding':BOUND,'training_complete':True,**files})
+
 @pytest.fixture
 def publication(tmp_path,monkeypatch):
     out=tmp_path/'final-model'
@@ -90,6 +99,16 @@ def publication(tmp_path,monkeypatch):
 
     monkeypatch.setattr('huggingface_hub.HfApi',api)
     monkeypatch.setattr(publish,'_remote_bytes',lambda repo,path,revision,token,limit:hub.read(path,revision,limit))
+    def head(repo,path,revision,token):
+        payload=hub.history[revision][path]
+        etag=hashlib.sha256(payload).hexdigest() if path.endswith('.safetensors') else hashlib.sha1(payload).hexdigest()
+        return SimpleNamespace(size=len(payload),etag=etag)
+    def stream(repo,path,revision,token,expected_bytes):
+        hub.streams.append(path);payload=hub.history[revision][path]
+        assert len(payload)==expected_bytes
+        return hashlib.sha256(payload).hexdigest()
+    monkeypatch.setattr(publish,'_remote_head',head)
+    monkeypatch.setattr(publish,'_stream_remote_sha256',stream)
     monkeypatch.setitem(__import__('sys').modules,'colab.final.inference',SimpleNamespace(load=lambda path:SimpleNamespace(parameters=lambda:[])))
     monkeypatch.setattr('torch.cuda.empty_cache',lambda:None)
     return campaign,hub,out
@@ -105,6 +124,22 @@ def test_upload_constructs_hfapi_and_verifies_complete_release(publication):
     assert receipt['files_verified']==3 and not receipt['already_committed']
     assert set(hub.history[receipt['commit']])=={'.gitattributes','MODEL_RELEASE.json','model.safetensors','config.json','runtime/inference.py'}
     assert campaign.store.receipts[0][0]==receipt
+
+
+def test_large_regular_release_file_uses_head_and_stream_verification(publication):
+    campaign,hub,out=publication
+    payload=b'{\"payload\":\"'+b'x'*(8*1024**2)+b'\"}'
+    (out/'PARAMETERS.json').write_bytes(payload);rewrite_release(out)
+    receipt=publish.upload_closed_export(campaign,CONFIG,out)
+    assert receipt['files_verified']==4 and hub.streams==['PARAMETERS.json']
+
+
+def test_large_weight_missing_tree_lfs_uses_head_without_download(publication):
+    campaign,hub,out=publication
+    (out/'model.safetensors').write_bytes(b'm'*(8*1024**2+1));rewrite_release(out)
+    hub.missing_lfs.add('model.safetensors')
+    receipt=publish.upload_closed_export(campaign,CONFIG,out)
+    assert receipt['model_lfs_sha256_verified'] and hub.streams==[]
 
 
 @pytest.mark.parametrize('damage',['corrupt','missing'])

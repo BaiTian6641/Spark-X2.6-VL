@@ -123,6 +123,30 @@ def _remote_bytes(repo,path,revision,token,limit):
         raise RuntimeError('Final remote content transport failed: '+path) from None
     finally: session.close()
 
+def _remote_head(repo,path,revision,token):
+    from huggingface_hub import get_hf_file_metadata,hf_hub_url
+    return get_hf_file_metadata(hf_hub_url(repo,path,revision=revision),token=token,timeout=30)
+
+def _stream_remote_sha256(repo,path,revision,token,expected_bytes):
+    import requests
+    from huggingface_hub import hf_hub_url
+    session=requests.Session();session.trust_env=False;digest=hashlib.sha256();total=0
+    try:
+        with session.get(hf_hub_url(repo,path,revision=revision),
+                         headers={'Authorization':'Bearer '+token,'Accept-Encoding':'identity'},
+                         stream=True,timeout=(30,120)) as response:
+            if response.status_code!=200: raise RuntimeError(f'Final remote content read failed (HTTP {response.status_code}): '+path)
+            for chunk in response.iter_content(1024*1024):
+                digest.update(chunk);total+=len(chunk)
+                if total>expected_bytes: raise RuntimeError('Final remote file size verification failed: '+path)
+    except requests.RequestException:
+        raise RuntimeError('Final remote content transport failed: '+path) from None
+    finally:
+        session.close()
+    if total!=expected_bytes: raise RuntimeError('Final remote file size verification failed: '+path)
+    return digest.hexdigest()
+
+
 
 def _verify_remote_release(api,campaign,config,out,release,revision):
     """Verify the complete immutable release, downloading only small Git blobs."""
@@ -145,13 +169,23 @@ def _verify_remote_release(api,campaign,config,out,release,revision):
             if actual!=f['sha256']: raise RuntimeError('Final remote LFS SHA256 verification failed: '+path)
             if path=='model.safetensors': model_lfs=True
             continue
-        # A regular Git blob has only a Git SHA1 in files_metadata. Hash its
-        # actual bytes, but never fetch an accidentally non-LFS multi-GB weight.
-        if f['bytes']>8*1024**2:
-            raise RuntimeError('Large remote file lacks verifiable LFS SHA256 metadata: '+path)
-        payload=_remote_bytes(repo,path,revision,campaign._hf_token,f['bytes'])
-        if len(payload)!=f['bytes'] or hashlib.sha256(payload).hexdigest()!=f['sha256']:
-            raise RuntimeError('Final remote Git blob SHA256 verification failed: '+path)
+        if f['bytes']<=8*1024**2:
+            payload=_remote_bytes(repo,path,revision,campaign._hf_token,f['bytes'])
+            if len(payload)!=f['bytes'] or hashlib.sha256(payload).hexdigest()!=f['sha256']:
+                raise RuntimeError('Final remote Git blob SHA256 verification failed: '+path)
+            continue
+        metadata=_remote_head(repo,path,revision,campaign._hf_token)
+        if metadata.size is not None and metadata.size!=f['bytes']:
+            raise RuntimeError('Final remote HEAD size verification failed: '+path)
+        etag=(metadata.etag or '').lower()
+        if len(etag) not in (40,64) or any(c not in '0123456789abcdef' for c in etag):
+            raise RuntimeError('Large remote file lacks verifiable Hub content metadata: '+path)
+        if len(etag)==64:
+            if etag!=f['sha256']: raise RuntimeError('Final remote HEAD LFS SHA256 verification failed: '+path)
+            if path=='model.safetensors': model_lfs=True
+            continue
+        if _stream_remote_sha256(repo,path,revision,campaign._hf_token,f['bytes'])!=f['sha256']:
+            raise RuntimeError('Final remote streamed Git blob SHA256 verification failed: '+path)
     return {'model_lfs':model_lfs}
 
 
