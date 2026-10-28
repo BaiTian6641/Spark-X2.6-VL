@@ -1,6 +1,6 @@
 # One-shot image/frame full fine-tune on Colab
 
-Use [`Spark_Full_Finetune_OneShot.ipynb`](Spark_Full_Finetune_OneShot.ipynb). It is deliberately separate from the gated all-modality `Spark_Formal_Full_Finetune.ipynb` and does **not** call its CPU preflight, qualification, instructor, Drive, or checkpoint-recovery gates.
+Use [`Spark_Formal_Full_Finetune.ipynb`](Spark_Formal_Full_Finetune.ipynb). It replaces the former gated all-modality launcher, now archived as [`Spark_Formal_Omni_Gated.ipynb`](Spark_Formal_Omni_Gated.ipynb), and does **not** call its CPU preflight, qualification, instructor, Drive, or checkpoint-recovery gates.
 
 ## What it runs
 
@@ -29,7 +29,7 @@ colab/stage1/candidate-cu130-py313.lock
 colab/stage1/prepare_models.py
 colab/stage1/port_trainer.py
 colab/stage1/prepare_public_image_frame.py
-colab/Spark_Full_Finetune_OneShot.ipynb
+colab/Spark_Formal_Full_Finetune.ipynb
 ```
 
 The notebook hard-checks these files and stops with the missing list. Do not include downloaded weights, datasets, checkpoints, secrets, or the workspace `runtime/` directory.

@@ -9,7 +9,7 @@ from colab.stage1.prepare_public_image_frame import choose_splits
 from colab.stage1.port_trainer import materialize
 
 ROOT = Path(__file__).resolve().parents[1]
-NOTEBOOK = ROOT / "colab" / "Spark_Full_Finetune_OneShot.ipynb"
+NOTEBOOK = ROOT / "colab" / "Spark_Formal_Full_Finetune.ipynb"
 
 
 class OneShotNotebookTests(unittest.TestCase):
