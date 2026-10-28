@@ -1,15 +1,15 @@
 # Spark X2.6 multimodal formal full-tuning pipeline
 
-[**Open the formal notebook in Colab**](https://colab.research.google.com/github/BaiTian6641/Spark-X2.6-VL/blob/05a7ad773723e31e4d09f7282b75f93142be4437/colab/Spark_Formal_Full_Finetune.ipynb) · [Review notebook source](https://github.com/BaiTian6641/Spark-X2.6-VL/blob/05a7ad773723e31e4d09f7282b75f93142be4437/colab/Spark_Formal_Full_Finetune.ipynb) · [Complete operator guide](colab/final/RUN.md) · [Release report](reports/spark_multimodal/FORMAL_HF_CHECKPOINT_RELEASE_2026-10-27.md)
+[**Open the formal notebook in Colab**](https://colab.research.google.com/github/BaiTian6641/Spark-X2.6-VL/blob/97c90b4e95bb39e1a330367567d230a6f99a0b7b/colab/Spark_Formal_Full_Finetune.ipynb) · [Review notebook source](https://github.com/BaiTian6641/Spark-X2.6-VL/blob/97c90b4e95bb39e1a330367567d230a6f99a0b7b/colab/Spark_Formal_Full_Finetune.ipynb) · [Complete operator guide](colab/final/RUN.md) · [Release report](reports/spark_multimodal/G4_SETUP_REPAIR_2026-10-27.md)
 
 The complete formal script for the English/Chinese multimodal Spark prototype is ready to run through its hardware and recovery checks. It uses Unsloth Studio's actual **headless training backend**. Its graphical UI is not launched, and custom-model speedup is measured during qualification.
 
-The notebook is only **23,071 bytes**. It downloads a separate 5,019,537-byte source ZIP from runtime commit `669d9ce6ddbfa2d08d31bb4745008fdcd522eedc`, verifies SHA256 `7be91268cc09294d9aa29b9b9e6bcd447268a48764ddbbabf2f27f95d7be2332` and all 43 source files before executing. No large source archive or model weights are embedded in the notebook. [The release receipt](releases/RELEASE.json) binds the source and launcher.
+The notebook is only **24,080 bytes**. It downloads a separate 5,021,404-byte source ZIP from runtime commit `4e90988168355a8a2de7025ed3dbf3bae5804cca`, verifies SHA256 `7df35726d7a16d8fb032b517aa1231efc9b168433712c57af93ede7bb7381148` and all 43 source files before executing. No large source archive or model weights are embedded in the notebook. [The release receipt](releases/RELEASE.json) binds the source and launcher.
 
 ## Complete configured workflow
 
-1. CPU environment, model access, source-grouped data/context audit and private checkpoint destination preflight.
-2. G4 CUDA/Studio whole-model qualification and fresh-VM full optimizer recovery.
+1. G4 environment, model access, source-grouped data/context audit and private checkpoint destination preflight; one environment throughout.
+2. CUDA/Studio whole-model qualification and full optimizer recovery in a new process on the same G4.
 3. Finite bridge alignment, then full Spark vision tuning, temporal/AV tuning, speech/sound understanding, native speech/sound/music generation, and joint full tuning.
 4. Two MiMo-V2.6-Pro instructed replay rounds with matched uniform-replay controls and protected promotion evaluation.
 5. Final protected audit and native samples, offline export reload, then private HF model upload using Colab Secret `HF_TOKEN`.
@@ -35,21 +35,22 @@ Restore uses the receipt's exact HF revision and complete manifest, including we
 
 ## Start the notebook
 
-1. Open the pinned link above on **CPU**. Enable notebook access to `HF_TOKEN` and `OPENCODE_API_KEY` in Colab Secrets. HF needs component read access and write access to both private model repositories; do not put either secret in cells or files.
-2. Run source bootstrap, operator configuration, Google authentication and CPU setup/preflight in order. Keep active work under `/content/spark-formal`. Drive mounting is optional for browsing cold results.
-3. Select the G4 Blackwell runtime, enter its **current** CU balance/rate, enable `INSTALL_CUDA_ENVIRONMENT`, then run `RUN_QUALIFICATION` once. Preserve its emitted profile receipt.
-4. On a fresh VM, repeat setup and select `RUN_MODE='train'` with that profile receipt. The complete optimizer continuation check runs before the formal stages. Later sessions use `RUN_MODE='resume'` plus the exact verified checkpoint receipt.
-5. If upload failed while local files still exist, use `RETRY_CHECKPOINT_DIRECTORY` in the CPU recovery cell first. `DISCOVER_CHECKPOINTS` lists cold receipts and the latest verified HF checkpoint.
+1. Open the pinned link above with **G4** selected. Enable notebook access to `HF_TOKEN` and `OPENCODE_API_KEY` in Colab Secrets. HF needs component read access and write access to both private model repositories.
+2. Run source bootstrap, configuration, authentication and **Install the G4 environment once**. All commands use `/content/spark-formal/env-cuda`; matching packages are reused. Drive is cold storage only.
+3. Run the metadata/access preflight. Enter the current CU balance/rate, then enable `RUN_QUALIFICATION` once.
+4. Keep this G4. Leave `PROFILE_RECEIPT=None` and `RESUME_RECEIPT=None`, then set `RUN_MODE='train'`. The local profile receipt is selected automatically, and a new subprocess checks two actual continuation updates from a full checkpoint before formal stages. A later real interruption uses `resume` with the full exact HF checkpoint receipt. Neither field takes a Drive folder ID.
+5. If an upload failed while local files exist, use `RETRY_CHECKPOINT_DIRECTORY` in this same environment first. `DISCOVER_CHECKPOINTS` lists cold receipts and the latest verified HF checkpoint.
 6. The completed campaign uploads the private inference package automatically. `MODEL_UPLOAD_RECEIPT.json` identifies the exact verified final commit.
 
 The $50 instructor and 1000 CU campaign limits remain configured. OpenCode Go's provider/account dataset-review eligibility field is still explicit in the guide; the script does not invent evidence or switch the chosen provider. Full CUDA qualification and recovery alone do not require instructor calls. GPU flags and `RUN_MODE='inspect'` initially prevent an accidental launch merely by opening the notebook.
 
 ## Validation and current evidence
 
-**71 focused tests passed for this release:** [68 runtime/data/native-component/checkpoint/notebook tests](validation/colab-formal-hf-checkpoint-tests-2026-10-27.log) and [three real isolated CPU bootstrap tests](validation/colab-formal-hf-bootstrap-tests-2026-10-27.log). Coverage includes real CPU optimizer serialization, repeated saves after cleanup, simulated Hub upload failures and lost responses, every-file remote verification, older-revision restore, receipt-backup failure, concurrency exclusion, CPU-only retry, cursor/cache behavior, native component gradients and the actual packaged notebook's hashes/import closure. One upstream Diffusers deprecation warning remains.
+**53 focused checks passed:** [42 runtime/native/checkpoint tests](validation/colab-g4-runtime-tests-2026-10-27.log), [four real isolated bootstrap tests](validation/colab-g4-bootstrap-tests-2026-10-27.log), and [seven packaged notebook tests](validation/colab-g4-notebook-tests-2026-10-27.log). One upstream Diffusers deprecation warning remains. The new clean-environment test reproduces the source-only SoX failure under the old wheel-only policy and verifies the narrow, hash-locked exception.
 
-The previous source release passed actual Colab CPU preflight and its chat-template audit. This source revision adds the checkpoint destination and must pass its own CPU preflight. The full native G4 campaign, live multi-gigabyte HF checkpoint transfer and trained multimodal quality are **not yet qualified**. No GPU training, instructor request or trained-model upload was performed while constructing this release. The final model card reports actual results and pending human audio review; it does not equate curriculum completion with broad capability acceptance.
+**Actual Colab G4 environment PASS:** all179 packages installed; `pip check` passed; CPython3.13.16, Torch2.11.0+cu130, native SM120 BF16 attention forward/backward and Unsloth Studio training-backend import passed. [Observed environment evidence](validation/colab-g4-environment-2026-10-27.json). This does not establish complete-model memory fit, live full-checkpoint transfers or multimodal quality. No model training, instructor request or trained-model upload was performed during this repair.
 
+The former setup failed because PyPI publishes `sox==1.5.0` only as an sdist. It is now the only allowed source build; its source and isolated build dependencies remain hash-checked. All other packages still require wheels. Installer stdout/stderr are captured in Colab and bounded sanitized logs. The workflow no longer requires a CPU runtime or deliberate VM replacement; recovery records `fresh_vm` accurately. An unused same-campaign checkpoint destination can follow a setup source repair only after checking that its entire bounded reachable history contains identity files alone. Current or historical training payloads prevent automatic rebinding.
 The earlier `ensurepip` and Jinja2 failures remain repaired: a hash-pinned external uv bootstrap creates/repairs isolated environments and synchronizes complete CPU/CUDA locks without replacing kernel packages. Child stdout/stderr are captured and sanitized, stopped reasons are visible, and Ctrl-C drains the checkpoint output. [Historical repair evidence](reports/spark_multimodal/COLAB_PREFLIGHT_REPAIR_2026-10-27.md) is retained separately.
 
 ## Rebuild and provenance

@@ -1,0 +1,41 @@
+{
+  "scope": "Observed through Colab notebook UI; environment only",
+  "observed_gpu_memory_mib": 97887,
+  "driver": "580.82.07",
+  "installation": {
+    "pinned_packages": 179,
+    "pip_check_passed": true,
+    "installer_exit": 0,
+    "root_cause": "sox==1.5.0 has no usable wheels under only-binary all",
+    "source_only_exception": "sox",
+    "source_and_build_dependency_hashes_required": true
+  },
+  "doctor": {
+    "event": "environment_ready",
+    "python": "3.13.16",
+    "torch": "2.11.0+cu130",
+    "cuda": "13.0",
+    "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "capability": [
+      12,
+      0
+    ],
+    "bf16": true,
+    "studio_backend_file": "/content/spark-formal/env-cuda/lib/python3.13/site-packages/studio/backend/core/training/trainer.py",
+    "studio_backend_sha256": "1b8410baf9d59663a3e029674c0f22e0cf82b713c48a0eb97b0e8281b51a6dd6",
+    "versions": {
+      "unsloth": "2026.10.9",
+      "unsloth-zoo": "2026.10.9",
+      "transformers": "4.57.3",
+      "trl": "0.23.1",
+      "accelerate": "1.12.0",
+      "bitsandbytes": "0.50.2",
+      "diffusers": "0.35.2",
+      "qwen-tts": "0.1.1"
+    },
+    "actual_cuda_sdpa_backward": true,
+    "full_native_model_qualified": false
+  },
+  "training_started": false,
+  "instructor_calls": 0
+}
