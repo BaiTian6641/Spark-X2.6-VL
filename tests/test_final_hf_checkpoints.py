@@ -26,6 +26,7 @@ class Hub:
         self.exists=True; self.history[self.head]={'.gitattributes':b'*.pt filter=lfs'}
     def model_info(self,*a,**kw): return SimpleNamespace(private=self.private,sha=self.head)
     def list_repo_files(self,*a,revision=None,**kw): return list(self.history[revision or self.head])
+    def list_repo_commits(self,*a,**kw): return [SimpleNamespace(commit_id=key) for key in self.history]
     def create_commit(self,repo,operations,parent_commit=None,**kw):
         self.calls+=1
         if self.fail: raise RuntimeError('simulated upload failure')
@@ -122,6 +123,24 @@ def test_public_or_foreign_repository_is_never_overwritten(store):
     hub.history[hub.head]['unrelated.txt']=b'keep'
     with pytest.raises(RuntimeError,match='Unrelated'):hf.commit(snapshot(hf.root))
     assert hub.history[hub.head]['unrelated.txt']==b'keep'
+
+
+def test_unused_same_campaign_destination_can_follow_setup_source_repair(store):
+    hf,hub=store;original=hf.ensure_repository()
+    hf.owner={**hf.owner,'binding':{**BOUND,'source_archive_sha256':'c'*64}}
+    updated=hf.ensure_repository()
+    assert updated!=original
+    assert all(not name.startswith(PREFIX) for name in hub.history[updated])
+    assert json.loads(hub.history[original]['CHECKPOINT_REPOSITORY.json'])['binding']==BOUND
+
+
+def test_source_repair_never_rebinds_existing_or_historically_trained_repo(store):
+    hf,hub=store;hf.commit(snapshot(hf.root))
+    hf.owner={**hf.owner,'binding':{**BOUND,'source_archive_sha256':'c'*64}}
+    with pytest.raises(RuntimeError,match='different campaign/source'):hf.ensure_repository()
+    # Even if an operator cleared current files, old trained history is protected.
+    hub.create_commit(hf.repo,parent_commit=hub.head,operations=[CommitOperationDelete(n) for n in hub.history[hub.head] if n.startswith(PREFIX)])
+    with pytest.raises(RuntimeError,match='trained or unverified'):hf.ensure_repository()
 
 
 def test_drive_receipt_failure_preserves_both_slots_and_retry_reuses_hf_commit(store):

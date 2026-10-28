@@ -40,7 +40,7 @@ def build(runtime_revision=None, runtime_only=False):
 
 This is the formal source-bound campaign notebook. It implements SigLIP2 So400m NaFlex with tiles and spatial downshuffle, V-JEPA2.1 motion, Whisper/CLAP audio input, Qwen native speech output, Stable Audio native sound/music output, full-parameter stages, two bounded MiMo instructor-guided replay comparisons, resumable Hugging Face checkpoints and private HF model publication.
 
-**Start on CPU.** Keep model/data random I/O on VM-local disk. The released dataset has304,861 original instructions; complete bounded music-score views produce315,359 supervised views before source-group splitting. The local media cache is23GB; the free floor is44GB. Only two complete checkpoint slots can coexist while saving; after the new HF snapshot and its Drive receipt are verified, older local checkpoints are purged and the newest remains. A full Git LFS dataset clone is prohibited by this disk design.
+**Select G4 directly and keep the same VM.** Setup, preflight, qualification and training use one isolated CUDA environment. Keep model/data random I/O on VM-local disk. The released dataset has304,861 original instructions; complete bounded music-score views produce315,359 supervised views before source-group splitting. The local media cache is23GB; the free floor is44GB. Only two complete checkpoint slots can coexist while saving; after the new HF snapshot and its Drive receipt are verified, older local checkpoints are purged and the newest remains. A full Git LFS dataset clone is prohibited by this disk design.
 
 | Purpose | Destination | Local behavior |
 |---|---|---|
@@ -49,9 +49,9 @@ This is the formal source-bound campaign notebook. It implements SigLIP2 So400m 
 | Completed inference model | Private `TassP0lar/SparkX2.6-MM` | Export and upload after final evaluation |
 | Receipts, reports and instructor ledger | Your cold Drive project | Small closed uploads, no training I/O |
 
-**Cell sequence:** CPU setup/preflight → G4 install/qualification → fresh G4 recovery and `RUN_MODE='train'` → `RUN_MODE='resume'` on later sessions. Keep the emitted profile/checkpoint receipts. Upload failures have a separate CPU-only retry cell below. This is the complete staged script; no modality is removed to turn it into a trial.
+**Cell sequence:** G4 setup → metadata/access preflight → qualification → `RUN_MODE='train'` on this same VM → `RUN_MODE='resume'` after a later interruption. Recovery runs in a new subprocess; no deliberate VM replacement or CPU runtime switch is required. Keep emitted receipts; the same-VM profile is loaded automatically. Upload failures have an upload-only retry cell below. This is the complete staged script; no modality is removed to turn it into a trial.
 
-**Evidence boundary:** the source/CPU component tests do not certify the complete CUDA model. This notebook must earn its whole-model and fresh-VM recovery gates. A single notebook does not guarantee one uninterrupted VM session or successful multimodal quality within1000CU. It never silently reduces the curriculum to fit.
+**Evidence boundary:** the source/CPU component tests do not certify the complete CUDA model. This notebook must earn its whole-model and new-process recovery gates. Recovery records whether the VM actually changed; same-VM recovery is never labeled fresh-VM proof. A single notebook does not guarantee one uninterrupted VM session or successful multimodal quality within1000CU. It never silently reduces the curriculum to fit.
 
 Default final destination is the **private model repository** `TassP0lar/SparkX2.6-MM`; the public dataset namespace is separate. No instructor call or training happens merely by opening this notebook. Read the downloaded `RUN.md` after bootstrap.
 
@@ -141,9 +141,9 @@ if MOUNT_DRIVE_FOR_BROWSING:
     from google.colab import drive
     drive.mount('/content/drive')
 ''')
-    md('''## Install isolated CPU tooling, then preflight
+    md('''## Install the G4 environment once
 
-This cell installs into a separate environment. It does not replace the notebook kernel's PyTorch. A wheel-and-binary-hash-verified `uv` installer creates pipless virtual environments and synchronizes complete package locks, including a pinned `pip`. System `ensurepip` is not needed. An earlier isolated environment with Python but no pip is repaired in place. Setup records readiness only after the complete installation and dependency check pass. On a new VM repeat this setup and CPU preflight before GPU recovery.
+Start with G4 selected. This cell installs one isolated `env-cuda` and runs the native CUDA/Studio health check. All subsequent commands use this environment, including metadata preflight. It does not replace the notebook kernel's PyTorch. A hash-verified `uv` installer creates a pipless environment and synchronizes the complete package lock. Matching packages are reused on a retry. The source-only `sox==1.5.0` dependency is the sole source-build exception; its source archive and isolated build dependencies remain hash-checked. Other packages must have wheels. Installer stdout/stderr are captured just like campaign output.
 
 Campaign stdout and stderr stream into this cell, with secret values and signed URL queries removed. Each invocation also saves a bounded sanitized log under `/content/spark-formal/logs`. A failure reports its exit code and actual reason. If the reason is `GatedRepo`, review the Stable Audio access form using the HF account that owns your token; once access is granted, rerun this cell without resetting the VM. A fine-grained token must also permit reading that gated model.''')
     code('''import importlib.util, subprocess, shutil
@@ -152,16 +152,22 @@ assert sys.version_info[:2] == (3,13), 'This reviewed lock targets CPython3.13; 
 _spec = importlib.util.spec_from_file_location('spark_environment_bootstrap', SOURCE_ROOT/'colab/final/bootstrap.py')
 _bootstrap = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_bootstrap)
-CPU_PYTHON = _bootstrap.install_environment(WORK, SOURCE_ROOT, 'cpu', base_python=sys.executable)
+assert shutil.which('nvidia-smi'), 'Select G4 in Runtime > Change runtime type before setup'
+if not shutil.which('sox'):
+    _bootstrap._run_checked(['apt-get','update','-qq'], WORK, _bootstrap._environment(WORK), 'apt-update')
+    _bootstrap._run_checked(['apt-get','install','-y','-qq','sox','libsndfile1'], WORK, _bootstrap._environment(WORK), 'apt-audio')
+CUDA_PYTHON = _bootstrap.install_environment(WORK, SOURCE_ROOT, 'cuda', base_python=sys.executable)
 _spec = importlib.util.spec_from_file_location('spark_campaign_launcher', SOURCE_ROOT/'colab/final/launcher.py')
 _launcher = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_launcher)
 
 def run_campaign(mode, gpu=False, profile_receipt=None, resume_receipt=None, checkpoint_directory=None):
-    python = str(WORK/('env-cuda' if gpu else 'env-cpu')/'bin/python')
+    python = str(WORK/'env-cuda/bin/python')
     args = [python,'-m','colab.final.run',mode,'--config',str(CONFIG_PATH),'--source-sha',SOURCE_SHA256]
     for option, value in (('--profile-receipt',profile_receipt),('--resume-receipt',resume_receipt)):
         if value is not None:
+            if not isinstance(value,dict):
+                raise ValueError(option+' needs the complete receipt JSON object, not a Drive folder ID')
             receipt_path = WORK/(option[2:]+'.json')
             receipt_path.write_text(json.dumps(value))
             args += [option,str(receipt_path)]
@@ -173,45 +179,42 @@ def run_campaign(mode, gpu=False, profile_receipt=None, resume_receipt=None, che
     return _launcher.run_process(args, cwd=SOURCE_ROOT, env=env,
         secrets={'HF_TOKEN':HF_SECRET,'OPENCODE_API_KEY':INSTRUCTOR_SECRET}, log_path=log_path)
 
-run_campaign('cpu')
+run_campaign('doctor', gpu=True)
 ''')
-    md('''## GPU environment and qualification
+    md('''## Preflight and qualification on this G4
 
-Choose the G4 Blackwell runtime only after CPU preflight. Record its current usage balance/rate in configuration. This release targets SM120, at least90GB GPU memory and60GB RAM. It fails on a different assignment instead of silently switching to LoRA or low-bit training.
+Keep the current G4 and run metadata/access preflight below. It does not allocate model weights or make instructor calls. Record the current usage balance/rate before qualification. This release targets SM120, at least90GB GPU memory and60GB RAM. It fails on a different assignment instead of silently switching to LoRA or low-bit training.
 
 The actual Studio backend ships inside the pinned Unsloth wheel. Its full graphical UI extra conflicts with the reviewed Transformers version, so this campaign uses Studio's real headless training backend. Torch SDPA, BF16 compute, gradient checkpointing and AdamW8bit are active; custom Spark speed is measured, not assumed. This cell may take time and incurs runtime charges while a GPU is attached.''')
-    code('''INSTALL_CUDA_ENVIRONMENT = False  # Set True after switching to G4 and entering current usage observations.
-if INSTALL_CUDA_ENVIRONMENT:
-    assert CONFIG['observed_compute_balance'] and CONFIG['observed_cu_per_hour'], 'Update and rerun operator configuration'
-    _preflight = json.loads((WORK/'PREFLIGHT.json').read_text())
-    assert _preflight.get('passed') and _preflight.get('source_archive_sha256') == SOURCE_SHA256, 'CPU preflight must pass for this source on this VM first'
-    # Optional native SoX executable used by the upstream package; decoding in
-    # this pipeline uses SoundFile/PyAV and preserves the released waveforms.
-    if not shutil.which('sox'):
-        subprocess.run(['apt-get','update','-qq'], check=True)
-        subprocess.run(['apt-get','install','-y','-qq','sox','libsndfile1'], check=True)
-    CUDA_PYTHON = _bootstrap.install_environment(WORK, SOURCE_ROOT, 'cuda', base_python=sys.executable)
-    run_campaign('doctor', gpu=True)
+    code('''# CPU work inside the same CUDA environment; no runtime or environment switch.
+run_campaign('cpu')
 ''')
     code('''RUN_QUALIFICATION = False  # Run once on the first GPU VM; do not repeat after it passes.
 if RUN_QUALIFICATION:
+    assert CONFIG['observed_compute_balance'] and CONFIG['observed_cu_per_hour'], 'Refresh and rerun operator configuration'
     run_campaign('qualify', gpu=True)
-    print('SAVE THE EMITTED QUALIFICATION PROFILE RECEIPT before replacing this VM.')
+    print('Qualification finished. Keep this G4; the next cell loads its profile receipt automatically.')
 ''')
-    md('''## Fresh-VM recovery, formal training, and later resume
+    md('''## Formal training on this G4, and later resume
 
-After qualification, save its emitted **profile receipt**, reconnect a fresh VM, run source/bootstrap/config/auth/CPU setup again and install the CUDA environment. Enter that profile receipt below. `train` first restores the fully populated qualification checkpoint, reproduces two native continuation updates, and verifies recovery across boot IDs. It then restores the original initial snapshot and begins formal stages. This is the deliberate recovery qualification before a long campaign.
+After qualification, leave `PROFILE_RECEIPT=None` and `RESUME_RECEIPT=None`, then select `RUN_MODE='train'`. The profile receipt is read from this VM automatically. `train` launches a new subprocess, restores the complete qualification checkpoint and reproduces two native continuation updates against its saved optimizer/RNG oracle. It then restores the original initial snapshot and begins formal stages. Keep the same G4. The proof records `fresh_vm=False` when the VM did not change.
+
+After a later VM loss, paste the complete **qualification-profile receipt JSON object**, and for `resume` also the complete **HF checkpoint receipt JSON object**. Neither field takes a Drive folder ID. A profile does not exist until qualification succeeds; a preflight receipt cannot replace it.
 
 If a later session ends, use `resume` with the last exact **HF checkpoint receipt** (not a profile/evaluation/unfinished upload). The receipt pins a commit and complete manifest; loading a moving `main` branch is not a resume. Weights, optimizer, scheduler, RNG, stage and optimizer-committed data cursor are restored. Instructor intents are reconciled from Drive; an ambiguous POST requires operator/provider reconciliation. The $50 ceiling includes accumulated provider cash/list/allowance exposure.
 
 The full-stage projection must fit the current authorized CU balance plus reserve. Watch `training`, `hf_checkpoint_committed`, `local_checkpoint_purged`, `qualification_complete` and `final_model_uploaded` events. A stop event is not completion. The entire six-stage curriculum and two controlled RSI rounds are configured below the launcher in the versioned runtime.''')
-    code('''PROFILE_RECEIPT = None  # Paste the nonsecret committed qualification-profile receipt dict.
+    code('''PROFILE_RECEIPT = None  # Auto-loads this VM's profile; paste its complete receipt dict only after VM loss.
 RESUME_RECEIPT = None   # For a later interruption, paste an exact committed checkpoint receipt dict.
 RUN_MODE = 'inspect'    # 'inspect', 'train', 'resume', or 'recover' (recovery only).
 if RUN_MODE == 'inspect':
     print('No GPU training launched. Select a mode explicitly when ready.')
 elif RUN_MODE in ('train','resume','recover'):
-    assert PROFILE_RECEIPT, 'The qualification-profile receipt is required'
+    if PROFILE_RECEIPT is None and (WORK/'QUALIFICATION_RECEIPT.json').exists():
+        PROFILE_RECEIPT = json.loads((WORK/'QUALIFICATION_RECEIPT.json').read_text())
+    assert isinstance(PROFILE_RECEIPT,dict), 'Finish qualification first, or paste its complete receipt JSON object; a Drive folder ID is not a receipt'
+    if RUN_MODE == 'resume':
+        assert isinstance(RESUME_RECEIPT,dict), 'Resume needs the complete verified HF checkpoint receipt JSON object'
     assert CONFIG['observed_compute_balance'] and CONFIG['observed_cu_per_hour'], 'Refresh current usage observations'
     if RUN_MODE != 'recover':
         assert CONFIG['instructor_route_eligibility_receipt'], 'Resolve the provider/account dataset-review eligibility before formal training'
@@ -222,7 +225,7 @@ else:
 ''')
     md('''## Checkpoint discovery and upload-only recovery
 
-Use this cell only after the training process has exited. If an HF upload or its small Drive receipt failed, keep the VM and its local checkpoint. Enter the exact closed directory from the stopped run, then retry its upload with CPU tooling. This performs no optimizer steps or teacher calls. Success verifies every remote file, backs up the receipt and purges older verified local checkpoints; use the resulting receipt with `RUN_MODE='resume'`.
+Use this cell only after the training process has exited. If an HF upload or its small Drive receipt failed, keep the VM and its local checkpoint. Enter the exact closed directory from the stopped run, then retry its upload in this same environment. This performs no optimizer steps or teacher calls. Success verifies every remote file, backs up the receipt and purges older verified local checkpoints; use the resulting receipt with `RUN_MODE='resume'`.
 
 The HF branch updates `checkpoint/` atomically. Earlier exact commits remain recoverable for qualification and RSI; the script never squashes their history. Updating a branch does **not** reclaim HF history quota. HF storage/access/quota failures stop cleanup and preserve local files. Old local snapshots, not remote history, are purged.''')
     code('''DISCOVER_CHECKPOINTS = False
@@ -245,7 +248,7 @@ for name in ('PREFLIGHT.json','ENVIRONMENT.json','FULL_RECOVERY_PROOF.json','MOD
         value=json.loads(path.read_text())
         if name=='PREFLIGHT.json': value={k:v for k,v in value.items() if k not in ('context','drive_quota')}
         print(name, json.dumps(value,indent=2))
-# To find cold commits after VM loss, with configuration/auth/CPU setup completed:
+# To find cold commits after VM loss, with configuration/auth/setup completed:
 # run_campaign('discover')
 ''')
     nb={'nbformat':4,'nbformat_minor':5,'metadata':{'colab':{'name':'Spark_Formal_Full_Finetune.ipynb','provenance':[]},'kernelspec':{'display_name':'Python3','language':'python','name':'python3'},'language_info':{'name':'python'},'spark_formal':{'source_sha256':source_sha,'source_commit':runtime_revision,'source_url':source_url,'training_executed':False,'teacher_requests_made':0,'dataset_revision':json.loads((FINAL/'dataset.lock.json').read_text())['media_revision']}},'cells':cells}

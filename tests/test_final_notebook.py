@@ -98,7 +98,7 @@ def test_notebook_runner_uses_the_captured_output_helper(tmp_path,monkeypatch):
     nb=json.load(open('colab/Spark_Formal_Full_Finetune.ipynb'))
     tree=ast.parse(''.join(nb['cells'][8]['source']))
     runner=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='run_campaign')
-    python=tmp_path/'env-cpu/bin/python';python.parent.mkdir(parents=True);python.symlink_to(sys.executable)
+    python=tmp_path/'env-cuda/bin/python';python.parent.mkdir(parents=True);python.symlink_to(sys.executable)
     # Execute the actual notebook wrapper against a real child module, replacing
     # only the heavyweight campaign. Child fd output must reach Python capture.
     module=tmp_path/'colab/final';module.mkdir(parents=True)
@@ -112,3 +112,23 @@ def test_notebook_runner_uses_the_captured_output_helper(tmp_path,monkeypatch):
     with contextlib.redirect_stdout(stream): state['run_campaign']('cpu')
     assert 'child stdout' in stream.getvalue() and 'child stderr' in stream.getvalue()
     assert 'test-credential' not in stream.getvalue()
+
+
+def test_training_cell_selects_same_vm_profile_and_rejects_folder_ids(tmp_path):
+    import pytest
+    nb=json.load(open('colab/Spark_Formal_Full_Finetune.ipynb'))
+    code=''.join(nb['cells'][13]['source']).replace("RUN_MODE = 'inspect'", "RUN_MODE = 'train'")
+    calls=[]
+    state=dict(WORK=tmp_path,json=json,CONFIG={'observed_compute_balance':900,'observed_cu_per_hour':8.71,
+               'instructor_route_eligibility_receipt':{'test_only':True}},INSTRUCTOR_SECRET='test-key',
+               run_campaign=lambda *a,**kw:calls.append((a,kw)))
+    with pytest.raises(AssertionError,match='Finish qualification first'):exec(code,state)
+    assert not calls
+    receipt={'kind':'qualification-profile','commit_file_id':'profile-id','commit_sha256':'a'*64}
+    (tmp_path/'QUALIFICATION_RECEIPT.json').write_text(json.dumps(receipt))
+    exec(code,state)
+    assert calls[0][1]['profile_receipt']==receipt and calls[0][1]['resume_receipt'] is None
+    calls.clear()
+    with pytest.raises(AssertionError,match='Drive folder ID'):
+        exec(code.replace('PROFILE_RECEIPT = None',"PROFILE_RECEIPT = 'folder-id'"),state)
+    assert not calls

@@ -9,13 +9,13 @@ import sys
 from pathlib import Path
 
 import pytest
-from colab.final.bootstrap import install_environment
+from colab.final.bootstrap import install_environment, installer, sync_arguments, _environment
 
 ROOT = Path(__file__).resolve().parents[1]
 pytestmark = pytest.mark.skipif(sys.version_info[:2] != (3, 13), reason="Reviewed CPython 3.13 environment")
 
 
-def test_actual_python_without_pip_recovers_and_repeated_setup_preserves_work(tmp_path):
+def test_actual_python_without_pip_recovers_and_repeated_setup_preserves_work(tmp_path, capsys):
     work = tmp_path / 'work'
     target = work / 'env-cpu'
     # This is the state left by a failed venv ensurepip: Python works, pip is absent.
@@ -50,8 +50,11 @@ assert tokenizer.apply_chat_template([{'role':'user','content':'hello'}],tokeniz
     bad_source.mkdir(parents=True)
     (bad_source/'bootstrap.lock.json').write_bytes((ROOT/'colab/final/bootstrap.lock.json').read_bytes())
     (bad_source/'requirements-preflight.lock').write_text('pip==25.3 --hash=sha256:'+'0'*64+'\n')
-    with pytest.raises(subprocess.CalledProcessError):
+    with pytest.raises(RuntimeError, match='Environment setup'):
         install_environment(work, bad_source.parents[1], 'cpu')
+    assert 'hash' in capsys.readouterr().out.lower()
+    logs='\n'.join(p.read_text() for p in (work/'logs').glob('environment-*.log'))
+    assert 'Hash mismatch' in logs or 'hash mismatch' in logs
     assert not (target/'.spark-environment-ready.json').exists()
     assert saved.read_bytes() == b'resumable-artifact-must-survive'
     install_environment(work, ROOT, 'cpu')
@@ -80,3 +83,30 @@ def test_foreign_directory_and_symlink_environment_are_preserved(tmp_path):
     with pytest.raises(ValueError,match='escapes|symlink'):
         install_environment(second, ROOT, 'cpu')
     assert sentinel.read_bytes()==b'keep'
+
+
+def test_pristine_cuda_lock_resolution_and_real_source_only_sox_build(tmp_path):
+    """No installed packages may mask a missing wheel; no GPU packages download."""
+    import re
+    work=tmp_path/'resolve';work.mkdir()
+    uv,_=installer(work,ROOT);env=_environment(work)
+    target=work/'empty'
+    subprocess.run([str(uv),'venv','--python',sys.executable,'--no-python-downloads',str(target)],check=True,env=env)
+    lock=ROOT/'colab/final/requirements.lock'
+    old=[str(uv),'pip','sync','--dry-run','--no-cache','--python',str(target/'bin/python'),
+         '--require-hashes','--only-binary',':all:','--torch-backend','cu130',str(lock)]
+    failure=subprocess.run(old,env=env,capture_output=True,text=True)
+    assert failure.returncode and 'sox==1.5.0 has no usable wheels' in failure.stderr
+    args=sync_arguments(uv,target/'bin/python',lock,'cuda')
+    success=subprocess.run(args+['--dry-run'],env=env,capture_output=True,text=True)
+    assert success.returncode==0, success.stderr
+    assert not (target/'lib/python3.13/site-packages/torch').exists()
+    # Actually build/import SoX in isolation with the exact locked source and
+    # hashed build dependencies, without installing the heavyweight CUDA stack.
+    source=tmp_path/'small-source';final=source/'colab/final';final.mkdir(parents=True)
+    (final/'bootstrap.lock.json').write_bytes((ROOT/'colab/final/bootstrap.lock.json').read_bytes())
+    blocks=re.split(r'(?=^[A-Za-z0-9][A-Za-z0-9_.-]*==)',lock.read_text(),flags=re.M)
+    wanted={'sox','numpy','typing-extensions','setuptools','pip','wheel','packaging'}
+    (final/'requirements.lock').write_text(''.join(b for b in blocks if b.split('==',1)[0] in wanted))
+    python=install_environment(tmp_path/'sox-build',source,'cuda')
+    subprocess.run([python,'-I','-c',"import sox,numpy; assert sox.__version__=='1.5.0'; assert callable(sox.Transformer)"],check=True)

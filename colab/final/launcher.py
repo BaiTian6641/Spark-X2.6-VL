@@ -25,7 +25,7 @@ def sanitize(text, secrets=()):
     return text
 
 
-def run_process(args, *, cwd, env, secrets, log_path, output=print):
+def run_process(args, *, cwd, env, secrets, log_path, output=print, label='Campaign'):
     """Stream both file descriptors through Python so Jupyter captures them.
 
     Only stdin carries credentials. A bounded queue decouples reads from notebook
@@ -100,15 +100,16 @@ def run_process(args, *, cwd, env, secrets, log_path, output=print):
                 if not interrupted and process.poll() is None:
                     process.send_signal(signal.SIGINT)
                 interrupted = True
-                show('Interrupt requested; waiting for the runner to finish its resumable save.')
+                show('Interrupt requested; waiting for the runner to finish its resumable save.' if label=='Campaign'
+                     else 'Interrupt requested; waiting for environment setup to exit. Readiness is not assumed.')
         process.wait()
         process.stdout.close()
-        show(f'Campaign subprocess exit code: {process.returncode}. Sanitized log: {log_path}')
+        show(f'{label} subprocess exit code: {process.returncode}. Sanitized log: {log_path}')
     if interrupted:
         raise KeyboardInterrupt('Runner exited after interrupt; inspect its checkpoint receipt above.')
     if process.returncode:
         detail = (f"{stopped.get('error_type', 'Error')}: {stopped.get('reason', '')}" if stopped else
                   last_line or 'No diagnostic output; inspect runtime resource availability.')
-        raise RuntimeError(f'Campaign {args[3] if len(args)>3 else "process"} stopped '
+        raise RuntimeError(f'{label} {args[3] if len(args)>3 else "process"} stopped '
                            f'(exit {process.returncode}): {detail[:2000]}\nSanitized log: {log_path}')
     return process.returncode

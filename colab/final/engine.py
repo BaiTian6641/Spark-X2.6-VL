@@ -376,7 +376,10 @@ class Campaign:
     def run_formal(self,profile):
         from .teacher import eligibility
         eligibility(self.c)
-        if not (self.root/'FULL_RECOVERY_PROOF.json').exists() or read(self.root/'FULL_RECOVERY_PROOF.json').get('binding')!=self.bound: raise RuntimeError('Actual fresh-VM recovery gate has not passed')
+        proof=read(self.root/'FULL_RECOVERY_PROOF.json') if (self.root/'FULL_RECOVERY_PROOF.json').exists() else {}
+        if (proof.get('binding')!=self.bound or not proof.get('passed') or not proof.get('fresh_process')
+                or not proof.get('complete_optimizer_recovery') or proof.get('native_updates')!=2):
+            raise RuntimeError('Actual new-process checkpoint continuation gate has not passed')
         if self.model is None: raise RuntimeError('Restore the reviewed initial or resumable campaign checkpoint first')
         slot=math.ceil(profile['complete_checkpoint_bytes']*1.10)
         self.reader.checkpoint_slot_bytes=slot; self.state['qualified_checkpoint_reservation_bytes']=slot

@@ -76,7 +76,7 @@ def dispatch(a,config,secrets):
     if not profile or not profile.get('passed'): raise RuntimeError('The complete-model qualification profile is required')
     if a.mode in ('recover','train') and not (root/'FULL_RECOVERY_PROOF.json').exists():
         from .qualify import recovery_check
-        result=recovery_check(campaign,profile); emit('fresh_vm_recovery_passed',**result)
+        result=recovery_check(campaign,profile); emit('checkpoint_recovery_passed',**result)
     if a.mode=='recover': return
     if a.mode=='resume':
         if not a.resume_receipt: raise ValueError('Select an exact committed checkpoint receipt')

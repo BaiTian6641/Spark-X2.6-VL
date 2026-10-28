@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import importlib.util
 import io
 import json
 import os
@@ -16,6 +17,7 @@ import subprocess
 import sys
 import time
 import urllib.request
+import uuid
 import zipfile
 from pathlib import Path
 
@@ -69,8 +71,32 @@ def _environment(work):
                UV_CACHE_DIR=str(_inside(work, ".installer-cache")),
                UV_CREDENTIALS_DIR=str(_inside(work, ".installer-no-auth")),
                UV_CONCURRENT_DOWNLOADS="2", UV_CONCURRENT_INSTALLS="2",
-               TMPDIR=str(temporary), PYTHONNOUSERSITE="1")
+               TMPDIR=str(temporary), PYTHONNOUSERSITE="1", UV_NO_PROGRESS="1")
     return env
+
+
+def _run_checked(args, work, env, stage):
+    # Loaded by path because the notebook imports bootstrap before setting a
+    # package search path. This sibling is part of the same verified archive.
+    spec = importlib.util.spec_from_file_location('spark_setup_launcher', Path(__file__).with_name('launcher.py'))
+    launcher = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(launcher)
+    log = work / 'logs' / ('environment-' + stage + '-' + uuid.uuid4().hex + '.log')
+    print(json.dumps({'event': 'environment_setup_stage', 'stage': stage, 'log': str(log)}), flush=True)
+    return launcher.run_process(args, cwd=work, env=env, secrets={}, log_path=log, label='Environment setup')
+
+
+def sync_arguments(uv, python, lock, kind):
+    args = [str(uv), 'pip', 'sync', '--no-config', '--no-cache', '--no-python-downloads',
+            '--python', str(python), '--require-hashes', '--only-binary', ':all:',
+            '--strict', '--default-index', 'https://pypi.org/simple']
+    if kind == 'cuda':
+        # Qwen-TTS requires sox1.5.0, published only as a source distribution.
+        # Permit only this package to build, and hash-pin its isolated build
+        # dependencies with the existing complete lock as well as its sdist.
+        args += ['--torch-backend', 'cu130', '--no-binary', 'sox',
+                 '--require-build-hashes', '--build-constraints', str(lock)]
+    return args + [str(lock)]
 
 
 def _probe(python, env):
@@ -173,24 +199,17 @@ def install_environment(work_root, source_root, kind, base_python=None):
             raise RuntimeError("Environment setup would violate the 44GB local free floor")
         uv, pin = installer(work, source_root)
         if prior is None:
-            subprocess.run([str(uv), "venv", "--no-config", "--no-cache", "--no-project", "--no-python-downloads",
+            _run_checked([str(uv), "venv", "--no-config", "--no-cache", "--no-project", "--no-python-downloads",
                             "--python", base_python, "--allow-existing", str(target)],
-                           check=True, env=env)
+                         work, env, kind+'-create')
         target.mkdir(parents=True, exist_ok=True)
         _write(owner_path, {"owner": OWNER, "kind": kind, "schema_version": 1})
-        args = [str(uv), "pip", "sync", "--no-config", "--no-cache", "--no-python-downloads",
-                "--python", str(python), "--require-hashes", "--only-binary", ":all:",
-                "--strict", "--default-index", "https://pypi.org/simple"]
-        if kind == "cuda":
-            # Selectively routes PyTorch packages; unrelated packages stay on
-            # PyPI rather than being shadowed by old PyTorch-index copies.
-            args += ["--torch-backend", "cu130"]
-        subprocess.run(args + [str(lock)], check=True, env=env)
+        _run_checked(sync_arguments(uv, python, lock, kind), work, env, kind+'-sync')
         installed = _probe(python, env)
         _require_python(installed)
         if Path(installed["prefix"]).resolve() != target.resolve() or not installed["pip"]:
             raise RuntimeError("Environment validation failed; setup is not ready")
-        subprocess.run([str(python), "-I", "-m", "pip", "check"], check=True, env=env)
+        _run_checked([str(python), "-I", "-m", "pip", "check"], work, env, kind+'-check')
         if shutil.disk_usage(work).free < FREE_FLOOR:
             raise RuntimeError("Installation finished below the required local free floor")
         receipt = {"schema_version": 1, "owner": OWNER, "kind": kind, "ready": True,

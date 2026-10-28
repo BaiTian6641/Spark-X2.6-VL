@@ -9,8 +9,8 @@
     },
     {
       "path": "colab/final/RUN.md",
-      "bytes": 23642,
-      "sha256": "578bd4318ca42877f07fc0633d51a5fe63dedcbf3f9be07b4004119b4523989a"
+      "bytes": 24874,
+      "sha256": "199c973277599c4705272230e480260a27b14e96f159274dc98139ab3923805d"
     },
     {
       "path": "colab/final/__init__.py",
@@ -29,8 +29,8 @@
     },
     {
       "path": "colab/final/bootstrap.py",
-      "bytes": 10422,
-      "sha256": "a729eeb3898adfbdab4f4824c02b3d87a84ec2c692249fec8d7d1618fad4ff6b"
+      "bytes": 11443,
+      "sha256": "200f9b5594d98918b8bfe032725f9a86bd42493e50137383aa12234b236acab0"
     },
     {
       "path": "colab/final/campaign.json",
@@ -64,8 +64,8 @@
     },
     {
       "path": "colab/final/engine.py",
-      "bytes": 34522,
-      "sha256": "dbe1454925506a36f42a00ce5943f6d2f7d4b59d2c177a4315bf62fe37ded4a3"
+      "bytes": 34737,
+      "sha256": "c40b0367103f3bfd0e74f7a545b4b42f545e05eb1ae4c121b3ebd8d29237628f"
     },
     {
       "path": "colab/final/evaluate.py",
@@ -74,8 +74,8 @@
     },
     {
       "path": "colab/final/hf_checkpoints.py",
-      "bytes": 13945,
-      "sha256": "e13ebdc22414156b38aa1d2bd8fe19ff6b37f7b8cd9f121d77b2c01085d43f74"
+      "bytes": 15577,
+      "sha256": "987ccb48848d1650f10cbe328578bd55fe5c1e0ba3bbf112a1975c5bf2434784"
     },
     {
       "path": "colab/final/inference.py",
@@ -84,8 +84,8 @@
     },
     {
       "path": "colab/final/launcher.py",
-      "bytes": 5190,
-      "sha256": "ec9aec6403692656c1af439cfc3fff3edab0840348e1a8d2df940493c85d99d4"
+      "bytes": 5341,
+      "sha256": "bee449d9f9aa7eaf4aec726a916afb52b18f6960b5df636d79e6c5ea21a3eb66"
     },
     {
       "path": "colab/final/model.py",
@@ -99,8 +99,8 @@
     },
     {
       "path": "colab/final/preflight.py",
-      "bytes": 5788,
-      "sha256": "dd8bf833b1cf90976cd758ccc7a55ac2c80a49b803f3339a79550417e2211622"
+      "bytes": 5802,
+      "sha256": "0dc95c4a6052099f514c4c6b05b9acd8b28fd09e69a1ce046d4bdab2ca9d7b80"
     },
     {
       "path": "colab/final/publish.py",
@@ -109,8 +109,8 @@
     },
     {
       "path": "colab/final/qualify.py",
-      "bytes": 12623,
-      "sha256": "7d55f9c8ad8e06456cdacce76e203275c4942fccc820b843d9012d343b0d2e65"
+      "bytes": 13397,
+      "sha256": "f0ebab0c3d18be2fb1df51011faf1055e33f1ec194175835520a4ae5bc486807"
     },
     {
       "path": "colab/final/requirements-preflight.in",
@@ -134,8 +134,8 @@
     },
     {
       "path": "colab/final/run.py",
-      "bytes": 7337,
-      "sha256": "bd6fe6e7c3b32a7721cc23e25c17ac32833f2cf15c7cc31ebb124da5cb2eac55"
+      "bytes": 7339,
+      "sha256": "b60107ccb2b1bb210888a9402cd25da5e43fe51876a9573b92a3a1e7b0531ff3"
     },
     {
       "path": "colab/final/storage.py",
@@ -209,8 +209,8 @@
     },
     {
       "path": "reports/spark_multimodal/COLAB_CAMPAIGN_PLAN.md",
-      "bytes": 40970,
-      "sha256": "19f2cfe586e7aab4c85fd05e04f3e413b4c6f3d9cacaee13b3cd506bc9811f06"
+      "bytes": 41692,
+      "sha256": "b5a8a2f09ffa253e92b80dab21b336811bafd312533c166ee686f1ea4490c6a4"
     },
     {
       "path": "reports/spark_multimodal/REFINEMENT_MULTIMODAL_REVIEW_2026-10-27.md",

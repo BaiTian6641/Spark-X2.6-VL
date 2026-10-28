@@ -67,10 +67,30 @@ class HFCheckpointStore:
             raise RuntimeError('Checkpoint repository must be private')
         names = set(self.api.list_repo_files(self.repo, repo_type='model', revision=info.sha)) if info.sha else set()
         if OWNER in names:
-            if json.loads(self._read_remote(OWNER, info.sha)) != self.owner:
-                raise RuntimeError('Checkpoint repository belongs to a different campaign/source')
             if any(n not in {'.gitattributes', 'README.md', OWNER} and not n.startswith(PREFIX) for n in names):
                 raise RuntimeError('Unrelated files in checkpoint repository; no overwrite performed')
+            previous = json.loads(self._read_remote(OWNER, info.sha))
+            if previous != self.owner:
+                # A setup repair can change the runtime hash after preflight
+                # created an identity-only repository. Rebind only if the same
+                # campaign has never stored a payload, including in history.
+                allowed = {'.gitattributes', 'README.md', OWNER}
+                if (any(previous.get(k) != self.owner[k] for k in ('schema_version','purpose','campaign_id'))
+                        or names - allowed):
+                    raise RuntimeError('Checkpoint repository belongs to a different campaign/source')
+                history = self.api.list_repo_commits(self.repo, repo_type='model', revision=info.sha)
+                if not history or len(history) > 32 or any(
+                        set(self.api.list_repo_files(self.repo, repo_type='model', revision=c.commit_id)) - allowed
+                        for c in history):
+                    raise RuntimeError('A trained or unverified checkpoint history cannot be rebound to new source')
+                result = self.api.create_commit(self.repo, repo_type='model', parent_commit=info.sha,
+                    operations=[CommitOperationAdd(OWNER, canonical(self.owner))],
+                    commit_message='Bind unused checkpoint destination to repaired formal runtime')
+                if json.loads(self._read_remote(OWNER, result.oid)) != self.owner:
+                    raise RuntimeError('HF checkpoint ownership update verification failed')
+                emit('empty_checkpoint_destination_rebound', repo_id=self.repo, revision=result.oid,
+                     previous_binding=previous.get('binding'), binding=self.binding, weights_uploaded=False)
+                return result.oid
             return info.sha
         if names - {'.gitattributes'}:
             raise RuntimeError('Existing checkpoint destination is unrelated; choose an empty private repository')
