@@ -20,7 +20,7 @@
     "project_cap_bytes": 2000000000000,
     "active_working_root": "/content/spark-formal",
     "training_from_drive_mount": false,
-    "transport": "private_huggingface_commits_with_size_sha256_and_preserved_history",
+    "transport": "public_sanitized_huggingface_commits_with_size_sha256_and_preserved_history",
     "source_shard_target_bytes": [
       1073741824,
       2147483648
@@ -41,6 +41,9 @@
     "local_disk_planned_capacity_bytes": 230000000000,
     "local_disk_profiles": "colab/formal/hf_storage_profiles.json",
     "drive_role": "not_used",
+    "artifact_visibility": "public_sanitized",
+    "checkpoint_repo": "TassP0lar/SparkX2.6-MM-checkpoints-g4-v2",
+    "model_repo": "TassP0lar/SparkX2.6-MM-g4-v2",
     "checkpoint_slots": 2,
     "checkpoint_slot_initial_bytes": 44000000000,
     "bounded_media_cache_bytes": 23000000000,

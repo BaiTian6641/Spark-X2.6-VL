@@ -3,6 +3,7 @@ import gc,os,shutil
 from pathlib import Path
 from .common import HERE,read,write,sha,emit,identity
 from .storage import manifest
+from .publication import public_artifact
 
 
 def card(config,state,bound):
@@ -18,11 +19,11 @@ license_link: README.md
 base_model: XHToken/Spark-X2.6-4B
 datasets:
 - TassP0lar/SparkX2.6-MM
-private: true
+private: {str(config['model_repo_private']).lower()}
 ---
 # Spark X2.6 multimodal formal prototype
 
-This custom PyTorch package contains a fully parameter-tuned Spark decoder with native image/video, speech/sound inputs and native waveform output branches. It requires the included runtime; `AutoModelForCausalLM` alone does not reconstruct this composite model. It is a private experimental artifact. Completion of the configured curriculum is distinct from broad capability acceptance. Human audio listening remains **{state.get('human_audio_review','pending')}**. See `evaluation-summary.json` for the actual measured results and limitations.
+This custom PyTorch package contains a fully parameter-tuned Spark decoder with native image/video, speech/sound inputs and native waveform output branches. It requires the included runtime; `AutoModelForCausalLM` alone does not reconstruct this composite model. It is an experimental artifact. Completion of the configured curriculum is distinct from broad capability acceptance. Human audio listening remains **{state.get('human_audio_review','pending')}**. See `evaluation-summary.json` for the actual measured results and limitations.
 
 All configured formal stages completed: {state.get('completed_stages',[])}. Instructor-controlled rounds: {len(state.get('rsi_rounds',[]))}. A rejected RSI candidate is recorded and the selected parent/control is retained. No autonomous architecture self-modification is claimed.
 
@@ -48,7 +49,7 @@ model = load(package)
 # Sound/music: row['_family']='sound_out'; model.generate_audio(row, empty_media(), seconds=15).
 ```
 
-Install the included hashed dependency lock in an isolated CPython3.13 CUDA13.0 environment as described in `RUN.md`. The export contains model weights, preprocessing/configuration, exact runtime source and original tokenizer/codec infrastructure. Optimizer, scheduler, private instructor ledger, credentials and raw training media are excluded. Resumable training snapshots remain in the separate private checkpoint repository; their small receipts and reports are backed up to the operator's Drive project.
+Install the included hashed dependency lock in an isolated CPython3.13 CUDA13.0 environment. The export contains model weights, preprocessing/configuration, exact runtime source and original tokenizer/codec infrastructure. Optimizer, scheduler, instructor ledger, credentials, raw training media and protected evaluation reports are excluded. Resumable training snapshots remain in the separate sanitized public checkpoint repository.
 
 Source release: `{bound['source_archive_sha256']}`. Dataset media revision: `{dataset['media_revision']}`. Metadata revision: `{dataset['catalogue_revision']}`.
 '''
@@ -104,7 +105,10 @@ def export_and_upload(campaign,config):
     return upload_closed_export(campaign,config,out)
 
 def upload_closed_export(campaign,config,out):
-    from huggingface_hub import HfApi
+    if not config['model_repo_private']:
+        out = public_artifact(out, campaign.root/'public-model', 'model')
+        write(out/'MODEL_RELEASE.json', {'schema_version':1,'campaign_id':config['campaign_id'],
+              'binding':campaign.bound,'training_complete':True,**manifest(out)})
     release=read(out/'MODEL_RELEASE.json')
     allowed=[f['path'] for f in release['files']]+['MODEL_RELEASE.json']
     # Verify a genuinely new object graph using only exported configs/weights.
@@ -118,7 +122,8 @@ def upload_closed_export(campaign,config,out):
     exists=api.repo_exists(config['model_repo'],repo_type='model')
     if exists:
         info=api.model_info(config['model_repo'])
-        if not info.private: raise RuntimeError('Existing destination is public; this reviewed release targets a private model repository')
+        if bool(info.private) != bool(config['model_repo_private']):
+            raise RuntimeError('Existing model repository has a different visibility policy; choose a new destination')
         names=api.list_repo_files(config['model_repo'],repo_type='model')
         if names and not set(names)<={'.gitattributes'} and 'MODEL_RELEASE.json' not in names: raise RuntimeError('Existing model repository is unrelated; choose a new explicit destination')
         if set(names)-set(allowed)-{'.gitattributes'}: raise RuntimeError('Existing model repository contains unrelated files; use a clean model destination')
@@ -129,15 +134,15 @@ def upload_closed_export(campaign,config,out):
                 response=session.get(f'https://huggingface.co/{config["model_repo"]}/resolve/{info.sha}/MODEL_RELEASE.json',headers={'Authorization':'Bearer '+campaign._hf_token},timeout=60)
                 if response.status_code!=200 or len(response.content)>2*1024**2: raise RuntimeError('Could not verify existing model ownership binding')
                 previous=response.json()
-                if previous.get('campaign_id')!=config['campaign_id'] or previous.get('binding')!=campaign.bound: raise RuntimeError('Existing private model belongs to another campaign/source release')
+                if previous.get('campaign_id')!=config['campaign_id'] or previous.get('binding')!=campaign.bound: raise RuntimeError('Existing model belongs to another campaign/source release')
             finally: session.close()
-    else: api.create_repo(config['model_repo'],repo_type='model',private=True)
+    else: api.create_repo(config['model_repo'],repo_type='model',private=bool(config['model_repo_private']))
     result=api.upload_folder(repo_id=config['model_repo'],repo_type='model',folder_path=out,allow_patterns=allowed,ignore_patterns=['.cache/**'],commit_message='Publish completed formal native multimodal Spark prototype')
     info=api.model_info(config['model_repo'],revision=result.oid,files_metadata=True)
     remote={f.rfilename:f for f in info.siblings}
     expected=sha(out/'model.safetensors'); obj=remote.get('model.safetensors'); lfs=getattr(obj,'lfs',None)
     actual=getattr(lfs,'sha256',None) if lfs is not None else None
     if actual!=expected: raise RuntimeError('Final remote model SHA256 verification failed')
-    receipt={'repo_id':config['model_repo'],'repo_type':'model','private':True,'commit':result.oid,'url':f'https://huggingface.co/{config["model_repo"]}/tree/{result.oid}','model_sha256':expected,'model_lfs_sha256_verified':True,'training_complete':True,'broad_capability_passed':False}
+    receipt={'repo_id':config['model_repo'],'repo_type':'model','private':bool(config['model_repo_private']),'commit':result.oid,'url':f'https://huggingface.co/{config["model_repo"]}/tree/{result.oid}','model_sha256':expected,'model_lfs_sha256_verified':True,'training_complete':True,'broad_capability_passed':False}
     write(campaign.root/'MODEL_UPLOAD_RECEIPT.json',receipt); campaign.store.small_file(campaign.root/'MODEL_UPLOAD_RECEIPT.json','model-publication'); emit('final_model_uploaded',**receipt)
     return receipt

@@ -8,7 +8,7 @@ import types
 import unittest
 from unittest.mock import patch
 
-from colab.final.common import read, validate_config
+from colab.final.common import read, write, validate_config
 from colab.final.data import CommittedCursor, cursor_rows
 from colab.final.run import directory_bytes, storage_envelope
 from colab.final import launcher
@@ -94,6 +94,26 @@ class StorageAndResumeTests(unittest.TestCase):
             with patch('shutil.disk_usage', return_value=types.SimpleNamespace(free=100_000_000_000)):
                 with self.assertRaises(RuntimeError):
                     storage_envelope(root, CONFIG, CONFIG['initial_checkpoint_reservation_bytes'])
+
+    def test_public_model_export_excludes_protected_material(self):
+        from colab.final.publication import public_artifact
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / 'source'
+            (source / 'evaluation').mkdir(parents=True)
+            (source / 'reload-assets').mkdir()
+            (source / 'model.safetensors').write_bytes(b'weights')
+            write(source / 'config.json', {'observed_compute_balance': 'private-account'})
+            (source / 'evaluation/REPORT.json').write_text('{"reference": "protected-answer"}')
+            (source / 'RUN.md').write_text('private-account')
+            (source / 'reload-assets/config.json').write_text('{}')
+            out = public_artifact(source, Path(temporary) / 'public', 'model')
+            assert (out / 'model.safetensors').stat().st_ino == (source / 'model.safetensors').stat().st_ino
+            assert not (out / 'evaluation').exists() and not (out / 'RUN.md').exists()
+            assert json.loads((out / 'config.json').read_text())['observed_compute_balance'] is None
+            cfg = dict(CONFIG, model_repo_private=False, checkpoint_repo_private=False, allow_public_artifacts=True)
+            validate_config(cfg)
+            with self.assertRaises(ValueError):
+                validate_config(dict(cfg, allow_public_artifacts=False))
 
     def test_out_of_order_workers_commit_only_contiguous_prefix(self):
         cursor = CommittedCursor(list('abcdefghij'))

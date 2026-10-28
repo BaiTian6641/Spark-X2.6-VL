@@ -89,20 +89,20 @@ Colab itself documents variable runtime limits and nonpersistent VMs; see the [C
 5. **Prove recovery in a fresh process.** Restore full model/optimizer/scheduler/RNG state and reproduce two continuation updates before restoring the original initial snapshot.
 6. **Run the staged campaign.** Preserve every stage, effective eight-record optimizer batch, source-grouped order, and family/language loss accounting. Worker-prefetched media does not advance the committed cursor.
 7. **Run two controlled RSI rounds.** `OPENCODE_API_KEY` is required. Each round uses 32 reviewed training records, typed replay-priority decisions, matched candidate/uniform-control replay, inherited optimizer moments, and promotion/rollback. Uncertain billing stops new requests.
-8. **Audit and publish.** Run the protected audit, preserve pending human-audio review, reload the closed export offline, then upload and verify the private model. Do not infer broad capability acceptance from completion.
+8. **Audit and publish.** Run the protected audit, preserve pending human-audio review, reload the closed export offline, then upload and verify the sanitized public model. Do not infer broad capability acceptance from completion. Protected evaluation reports and account metadata are excluded from public artifacts.
 
 ## 7. Verification boundary
 
 The focused local suite exercises actual behavior: official Spark chat layout, Qwen prefix/sub-talker alignment and cached frames, Stable Audio EDM equations, Spark microbatch and cached-generation parity, source-group splitting, target-role isolation, contiguous-prefix worker commits, checkpoint write/retry/restore/purge behavior, full-Git source hashing, and expected subprocess exit codes. These are CPU/source tests, not proof of full-model G4 residency, throughput, quality, or fresh-VM recovery.
 
-**Observed during this correction:** **55 focused tests passed**. A direct CLI smoke also reached the expected environment gate without starting model or dataset downloads. These checks used the pinned API stack where required; no full Colab G4 campaign was launched.
+**Observed during this correction:** **58 focused tests passed**. A direct CLI smoke also reached the expected environment gate without starting model or dataset downloads. These checks used the pinned API stack where required; no full Colab G4 campaign was launched.
 
 The first G4 run remains the required hardware gate. A completed notebook must not be described as validated unless its actual receipts show whole-model qualification, fresh-process recovery, all stages, both RSI rounds, protected audit, offline reload, and verified upload. Human speech intelligibility/tone review, sound/music listening, broad spatial/temporal benchmarks, and independent 3D evaluation remain separate acceptance work.
 
 ## 8. Operator steps
 
 1. Open `colab/Spark_Formal_Full_Finetune.ipynb` from branch `codex/formal-colab` on a G4 RTX PRO 6000.
-2. Enable `HF_TOKEN` and `OPENCODE_API_KEY` in Colab Secrets. The HF token needs component read access and private model/checkpoint write access. Accept Stable Audio's gate on the same account beforehand. `INSTRUCTOR_MODEL` defaults to **`mimo-v2.6-pro`**, which is an allowed operator selection, not an independently verified provider-eligibility or multimodal-competence claim. Returned-model and billing checks still apply.
+2. Enable `HF_TOKEN` and `OPENCODE_API_KEY` in Colab Secrets. The HF token needs component read access and model/checkpoint write access. Accept Stable Audio's gate on the same account beforehand. `INSTRUCTOR_MODEL` defaults to **`mimo-v2.6-pro`**, which is an allowed operator selection, not an independently verified provider-eligibility or multimodal-competence claim. Returned-model and billing checks still apply. Public artifact repositories are sanitized; protected evaluation and account metadata are excluded.
 3. Optionally enter the current Colab CU balance/rate. The 110-hour wall budget applies regardless; valid CU observations add a second budget check.
 4. Click **Runtime → Run all**. Keep the streamed output. If exit `3` occurs, start a new G4 session and run all again. Do not start a second writer against the same work root or checkpoint repo.
 5. Inspect `ONESHOT_RECEIPT.json`, `QUALIFICATION.json`, `CAMPAIGN.json`, per-stage evaluations, and `MODEL_UPLOAD_RECEIPT.json`. Do not treat an incomplete/stopped run as a completed model.

@@ -28,6 +28,14 @@ def test_real_naflex_patch_interface_backward():
     assert torch.isfinite(patches.grad).all() and patches.grad[:,:15].abs().sum()>0
     assert patches.grad[:,15:].abs().sum()==0
 
+def test_clap_pretrained_loader_uses_audio_model_subtree(monkeypatch):
+    from colab.final.model import SparkNative
+    from transformers import ClapModel
+    marker=object()
+    monkeypatch.setattr(ClapModel,'from_pretrained',lambda *args,**kwargs: types.SimpleNamespace(
+        audio_model=types.SimpleNamespace(audio_encoder=marker)))
+    assert SparkNative.load_sound_in('clap-checkpoint',True) is marker
+
 
 def tiny_talker():
     from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSTalkerConfig

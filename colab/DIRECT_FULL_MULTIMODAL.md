@@ -11,7 +11,7 @@ Use [`Spark_Formal_Full_Finetune.ipynb`](Spark_Formal_Full_Finetune.ipynb). Read
 3. Whole-model CUDA qualification and fresh-process optimizer/RNG recovery.
 4. Bridge alignment → vision → temporal/AV → audio understanding → native speech/sound generation → joint full tuning.
 5. Two instructor-controlled candidate-versus-uniform-control RSI rounds.
-6. Protected audit, offline export reload, and verified private HF upload.
+6. Protected audit, offline export reload, and verified sanitized public HF upload.
 
 The replacement `colab/oneshot` WSD schedule, 20-source expansion, 12 GB reserve, history squashing, and single optional replay round are **not** used.
 
@@ -20,7 +20,7 @@ The replacement `colab/oneshot` WSD schedule, 20-source expansion, 12 GB reserve
 - G4 / RTX PRO 6000 Blackwell with at least 90,000,000,000 GPU bytes and BF16.
 - `INSTRUCTOR_MODEL`: defaults to `mimo-v2.6-pro`; this is an allowed operator selection, not independently verified provider eligibility or instructor competence.
 - Conservative 230 GB local-disk envelope; 44 GB non-borrowable free floor.
-- `HF_TOKEN`: component read access plus private model/checkpoint write access for `TassP0lar`.
+- `HF_TOKEN`: component read access plus model/checkpoint write access for `TassP0lar`; public snapshots are sanitized.
 - `OPENCODE_API_KEY`: required for both instructor rounds; $50 cumulative ledger and uncertain-outcome stop remain enforced.
 - Stable Audio Open 1.0 access accepted on the same HF account before launch.
 
@@ -28,7 +28,7 @@ The replacement `colab/oneshot` WSD schedule, 20-source expansion, 12 GB reserve
 
 Open the notebook on branch `codex/formal-colab`, select the G4 runtime, and click **Run all**. The notebook records the actual Git `HEAD` and hashes every tracked file. Set `REPO_COMMIT` to a full 40-character commit when an immutable launch is required.
 
-If an existing checkpoint repository contains an incompatible trained payload, choose a new empty private checkpoint repository. The runner will not overwrite or rebind that history.
+If an existing checkpoint repository contains an incompatible trained payload, choose a new empty repository. The runner will not overwrite or rebind that history. The current default is a new sanitized public `TassP0lar/SparkX2.6-MM-checkpoints-g4-v2` repository.
 
 | Exit | Meaning | Action |
 | ---: | --- | --- |
@@ -45,8 +45,8 @@ The cumulative budget is **110 GPU-hours**, including setup, qualification, trai
 - Local active files stay under `/content/spark-formal`.
 - Two measured checkpoint slots, initially 44 GB each, plus a 10% post-qualification margin.
 - Ten bounded 2.3 GB TAR caches; no full dataset clone or second HF payload cache.
-- Full checkpoints go to private `TassP0lar/SparkX2.6-MM-checkpoints`; HF history is preserved for recovery and RSI parent/control snapshots.
-- Final inference weights go to private `TassP0lar/SparkX2.6-MM` after offline reload and remote hash verification.
+- Full checkpoints go to public sanitized `TassP0lar/SparkX2.6-MM-checkpoints-g4-v2`; HF history is preserved for recovery and RSI parent/control snapshots. Protected evaluation rows and account metadata are excluded.
+- Final inference weights go to public `TassP0lar/SparkX2.6-MM-g4-v2` after offline reload and remote hash verification; protected evaluation reports are excluded.
 
 ## Evidence limits
 

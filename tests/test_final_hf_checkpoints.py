@@ -22,8 +22,7 @@ class Hub:
     def whoami(self): return {'name':'TassP0lar'}
     def repo_exists(self,*a,**kw): return self.exists
     def create_repo(self,*a,**kw):
-        assert kw['private'] and kw['repo_type']=='model'
-        self.exists=True; self.history[self.head]={'.gitattributes':b'*.pt filter=lfs'}
+        self.private=kw['private']; self.exists=True; self.history[self.head]={'.gitattributes':b'*.pt filter=lfs'}
     def model_info(self,*a,**kw): return SimpleNamespace(private=self.private,sha=self.head)
     def list_repo_files(self,*a,revision=None,**kw): return list(self.history[revision or self.head])
     def list_repo_commits(self,*a,**kw): return [SimpleNamespace(commit_id=key) for key in self.history]
@@ -98,6 +97,37 @@ def test_atomic_versioned_upload_verifies_all_files_and_restores_old_revision(st
     assert not (hf.root/'hub').exists()
     assert 'test-only-secret' not in json.dumps(hub.history[r2['revision']],default=lambda b:b.decode(errors='ignore'))
 
+
+def test_public_checkpoint_is_sanitized_and_restores(store,monkeypatch):
+    hf,hub=store; hf.c['checkpoint_repo_private']=False; hf.c['allow_public_artifacts']=True
+    d=snapshot(hf.root)
+    write(d/'STATE.json',{'orchestration':{'parent_eval':{'by_stratum':{'image:en':{'mean_loss':1.0}},'rows':[{'reference':'protected-answer'}]},'candidate_order':['rid-1'],'reviews':[{'decision':{'priority':3,'training_action':'replay_original','rationale':'protected-rationale'}}]}})
+    write(d/'config.json',{'observed_compute_balance':'private-account','instructor_route_eligibility_receipt':{'private':'evidence'}})
+    write(d/'INSTRUCTOR_LEDGER.json',{'requests':[{'status':'accounted','reservation_usd':0.5,'decision':{'priority':3,'training_action':'replay_original','rationale':'protected-rationale'}}]})
+    (d/'provenance').mkdir();write(d/'provenance/BASELINE.json',{'by_stratum':{'image:en':{'mean_loss':1.0}},'rows':[{'reference':'protected-answer'}]})
+    write(d/'COMPUTE_BUDGET.json',{'observed_balance':'private-account'})
+    receipt=hf.commit(d)
+    assert receipt['private'] is False and hub.private is False
+    history=hub.history[receipt['revision']]
+    public_text=json.dumps(history,default=lambda value:value.decode(errors='ignore') if isinstance(value,bytes) else value)
+    assert 'protected-answer' not in public_text and 'protected-rationale' not in public_text and 'private-account' not in public_text
+    assert 'checkpoint/COMPUTE_BUDGET.json' not in history
+    state=json.loads(history['checkpoint/STATE.json'])
+    assert state['orchestration']['candidate_order']==['rid-1']
+    assert 'rows' not in state['orchestration']['parent_eval']
+    assert 'rationale' not in state['orchestration']['reviews'][0]['decision']
+    assert json.loads(history['checkpoint/config.json'])['observed_compute_balance'] is None
+    def fetch(url,path,entry,token):
+        revision,filename=url.split('/resolve/')[1].split('/',1)
+        data=hub.history[revision][filename]
+        assert hashlib.sha256(data).hexdigest()==entry['sha256']
+        path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(data)
+    monkeypatch.setattr('colab.final.hf_checkpoints.fetch',fetch)
+    monkeypatch.setattr('colab.final.hf_checkpoints.disk_guard',lambda *a,**kw:None)
+    recovered=hf.root/'checkpoints/public-restored'
+    hf.restore(receipt,recovered)
+    assert json.loads((recovered/'STATE.json').read_text())['orchestration']['candidate_order']==['rid-1']
+    assert 'rows' not in json.loads((recovered/'provenance/BASELINE.json').read_text())
 
 def test_lost_response_reconciles_same_transaction_without_another_commit(store):
     hf,hub=store;hf.ensure_repository();d=snapshot(hf.root)

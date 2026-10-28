@@ -7,7 +7,7 @@ For the corrected one-click G4 campaign, open [`Spark_Formal_Full_Finetune.ipynb
 - [`ONESHOT_HANDOFF_AND_NEXT_STEPS.md`](ONESHOT_HANDOFF_AND_NEXT_STEPS.md) — corrected architecture, restored contracts, corpus boundaries, 230 GB / 110-hour enforcement, verification scope, and operator steps.
 - [`DIRECT_FULL_MULTIMODAL.md`](DIRECT_FULL_MULTIMODAL.md) — concise launch, resume, storage, and exit-code guide.
 
-The flow is full Git checkout → locked environment → original corpus → whole-model qualification → fresh-process recovery → six staged curricula → two controlled instructor RSI rounds → protected audit → offline reload → verified private HF upload. No Drive mount or API is used. Complete epochs and matched RSI controls are never silently shortened.
+The flow is full Git checkout → locked environment → original corpus → whole-model qualification → fresh-process recovery → six staged curricula → two controlled instructor RSI rounds → protected audit → offline reload → verified sanitized public HF upload. No Drive mount or API is used. Complete epochs and matched RSI controls are never silently shortened. Protected evaluation rows and account metadata are excluded from public artifacts.
 
 The older gated launcher remains archived as [`Spark_Formal_Omni_Gated.ipynb`](Spark_Formal_Omni_Gated.ipynb).
 

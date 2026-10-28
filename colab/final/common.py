@@ -34,11 +34,15 @@ def validate_config(c):
     if c.get('schema_version')!=SCHEMA or not re.fullmatch(r'[a-zA-Z0-9_-]{3,64}',c.get('campaign_id','')): raise ValueError('Invalid campaign identity')
     local(c['work_root'])
     if not re.fullmatch(r'TassP0lar/[A-Za-z0-9_.-]+',c['model_repo']): raise ValueError('Use an explicit model repository in the intended account')
-    if c['model_repo_private'] is not True: raise ValueError('This reviewed release publishes a private experimental model')
-    if c.get('checkpoint_backend')!='huggingface' or c.get('checkpoint_repo_private') is not True:
-        raise ValueError('Formal checkpoints require the reviewed private Hugging Face storage policy')
-    if not re.fullmatch(r'TassP0lar/[A-Za-z0-9_.-]+',c.get('checkpoint_repo','')) or c['checkpoint_repo']==c['model_repo']:
-        raise ValueError('Use a separate explicit private checkpoint repository in the intended account')
+    public_ok=c.get('allow_public_artifacts') is True
+    if type(c['model_repo_private']) is not bool or type(c['checkpoint_repo_private']) is not bool:
+        raise ValueError('Repository visibility must be an explicit boolean')
+    if not c['model_repo_private'] and not public_ok:
+        raise ValueError('Public model upload requires allow_public_artifacts=true and sanitized exports')
+    if c.get('checkpoint_backend')!='huggingface' or type(c['checkpoint_repo_private']) is not bool:
+        raise ValueError('Formal checkpoints require the reviewed Hugging Face storage policy')
+    if not c['checkpoint_repo_private'] and not public_ok:
+        raise ValueError('Public checkpoints require allow_public_artifacts=true and sanitized snapshots')
     if not 0 < c['instructor_budget_usd'] <= 50 or not 0 < c['max_compute_units'] <= 1000: raise ValueError('Campaign exceeds the authorized budget')
     if c['cache_bytes_per_component']*10 > 24_000_000_000: raise ValueError('Global media cache exceeds its reservation')
     if c['checkpoint_slots']!=2 or c['drive_cap_bytes']>2_000_000_000_000: raise ValueError('Storage contract changed')

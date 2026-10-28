@@ -120,7 +120,7 @@ def main(secrets=None):
 
 def dispatch(a,config,secrets):
     root=Path(config['work_root'])
-    os.environ.update(HF_HOME=str(root/'hf-metadata-cache'),HF_HUB_DISABLE_TELEMETRY='1',HF_HUB_DISABLE_XET='1',TORCH_HOME=str(root/'torch-metadata-cache'),WANDB_DISABLED='true',TOKENIZERS_PARALLELISM='false',UNSLOTH_COMPILE_DISABLE='1')
+    os.environ.update(HF_HOME=str(root/'hf-metadata-cache'),HF_HUB_DISABLE_TELEMETRY='1',HF_HUB_DISABLE_XET='1',TORCH_HOME=str(root/'torch-metadata-cache'),TOKENIZERS_PARALLELISM='false',UNSLOTH_COMPILE_DISABLE='1')
     if secrets is None: secrets=json.loads(sys.stdin.readline())
     token=secrets.get('HF_TOKEN'); key=secrets.get('OPENCODE_API_KEY')
     if not token: raise ValueError('HF_TOKEN is unavailable')

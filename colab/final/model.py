@@ -106,23 +106,23 @@ class SparkNative(nn.Module):
     supports_gradient_checkpointing=True
     def __init__(self,paths,policy,device='cuda',pretrained=True):
         super().__init__()
-        from transformers import (AutoConfig,AutoModelForCausalLM,AutoTokenizer,Siglip2VisionModel,Siglip2VisionConfig,AutoImageProcessor,WhisperModel,WhisperConfig,WhisperFeatureExtractor,ClapAudioModel,ClapAudioConfig,ClapFeatureExtractor)
+        from transformers import (AutoConfig,AutoModelForCausalLM,AutoTokenizer,Siglip2VisionModel,Siglip2VisionConfig,AutoImageProcessor,WhisperModel,WhisperConfig,WhisperFeatureExtractor,ClapModel,ClapAudioModel,ClapAudioConfig,ClapFeatureExtractor)
         self.policy=policy; self.paths={k:str(v) for k,v in paths.items()}; self.pretrained=pretrained
-        self.spark=(AutoModelForCausalLM.from_pretrained(paths['spark'],trust_remote_code=True,local_files_only=True,torch_dtype=torch.float32,attn_implementation='eager') if pretrained else AutoModelForCausalLM.from_config(AutoConfig.from_pretrained(paths['spark'],trust_remote_code=True,local_files_only=True),trust_remote_code=True,attn_implementation='eager'))
+        self.spark=(AutoModelForCausalLM.from_pretrained(paths['spark'],trust_remote_code=True,local_files_only=True,dtype=torch.float32,attn_implementation='eager') if pretrained else AutoModelForCausalLM.from_config(AutoConfig.from_pretrained(paths['spark'],trust_remote_code=True,local_files_only=True),trust_remote_code=True,attn_implementation='eager'))
         install_spark_sdpa(self.spark)
         self.tokenizer=AutoTokenizer.from_pretrained(paths['spark'],trust_remote_code=True,local_files_only=True)
         if self.tokenizer.pad_token_id is None: self.tokenizer.pad_token=self.tokenizer.eos_token
         self.chat = ChatFormat(self.tokenizer)
         self.config=self.spark.config; self.config.use_cache=False; self.generation_config=self.spark.generation_config
-        self.vision=(Siglip2VisionModel.from_pretrained(paths['vision'],local_files_only=True,torch_dtype=torch.float32) if pretrained else Siglip2VisionModel(Siglip2VisionConfig.from_pretrained(paths['vision'],local_files_only=True)))
+        self.vision=(Siglip2VisionModel.from_pretrained(paths['vision'],local_files_only=True,dtype=torch.float32) if pretrained else Siglip2VisionModel(Siglip2VisionConfig.from_pretrained(paths['vision'],local_files_only=True)))
         # Pooling heads are not part of the dense patch interface.
         if hasattr(self.vision.vision_model,'head'): del self.vision.vision_model.head
         self.vision.vision_model.use_head=False
         self.image_processor=AutoImageProcessor.from_pretrained(paths['vision'],local_files_only=True)
-        whisper=(WhisperModel.from_pretrained(paths['speech_in'],local_files_only=True,torch_dtype=torch.float32) if pretrained else WhisperModel(WhisperConfig.from_pretrained(paths['speech_in'],local_files_only=True)))
+        whisper=(WhisperModel.from_pretrained(paths['speech_in'],local_files_only=True,dtype=torch.float32) if pretrained else WhisperModel(WhisperConfig.from_pretrained(paths['speech_in'],local_files_only=True)))
         self.speech_in=whisper.encoder; del whisper
         self.speech_processor=WhisperFeatureExtractor.from_pretrained(paths['speech_in'],local_files_only=True)
-        self.sound_in=(ClapAudioModel.from_pretrained(paths['sound_in'],local_files_only=True,torch_dtype=torch.float32) if pretrained else ClapAudioModel(ClapAudioConfig.from_pretrained(paths['sound_in'],local_files_only=True)))
+        self.sound_in=self.load_sound_in(paths['sound_in'],pretrained)
         self.sound_processor=ClapFeatureExtractor.from_pretrained(paths['sound_in'],local_files_only=True)
         self.motion=self.load_motion(paths['motion_source'],paths['motion'] if pretrained else None)
         h=self.config.hidden_size; self.hidden=h
@@ -137,6 +137,12 @@ class SparkNative(nn.Module):
         self.speech_out=NativeSpeechOutput(paths['speech_out'],h,policy,pretrained=pretrained)
         self.sound_out=NativeSoundOutput(paths['sound_out'],h,policy,pretrained=pretrained)
         self.to(device=device,dtype=torch.float32); self.freeze_infrastructure(); self.gradient_checkpointing_enable()
+    @staticmethod
+    def load_sound_in(path,pretrained):
+        from transformers import ClapModel,ClapAudioModel,ClapAudioConfig
+        if pretrained:
+            return ClapModel.from_pretrained(path,local_files_only=True,dtype=torch.float32).audio_model.audio_encoder
+        return ClapAudioModel(ClapAudioConfig.from_pretrained(path,local_files_only=True))
     @staticmethod
     def load_motion(source,checkpoint):
         sys.path.insert(0,str(source))

@@ -19,15 +19,15 @@ The latest user instruction changes full checkpoint storage to **Hugging Face**.
 | Artifact | Destination |
 |---|---|
 | Existing pinned data | `datasets/TassP0lar/SparkX2.6-MM` |
-| Full resumable snapshots | Private model repo `TassP0lar/SparkX2.6-MM-checkpoints` |
-| Finished inference package | Private model repo `TassP0lar/SparkX2.6-MM` |
-| Small receipts, reports and ledger | Configured cold Drive project, within its 2 TB cap |
+| Full resumable snapshots | Public sanitized model repo `TassP0lar/SparkX2.6-MM-checkpoints-g4-v2` |
+| Finished inference package | Public model repo `TassP0lar/SparkX2.6-MM-g4-v2` |
+| Protected evaluation rows and account metadata | Excluded from public artifacts; only aggregate/receipt state is retained |
 
-`HF_TOKEN` needs read access to the component models and write access to **both private model repositories**. No token is placed in a cell, file, argv or checkpoint. CPU preflight initializes or verifies the small checkpoint repository identity before expensive training. The dataset repository is not modified by this notebook.
+`HF_TOKEN` needs read access to component models and write access to **both configured model repositories**. No token is placed in a cell, file, argv or checkpoint. The dataset repository is not modified by this notebook.
 
-On a roughly230GB VM, the rolling media cache is23GB, the free floor44GB, and the initial full-checkpoint reservation55GB per slot. Two local snapshots may coexist during saving/upload. Every payload file is verified against the exact HF commit (LFS SHA256 for large objects, downloaded content SHA256 for ordinary small Git files). After the exact-revision receipt has also been backed up to Drive, only the newest local snapshot remains. Older verified local checkpoints are automatically purged. Upload, hash, quota or receipt-backup failures preserve the fallback and the new local checkpoint; they stop training rather than delete an unverified artifact.
+On a roughly230GB VM, the rolling media cache is23GB, the free floor44GB, and the initial full-checkpoint reservation44GB per slot. Two local snapshots may coexist during saving/upload. Every payload file is verified against the exact HF commit (LFS SHA256 for large objects, downloaded content SHA256 for ordinary small Git files). After the exact-revision receipt has also been backed up locally, only the newest local snapshot remains. Older verified local checkpoints are automatically purged. Upload, hash, quota or receipt-backup failures preserve the fallback and the new local checkpoint; they stop training rather than delete an unverified artifact.
 
-The remote `checkpoint/` directory is updated atomically. Old exact revisions remain in HF Git history for recovery and parent/candidate/control RSI. **Local purge does not reclaim HF history quota.** The script never squashes remote history or deletes unrelated files. Ensure the HF account has sufficient private storage; the program stops if the Hub rejects a write. Source model files, the active bounded shard cache, the newest checkpoint, original workstation checkpoints and unrelated data are not part of checkpoint cleanup.
+The remote `checkpoint/` directory is updated atomically. Old exact revisions remain in HF Git history for recovery and parent/candidate/control RSI. **Local purge does not reclaim HF history quota.** The script never squashes remote history or deletes unrelated files. Ensure the HF account has sufficient public storage; the program stops if the Hub rejects a write. Source model files, the active bounded shard cache, the newest checkpoint, original workstation checkpoints and unrelated data are not part of checkpoint cleanup.
 
 Start directly on **G4**. Use one isolated `env-cuda` for setup, metadata/access preflight, qualification, training, upload retries and resume. After qualification, keep the same VM and select `RUN_MODE='train'`. A new subprocess restores the full checkpoint and checks two native continuation updates against the saved optimizer/RNG oracle before returning to the original initial snapshot. The proof records whether the VM changed; same-VM evidence is never reported as fresh-VM evidence. There is no required CPU runtime switch or deliberate VM deletion. After an actual later interruption, use `RUN_MODE='resume'` with exact saved receipts.
 

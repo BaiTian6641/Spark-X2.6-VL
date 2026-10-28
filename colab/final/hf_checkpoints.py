@@ -1,14 +1,14 @@
-"""Complete private HF snapshots, pinned receipts, and verified direct restores.
+"""Complete private or sanitized-public HF snapshots, pinned receipts, and verified direct restores.
 
 The branch's checkpoint/ directory is replaced in one commit. Older receipts
 retain their immutable revisions; Git history is never squashed by this runner.
 No git/LFS checkout or second Hub cache copy is created on the Colab disk.
 """
-from __future__ import annotations
-import hashlib, json, os, re, time
+import hashlib, json, os, re, shutil, time
 from pathlib import Path
 from .common import canonical, identity, read, write, sha, disk_guard, emit
 from .assets import fetch
+from .publication import public_artifact
 from colab.stage1.common import safe_relative
 
 PREFIX = 'checkpoint/'
@@ -30,7 +30,8 @@ class HFCheckpointStore:
         self.repo, self.token = config['checkpoint_repo'], token
         self.api = api or HfApi(token=token)
         self.owner = {'schema_version': 1, 'purpose': 'resumable-training-checkpoints',
-                      'campaign_id': config['campaign_id'], 'binding': binding}
+                      'campaign_id': config['campaign_id'], 'binding': binding,
+                      'public_sanitized': not bool(config['checkpoint_repo_private'])}
         self.private = self.root / 'private-upload-state' / 'huggingface'
         self.private.mkdir(parents=True, exist_ok=True, mode=0o700)
 
@@ -60,11 +61,12 @@ class HFCheckpointStore:
         from huggingface_hub import CommitOperationAdd
         if self.api.whoami().get('name') != 'TassP0lar':
             raise ValueError('Unexpected HF checkpoint account')
+        private=bool(self.c['checkpoint_repo_private'])
         if not self.api.repo_exists(self.repo, repo_type='model'):
-            self.api.create_repo(self.repo, repo_type='model', private=True)
+            self.api.create_repo(self.repo, repo_type='model', private=private)
         info = self.api.model_info(self.repo)
-        if not info.private:
-            raise RuntimeError('Checkpoint repository must be private')
+        if bool(info.private) != private:
+            raise RuntimeError(f'Checkpoint repository visibility must be {"private" if private else "public"}')
         names = set(self.api.list_repo_files(self.repo, repo_type='model', revision=info.sha)) if info.sha else set()
         if OWNER in names:
             if any(n not in {'.gitattributes', 'README.md', OWNER} and not n.startswith(PREFIX) for n in names):
@@ -93,11 +95,12 @@ class HFCheckpointStore:
                 return result.oid
             return info.sha
         if names - {'.gitattributes'}:
-            raise RuntimeError('Existing checkpoint destination is unrelated; choose an empty private repository')
-        card = ('---\nlicense: other\nprivate: true\n---\n'
-                '# Spark multimodal resumable training checkpoints\n\n'
-                'Private full training state: weights, optimizer, scheduler, RNG and data cursor. '
-                'This is not the finished inference model. The latest snapshot is under `checkpoint/`. '
+            raise RuntimeError('Existing checkpoint destination is unrelated; choose an empty repository')
+        visibility = 'private' if private else 'public sanitized'
+        card = (f'---\nlicense: other\nprivate: {str(private).lower()}\n---\n'
+                f'# Spark multimodal {visibility} resumable training checkpoints\n\n'
+                'Full training state: weights, optimizer, scheduler, RNG and data cursor. '
+                'Public snapshots are sanitized to remove protected evaluation rows and account metadata. '
                 'Restore only from a verified receipt at its exact commit. Earlier snapshots remain '
                 'in commit history for recovery and the controlled RSI comparison. Do not squash '
                 'history during an active campaign. Updating the branch does not free history storage. '
@@ -105,7 +108,7 @@ class HFCheckpointStore:
                 'and [dataset attribution](https://huggingface.co/datasets/TassP0lar/SparkX2.6-MM).\n')
         result = self.api.create_commit(self.repo, repo_type='model', parent_commit=info.sha,
             operations=[CommitOperationAdd(OWNER, canonical(self.owner)), CommitOperationAdd('README.md', card.encode())],
-            commit_message='Initialize private Spark checkpoint destination')
+            commit_message=f'Initialize {visibility} Spark checkpoint destination')
         if json.loads(self._read_remote(OWNER, result.oid)) != self.owner:
             raise RuntimeError('HF checkpoint ownership write verification failed')
         return result.oid
@@ -151,7 +154,7 @@ class HFCheckpointStore:
 
     def _receipt(self, revision, payload, seconds=0):
         value = json.loads(payload)
-        return {'backend': 'huggingface', 'repo_id': self.repo, 'repo_type': 'model', 'private': True,
+        return {'backend': 'huggingface', 'repo_id': self.repo, 'repo_type': 'model', 'private': bool(self.c['checkpoint_repo_private']),
                 'revision': revision, 'marker_path': MARKER,
                 'commit_sha256': hashlib.sha256(payload).hexdigest(), 'kind': 'checkpoint',
                 'total_bytes': value['total_bytes'], 'seconds': seconds,
@@ -164,7 +167,8 @@ class HFCheckpointStore:
         directory = Path(directory).resolve()
         if not directory.is_relative_to((self.root / 'checkpoints').resolve()):
             raise ValueError('Only campaign-owned checkpoints may be uploaded')
-        snapshot = manifest(directory)
+        upload_directory = directory if self.c['checkpoint_repo_private'] else public_artifact(directory, self.root/'public-artifacts'/directory.name, 'checkpoint')
+        snapshot = manifest(upload_directory)
         if not REQUIRED <= {f['path'] for f in snapshot['files']} or read(directory/'BINDING.json') != self.binding:
             raise ValueError('Incomplete or foreign resumable checkpoint')
         head = self.ensure_repository()
@@ -196,7 +200,7 @@ class HFCheckpointStore:
             if head != saved['parent']:
                 raise RuntimeError('HF branch changed during checkpoint transaction; preserve local snapshots and reconcile')
             wanted = {PREFIX + f['path'] for f in snapshot['files']} | {MARKER}
-            operations = [CommitOperationAdd(PREFIX + f['path'], directory/f['path']) for f in snapshot['files']]
+            operations = [CommitOperationAdd(PREFIX + f['path'], upload_directory/f['path']) for f in snapshot['files']]
             operations += [CommitOperationAdd(MARKER, payload)]
             operations += [CommitOperationDelete(n) for n in sorted(names) if n.startswith(PREFIX) and n not in wanted]
             emit('hf_checkpoint_upload_start', repo_id=self.repo, bytes=snapshot['total_bytes'], files=len(snapshot['files']))
@@ -209,13 +213,15 @@ class HFCheckpointStore:
         # A local deletion acknowledgement is written by ColdStore only after
         # this verification AND its small receipt has been committed to Drive.
         emit('hf_checkpoint_verified', **receipt)
+        if upload_directory != directory:
+            shutil.rmtree(upload_directory, ignore_errors=True)
         return receipt
 
     def restore(self, receipt, destination):
         if (receipt.get('backend') != 'huggingface' or receipt.get('repo_id') != self.repo
                 or receipt.get('marker_path') != MARKER or receipt.get('repo_type') != 'model'
                 or not re.fullmatch('[0-9a-f]{40}', receipt.get('revision', ''))):
-            raise ValueError('Use an exact checkpoint receipt for this private repository')
+            raise ValueError('Use an exact checkpoint receipt for the configured repository')
         revision = receipt['revision']; payload = self._read_remote(MARKER, revision)
         if hashlib.sha256(payload).hexdigest() != receipt['commit_sha256']:
             raise ValueError('HF checkpoint receipt hash differs')

@@ -75,7 +75,7 @@ def prepare_assets(root,token,config,download_weights=True):
     if not token: raise ValueError('HF_TOKEN must be enabled in Colab Secrets')
     who=api.whoami()
     role=(who.get('auth',{}).get('accessToken') or {}).get('role')
-    if role=='read': raise ValueError('HF_TOKEN must permit writing the final private model repository, not only reading datasets')
+    if role=='read': raise ValueError('HF_TOKEN must permit writing the configured model/checkpoint repositories, not only reading datasets')
     if who.get('name')!='TassP0lar': raise ValueError('HF_TOKEN belongs to an unexpected publishing account')
     emit('hf_identity_verified',account=who['name'],token_role=role,publication_write_access_proven=False)
     # Check gated access before allocating a GPU or downloading other weights.
