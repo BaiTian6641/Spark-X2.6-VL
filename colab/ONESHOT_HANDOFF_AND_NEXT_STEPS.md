@@ -95,7 +95,7 @@ Colab itself documents variable runtime limits and nonpersistent VMs; see the [C
 
 The focused local suite exercises actual behavior: official Spark chat layout, Qwen prefix/sub-talker alignment and cached frames, Stable Audio EDM equations, Spark microbatch and cached-generation parity, source-group splitting, target-role isolation, contiguous-prefix worker commits, checkpoint write/retry/restore/purge behavior, full-Git source hashing, and expected subprocess exit codes. These are CPU/source tests, not proof of full-model G4 residency, throughput, quality, or fresh-VM recovery.
 
-**Observed during this correction:** **58 focused tests passed**. A direct CLI smoke also reached the expected environment gate without starting model or dataset downloads. These checks used the pinned API stack where required; no full Colab G4 campaign was launched.
+**Observed during this correction:** **59 focused tests passed**. A direct CLI smoke also reached the expected environment gate without starting model or dataset downloads. These checks used the pinned API stack where required; no full Colab G4 campaign was launched.
 
 The first G4 run remains the required hardware gate. A completed notebook must not be described as validated unless its actual receipts show whole-model qualification, fresh-process recovery, all stages, both RSI rounds, protected audit, offline reload, and verified upload. Human speech intelligibility/tone review, sound/music listening, broad spatial/temporal benchmarks, and independent 3D evaluation remain separate acceptance work.
 

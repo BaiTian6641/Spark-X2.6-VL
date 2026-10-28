@@ -109,6 +109,22 @@ def test_native_dit_v_prediction_reaches_spark_conditioning():
     assert model.dit.proj_out.weight.grad.abs().sum()>0
     assert type(model.scheduler()).__name__=='EDMDPMSolverMultistepScheduler'
 
+def test_diffusers_pretrained_loaders_accept_torch_dtype(tmp_path):
+    from diffusers import StableAudioDiTModel,AutoencoderOobleck
+    from diffusers.pipelines.stable_audio.modeling_stable_audio import StableAudioProjectionModel
+    dit=StableAudioDiTModel(sample_size=16,in_channels=8,out_channels=8,num_layers=1,attention_head_dim=16,num_attention_heads=4,num_key_value_attention_heads=2,cross_attention_dim=32,cross_attention_input_dim=32,time_proj_dim=16,global_states_input_dim=64)
+    dit.save_pretrained(tmp_path/'dit')
+    loaded=StableAudioDiTModel.from_pretrained(tmp_path/'dit',torch_dtype=torch.float32,local_files_only=True)
+    assert next(loaded.parameters()).dtype==torch.float32
+    vae=AutoencoderOobleck(encoder_hidden_size=128,downsampling_ratios=[2],channel_multiples=[1],decoder_channels=128,decoder_input_channels=64,audio_channels=2,sampling_rate=44100)
+    vae.save_pretrained(tmp_path/'vae')
+    loaded_vae=AutoencoderOobleck.from_pretrained(tmp_path/'vae',torch_dtype=torch.float32,local_files_only=True)
+    assert next(loaded_vae.parameters()).dtype==torch.float32
+    projection=StableAudioProjectionModel(text_encoder_dim=32,conditioning_dim=32,min_value=0,max_value=512)
+    projection.save_pretrained(tmp_path/'projection')
+    loaded_projection=StableAudioProjectionModel.from_pretrained(tmp_path/'projection',torch_dtype=torch.float32,local_files_only=True)
+    assert next(loaded_projection.parameters()).dtype==torch.float32
+
 def tiny_original_spark(adapt=True):
     """The pinned custom decoder source, dimension-reduced for CPU graph tests."""
     import hashlib,importlib,sys,types

@@ -101,9 +101,9 @@ class NativeSoundOutput(nn.Module):
         super().__init__()
         from diffusers import StableAudioDiTModel,AutoencoderOobleck
         from diffusers.pipelines.stable_audio.modeling_stable_audio import StableAudioProjectionModel
-        self.dit=(StableAudioDiTModel.from_pretrained(path,subfolder='transformer',local_files_only=True,dtype=torch.float32) if pretrained else StableAudioDiTModel.from_config(StableAudioDiTModel.load_config(path,subfolder='transformer',local_files_only=True)))
-        self.vae=(AutoencoderOobleck.from_pretrained(path,subfolder='vae',local_files_only=True,dtype=torch.float32) if pretrained else AutoencoderOobleck.from_config(AutoencoderOobleck.load_config(path,subfolder='vae',local_files_only=True)))
-        self.projection=(StableAudioProjectionModel.from_pretrained(path,subfolder='projection_model',local_files_only=True,dtype=torch.float32) if pretrained else StableAudioProjectionModel.from_config(StableAudioProjectionModel.load_config(path,subfolder='projection_model',local_files_only=True)))
+        self.dit=(StableAudioDiTModel.from_pretrained(path,subfolder='transformer',local_files_only=True,torch_dtype=torch.float32) if pretrained else StableAudioDiTModel.from_config(StableAudioDiTModel.load_config(path,subfolder='transformer',local_files_only=True)))
+        self.vae=(AutoencoderOobleck.from_pretrained(path,subfolder='vae',local_files_only=True,torch_dtype=torch.float32) if pretrained else AutoencoderOobleck.from_config(AutoencoderOobleck.load_config(path,subfolder='vae',local_files_only=True)))
+        self.projection=(StableAudioProjectionModel.from_pretrained(path,subfolder='projection_model',local_files_only=True,torch_dtype=torch.float32) if pretrained else StableAudioProjectionModel.from_config(StableAudioProjectionModel.load_config(path,subfolder='projection_model',local_files_only=True)))
         dim=self.projection.config.text_encoder_dim
         self.bridge=Resampler(spark_hidden,dim,policy['generator_prefix_tokens'])
         from diffusers import EDMDPMSolverMultistepScheduler
