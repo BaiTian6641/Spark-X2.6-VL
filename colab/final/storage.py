@@ -1,4 +1,4 @@
-"""Closed immutable checkpoint transactions. Drive is never an active filesystem."""
+"""HF full checkpoints and small immutable Drive artifacts; local active I/O."""
 from __future__ import annotations
 import json, os, shutil, time
 from pathlib import Path
@@ -27,14 +27,28 @@ def drive_service():
     return build('drive','v3',http=google_auth_httplib2.AuthorizedHttp(credentials,http=build_http()),cache_discovery=False)
 
 class ColdStore:
-    def __init__(self,root,config,binding):
+    def __init__(self,root,config,binding,token=None):
         self.root=Path(root); self.c=config; self.binding=binding; self.service=drive_service(); self.parent=validate_drive_id(config['drive_project_folder'])
         self.private=self.root/'private-upload-state'; self.private.mkdir(exist_ok=True,mode=0o700)
         item=drive_metadata(self.service,self.parent)
         if item.get('mimeType')!='application/vnd.google-apps.folder' or item.get('trashed'): raise ValueError('Invalid Drive project folder')
+        self.hf=None
+        if config.get('checkpoint_backend')=='huggingface':
+            from .hf_checkpoints import HFCheckpointStore
+            self.hf=HFCheckpointStore(root,config,binding,token)
     def commit(self,directory,kind='checkpoint'):
         directory=Path(directory).resolve()
         if not directory.is_relative_to(self.root.resolve()): raise ValueError('Only campaign-owned local artifacts may be uploaded')
+        if kind=='checkpoint' and self.hf is not None:
+            from .hf_checkpoints import receipt_path
+            receipt=self.hf.commit(directory)
+            # Back up the small exact-revision receipt before local reclamation.
+            index=self.root/'checkpoint-receipts'/('hf-'+receipt['revision']+'.json')
+            write(index,receipt); cold=self.small_file(index,'hf-checkpoint-receipt')
+            receipt={**receipt,'drive_index_receipt':cold}
+            write(receipt_path(directory),receipt)
+            emit('hf_checkpoint_committed',**receipt)
+            return receipt
         snapshot=manifest(directory); names={f['path'] for f in snapshot['files']}
         if kind=='checkpoint' and not REQUIRED<=names: raise ValueError('Incomplete resumable checkpoint')
         tx=identity([kind,directory.name,self.binding,snapshot]); state=self.private/tx; state.mkdir(exist_ok=True,mode=0o700)
@@ -63,8 +77,16 @@ class ColdStore:
         marker=state/'COMMITTED.json'; write(marker,value)
         result=upload_file(self.service,marker,folder,state/'commit-upload.json','COMMITTED.json')
         receipt={'folder_id':folder,'commit_file_id':result['file_id'],'commit_sha256':result['sha256'],'total_bytes':snapshot['total_bytes'],'seconds':time.monotonic()-started,'kind':kind}
-        write(directory.with_name(directory.name+'.drive-receipt.json'),receipt); emit('drive_committed',**receipt); return receipt
+        write(directory.with_name(directory.name+'.drive-receipt.json'),receipt)
+        if kind=='checkpoint':
+            from .hf_checkpoints import receipt_path
+            receipt={**receipt,'backend':'drive','verified':True,'binding':self.binding}
+            write(receipt_path(directory),receipt)
+        emit('drive_committed',**receipt); return receipt
     def restore(self,receipt,destination):
+        if receipt.get('backend')=='huggingface':
+            if self.hf is None: raise ValueError('HF checkpoint restore is not configured')
+            return self.hf.restore(receipt,destination)
         destination=Path(destination); destination.mkdir(parents=True,exist_ok=True)
         marker=destination.parent/(destination.name+'.COMMITTED.json')
         if not marker.exists(): download_verified(self.service,receipt['commit_file_id'],marker,receipt['commit_sha256'])
@@ -82,6 +104,9 @@ class ColdStore:
             if not p.exists(): download_verified(self.service,f['file_id'],p,f['sha256'])
             if p.stat().st_size!=f['bytes'] or sha(p)!=f['sha256']: raise ValueError('Restored checkpoint content differs')
         write(destination.with_name(destination.name+'.drive-receipt.json'),receipt)
+        if commit['kind']=='checkpoint':
+            from .hf_checkpoints import receipt_path
+            write(receipt_path(destination),{**receipt,'backend':'drive','verified':True,'binding':self.binding})
         return commit
     def small_file(self,path,kind):
         # Small ledgers are closed in uniquely named artifact directories. Keys,
@@ -103,4 +128,7 @@ class ColdStore:
                     if h: items.append({'folder_id':folder['id'],'commit_file_id':f['id'],'commit_sha256':h,'name':folder['name']})
             token=page.get('nextPageToken')
             if not token: break
+        if self.hf is not None:
+            latest=self.hf.latest()
+            if latest: items.append({**latest,'name':'HF latest verified resumable checkpoint'})
         return items

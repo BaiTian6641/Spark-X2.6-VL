@@ -38,15 +38,24 @@ def build(runtime_revision=None, runtime_only=False):
         cells.append({'cell_type':'code','metadata':{},'source':s.splitlines(keepends=True),'outputs':[],'execution_count':None,'id':f'cell-{len(cells):03d}'})
     md('''# Spark X2.6 native multimodal formal full fine-tune
 
-This is the formal source-bound campaign notebook, not the earlier image-only qualification. It implements SigLIP2 So400m NaFlex with tiles and spatial downshuffle, V-JEPA2.1 motion, Whisper/CLAP audio input, Qwen native speech output, Stable Audio native sound/music output, full-parameter stages, bounded instructor-guided replay comparisons, resumable Drive checkpoints and private HF model publication.
+This is the formal source-bound campaign notebook. It implements SigLIP2 So400m NaFlex with tiles and spatial downshuffle, V-JEPA2.1 motion, Whisper/CLAP audio input, Qwen native speech output, Stable Audio native sound/music output, full-parameter stages, two bounded MiMo instructor-guided replay comparisons, resumable Hugging Face checkpoints and private HF model publication.
 
-**Start on CPU.** Keep model/data random I/O on VM-local disk. Drive stores closed artifacts only. The released dataset has304,861 original instructions; complete bounded music-score views produce315,359 supervised views before source-group splitting. The local media cache is23GB; the free floor is44GB; two complete checkpoint slots are reserved. A full Git LFS dataset clone is prohibited by this disk design.
+**Start on CPU.** Keep model/data random I/O on VM-local disk. The released dataset has304,861 original instructions; complete bounded music-score views produce315,359 supervised views before source-group splitting. The local media cache is23GB; the free floor is44GB. Only two complete checkpoint slots can coexist while saving; after the new HF snapshot and its Drive receipt are verified, older local checkpoints are purged and the newest remains. A full Git LFS dataset clone is prohibited by this disk design.
+
+| Purpose | Destination | Local behavior |
+|---|---|---|
+| Pinned training data | `datasets/TassP0lar/SparkX2.6-MM` | Bounded rolling shard cache |
+| Complete resumable training state | Private `TassP0lar/SparkX2.6-MM-checkpoints` | Upload, verify, retain newest local snapshot |
+| Completed inference model | Private `TassP0lar/SparkX2.6-MM` | Export and upload after final evaluation |
+| Receipts, reports and instructor ledger | Your cold Drive project | Small closed uploads, no training I/O |
+
+**Cell sequence:** CPU setup/preflight → G4 install/qualification → fresh G4 recovery and `RUN_MODE='train'` → `RUN_MODE='resume'` on later sessions. Keep the emitted profile/checkpoint receipts. Upload failures have a separate CPU-only retry cell below. This is the complete staged script; no modality is removed to turn it into a trial.
 
 **Evidence boundary:** the source/CPU component tests do not certify the complete CUDA model. This notebook must earn its whole-model and fresh-VM recovery gates. A single notebook does not guarantee one uninterrupted VM session or successful multimodal quality within1000CU. It never silently reduces the curriculum to fit.
 
 Default final destination is the **private model repository** `TassP0lar/SparkX2.6-MM`; the public dataset namespace is separate. No instructor call or training happens merely by opening this notebook. Read the downloaded `RUN.md` after bootstrap.
 
-The runtime is downloaded from a pinned commit of [BaiTian6641/Spark-X2.6-VL](https://github.com/BaiTian6641/Spark-X2.6-VL). Its SHA256 and exact source inventory are checked before execution. The notebook contains no embedded source archive. Both CPU and CUDA setup recover an earlier Python-without-pip environment without relying on system `ensurepip`. Existing local data and Drive checkpoints stay in their original locations.''')
+The runtime is downloaded from a pinned commit of [BaiTian6641/Spark-X2.6-VL](https://github.com/BaiTian6641/Spark-X2.6-VL). Its SHA256 and exact source inventory are checked before execution. The notebook contains no embedded source archive. Both CPU and CUDA setup recover an earlier Python-without-pip environment without relying on system `ensurepip`. Setup preserves existing files; training reclaims only older verified campaign checkpoints under the policy above.''')
     code(f'''# Verified source bootstrap: standard library only, no credentials.
 import hashlib, io, json, os, pathlib, sys, urllib.request, zipfile
 SOURCE_SHA256 = {source_sha!r}
@@ -85,7 +94,7 @@ print((SOURCE_ROOT/'colab/final/RUN.md').read_text())
 ''')
     md('''## Operator configuration
 
-Keep Secrets in Colab's key panel, not in these cells. Enable access for `HF_TOKEN` and `OPENCODE_API_KEY`. The HF account must have access to [Stable Audio Open1.0](https://huggingface.co/stabilityai/stable-audio-open-1.0) before the CPU preflight passes. This notebook never accepts a model license on your behalf.
+Keep Secrets in Colab's key panel, not in these cells. Enable access for `HF_TOKEN` and `OPENCODE_API_KEY`. The HF token must be able to read component models and write to both the private checkpoint and final-model repositories. The HF account must have access to [Stable Audio Open1.0](https://huggingface.co/stabilityai/stable-audio-open-1.0) before the CPU preflight passes. This notebook never accepts a model license on your behalf.
 
 Fill the instructor eligibility receipt from provider/account evidence before formal training. OpenCode Go API readiness and the key's existence do not establish permission or quota for dataset review. The implementation stops at that gate instead of guessing. Keep its $50 cumulative ceiling.
 
@@ -94,6 +103,8 @@ For GPU work, replace the two `None` usage fields with the **actual current** Co
 # Stable campaign name/work root across VM replacements.
 CONFIG['model_repo'] = 'TassP0lar/SparkX2.6-MM'
 CONFIG['model_repo_private'] = True
+CONFIG['checkpoint_repo'] = 'TassP0lar/SparkX2.6-MM-checkpoints'
+CONFIG['checkpoint_repo_private'] = True
 CONFIG['drive_project_folder'] = '1ELmWWHxpCb3IGM2LZDQV-u7NiLxK12T_'
 CONFIG['observed_compute_balance'] = None  # Enter currently displayed balance before GPU commands.
 CONFIG['observed_cu_per_hour'] = None     # Enter currently displayed active rate (do not assume a quoted price).
@@ -108,7 +119,7 @@ assert WORK.resolve().is_relative_to('/content') and 'drive' not in WORK.parts
 WORK.mkdir(parents=True, exist_ok=True)
 CONFIG_PATH = WORK/'operator-config.json'
 CONFIG_PATH.write_text(json.dumps(CONFIG, indent=2))
-print({k:CONFIG[k] for k in ('campaign_id','model_repo','model_repo_private','max_compute_units','instructor_budget_usd')})
+print({k:CONFIG[k] for k in ('campaign_id','model_repo','checkpoint_repo','max_compute_units','instructor_budget_usd')})
 ''')
     md('''## Google access and in-memory Secrets
 
@@ -146,7 +157,7 @@ _spec = importlib.util.spec_from_file_location('spark_campaign_launcher', SOURCE
 _launcher = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_launcher)
 
-def run_campaign(mode, gpu=False, profile_receipt=None, resume_receipt=None):
+def run_campaign(mode, gpu=False, profile_receipt=None, resume_receipt=None, checkpoint_directory=None):
     python = str(WORK/('env-cuda' if gpu else 'env-cpu')/'bin/python')
     args = [python,'-m','colab.final.run',mode,'--config',str(CONFIG_PATH),'--source-sha',SOURCE_SHA256]
     for option, value in (('--profile-receipt',profile_receipt),('--resume-receipt',resume_receipt)):
@@ -154,6 +165,8 @@ def run_campaign(mode, gpu=False, profile_receipt=None, resume_receipt=None):
             receipt_path = WORK/(option[2:]+'.json')
             receipt_path.write_text(json.dumps(value))
             args += [option,str(receipt_path)]
+    if checkpoint_directory is not None:
+        args += ['--checkpoint-directory',str(checkpoint_directory)]
     env = os.environ.copy()
     env['PYTHONPATH'] = str(SOURCE_ROOT)
     log_path = WORK/'logs'/(mode+'-'+__import__('uuid').uuid4().hex+'.log')
@@ -182,7 +195,6 @@ if INSTALL_CUDA_ENVIRONMENT:
 ''')
     code('''RUN_QUALIFICATION = False  # Run once on the first GPU VM; do not repeat after it passes.
 if RUN_QUALIFICATION:
-    assert INSTRUCTOR_SECRET, 'Enable OPENCODE_API_KEY before the formal campaign'
     run_campaign('qualify', gpu=True)
     print('SAVE THE EMITTED QUALIFICATION PROFILE RECEIPT before replacing this VM.')
 ''')
@@ -190,9 +202,9 @@ if RUN_QUALIFICATION:
 
 After qualification, save its emitted **profile receipt**, reconnect a fresh VM, run source/bootstrap/config/auth/CPU setup again and install the CUDA environment. Enter that profile receipt below. `train` first restores the fully populated qualification checkpoint, reproduces two native continuation updates, and verifies recovery across boot IDs. It then restores the original initial snapshot and begins formal stages. This is the deliberate recovery qualification before a long campaign.
 
-If a later session ends, use `resume` with the last exact **checkpoint receipt** (not a profile/evaluation/unfinished upload). Optimizer-committed cursor recovery prevents skipped rows. Instructor intents are reconciled from Drive; an ambiguous POST requires operator/provider reconciliation. The $50 ceiling includes accumulated provider cash/list/allowance exposure.
+If a later session ends, use `resume` with the last exact **HF checkpoint receipt** (not a profile/evaluation/unfinished upload). The receipt pins a commit and complete manifest; loading a moving `main` branch is not a resume. Weights, optimizer, scheduler, RNG, stage and optimizer-committed data cursor are restored. Instructor intents are reconciled from Drive; an ambiguous POST requires operator/provider reconciliation. The $50 ceiling includes accumulated provider cash/list/allowance exposure.
 
-The full-stage projection must fit the current authorized CU balance plus reserve. The notebook will not promise a one-session result or remove modalities/epochs to make the estimate fit. Watch `training`, `drive_committed`, `qualification_complete` and `final_model_uploaded` events. A stop event is not completion.''')
+The full-stage projection must fit the current authorized CU balance plus reserve. Watch `training`, `hf_checkpoint_committed`, `local_checkpoint_purged`, `qualification_complete` and `final_model_uploaded` events. A stop event is not completion. The entire six-stage curriculum and two controlled RSI rounds are configured below the launcher in the versioned runtime.''')
     code('''PROFILE_RECEIPT = None  # Paste the nonsecret committed qualification-profile receipt dict.
 RESUME_RECEIPT = None   # For a later interruption, paste an exact committed checkpoint receipt dict.
 RUN_MODE = 'inspect'    # 'inspect', 'train', 'resume', or 'recover' (recovery only).
@@ -201,15 +213,29 @@ if RUN_MODE == 'inspect':
 elif RUN_MODE in ('train','resume','recover'):
     assert PROFILE_RECEIPT, 'The qualification-profile receipt is required'
     assert CONFIG['observed_compute_balance'] and CONFIG['observed_cu_per_hour'], 'Refresh current usage observations'
-    assert CONFIG['instructor_route_eligibility_receipt'], 'Resolve the provider/account dataset-review eligibility before formal training'
-    assert INSTRUCTOR_SECRET, 'Enable OPENCODE_API_KEY'
+    if RUN_MODE != 'recover':
+        assert CONFIG['instructor_route_eligibility_receipt'], 'Resolve the provider/account dataset-review eligibility before formal training'
+        assert INSTRUCTOR_SECRET, 'Enable OPENCODE_API_KEY'
     run_campaign(RUN_MODE,gpu=True,profile_receipt=PROFILE_RECEIPT,resume_receipt=RESUME_RECEIPT)
 else:
     raise ValueError('Unknown explicit run mode')
 ''')
+    md('''## Checkpoint discovery and upload-only recovery
+
+Use this cell only after the training process has exited. If an HF upload or its small Drive receipt failed, keep the VM and its local checkpoint. Enter the exact closed directory from the stopped run, then retry its upload with CPU tooling. This performs no optimizer steps or teacher calls. Success verifies every remote file, backs up the receipt and purges older verified local checkpoints; use the resulting receipt with `RUN_MODE='resume'`.
+
+The HF branch updates `checkpoint/` atomically. Earlier exact commits remain recoverable for qualification and RSI; the script never squashes their history. Updating a branch does **not** reclaim HF history quota. HF storage/access/quota failures stop cleanup and preserve local files. Old local snapshots, not remote history, are purged.''')
+    code('''DISCOVER_CHECKPOINTS = False
+RETRY_CHECKPOINT_DIRECTORY = None  # Example: str(WORK/'checkpoints/joint_full-00000100')
+if DISCOVER_CHECKPOINTS:
+    run_campaign('discover')
+if RETRY_CHECKPOINT_DIRECTORY is not None:
+    run_campaign('upload-checkpoint', checkpoint_directory=RETRY_CHECKPOINT_DIRECTORY)
+print('Local checkpoint directories:', [p.name for p in (WORK/'checkpoints').glob('*') if p.is_dir()])
+''')
     md('''## Receipts and results
 
-A finished campaign uploads the selected **trained private model** using `HF_TOKEN`, verifies the remote model LFS checksum and writes `MODEL_UPLOAD_RECEIPT.json` to local disk and cold Drive. The export is also reloaded from only its own saved configs/code/weights before uploading. It excludes optimizer state, credentials, raw training data and private instructor ledgers. Complete resumable checkpoints remain in Drive.
+A finished campaign uploads the selected **trained private model** using `HF_TOKEN`, verifies the remote model LFS checksum and writes `MODEL_UPLOAD_RECEIPT.json` to local disk and cold Drive. The export is also reloaded from only its own saved configs/code/weights before uploading. It excludes optimizer state, credentials, raw training data and private instructor ledgers. Complete resumable checkpoints remain in their separate private HF repository; their small receipts and reports remain in Drive.
 
 The card reports actual internal results, the selected/rejected RSI candidates and pending human audio review. A completed curriculum is not proof of broad vision/video/music capability. Listen to the final native samples and their zero-bridge controls; examine input ablations, temporal reversal, bilingual retention and independent-group counts. Stronger downstream acceptance still needs the documented domain/public benchmarks and qualified listeners.''')
     code('''# Read only sanitized status/receipts. Never display credentials or upload-state files.

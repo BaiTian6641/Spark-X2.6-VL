@@ -35,6 +35,10 @@ def validate_config(c):
     local(c['work_root'])
     if not re.fullmatch(r'TassP0lar/[A-Za-z0-9_.-]+',c['model_repo']): raise ValueError('Use an explicit model repository in the intended account')
     if c['model_repo_private'] is not True: raise ValueError('This reviewed release publishes a private experimental model')
+    if c.get('checkpoint_backend')!='huggingface' or c.get('checkpoint_repo_private') is not True:
+        raise ValueError('Formal checkpoints require the reviewed private Hugging Face storage policy')
+    if not re.fullmatch(r'TassP0lar/[A-Za-z0-9_.-]+',c.get('checkpoint_repo','')) or c['checkpoint_repo']==c['model_repo']:
+        raise ValueError('Use a separate explicit private checkpoint repository in the intended account')
     if not 0 < c['instructor_budget_usd'] <= 50 or not 0 < c['max_compute_units'] <= 1000: raise ValueError('Campaign exceeds the authorized budget')
     if c['cache_bytes_per_component']*10 > 24_000_000_000: raise ValueError('Global media cache exceeds its reservation')
     if c['checkpoint_slots']!=2 or c['drive_cap_bytes']>2_000_000_000_000: raise ValueError('Storage contract changed')
@@ -54,6 +58,15 @@ class ComputeBudget:
         current=time.monotonic(); dt=current-self.started; self.started=current
         self.state['active_seconds']+=dt
         if self.state['rate'] is not None: self.state['used_cu']+=dt*self.state['rate']/3600
+        return self.state
+    def merge_checkpoint(self,saved):
+        self.tick()
+        for key in ('used_cu','active_seconds'):
+            self.state[key]=max(self.state.get(key,0),saved.get(key,0))
+        # Current operator observations remain current; old checkpoints may
+        # supply accounting history but cannot refresh a stale observation.
+        if self.state['observed_at'] is None:
+            for key in ('observed_at','observed_balance','rate'): self.state[key]=saved.get(key)
         return self.state
     def check(self,needed_seconds=0):
         self.tick(); s=self.state

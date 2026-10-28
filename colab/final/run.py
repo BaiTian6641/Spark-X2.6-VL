@@ -1,6 +1,6 @@
 """CLI entry point. Secrets are received through stdin, never argv or files."""
 from __future__ import annotations
-import argparse,json,os,re,sys
+import argparse,json,os,re,sys,fcntl
 from pathlib import Path
 from .common import HERE,read,write,emit,validate_config
 
@@ -22,9 +22,18 @@ def doctor(root):
     write(Path(root)/'ENVIRONMENT.json',report); emit('environment_ready',**report); return report
 
 def main(secrets=None):
-    p=argparse.ArgumentParser(description=__doc__); p.add_argument('mode',choices=('cpu','doctor','qualify','discover','recover','train','resume')); p.add_argument('--config',required=True);p.add_argument('--source-sha',required=True); p.add_argument('--profile-receipt');p.add_argument('--resume-receipt');a=p.parse_args()
+    p=argparse.ArgumentParser(description=__doc__); p.add_argument('mode',choices=('cpu','doctor','qualify','discover','upload-checkpoint','recover','train','resume')); p.add_argument('--config',required=True);p.add_argument('--source-sha',required=True); p.add_argument('--profile-receipt');p.add_argument('--resume-receipt');p.add_argument('--checkpoint-directory');a=p.parse_args()
     if not re.fullmatch('[0-9a-f]{64}',a.source_sha): raise ValueError('Source archive SHA256 is required')
     config=validate_config(read(a.config)); root=Path(config['work_root']); root.mkdir(parents=True,exist_ok=True)
+    # Training, restore, retry-upload and cleanup share the same local slots.
+    # A second cell/process must never reclaim files from a running campaign.
+    with (root/'.campaign.lock').open('a') as lock:
+        try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError: raise RuntimeError('Another campaign process is active; wait for it to exit before retrying, restoring or cleaning checkpoints') from None
+        return dispatch(a,config,secrets)
+
+def dispatch(a,config,secrets):
+    root=Path(config['work_root'])
     os.environ.update(HF_HOME=str(root/'hf-metadata-cache'),HF_HUB_DISABLE_TELEMETRY='1',HF_HUB_DISABLE_XET='1',TORCH_HOME=str(root/'torch-metadata-cache'),WANDB_DISABLED='true',TOKENIZERS_PARALLELISM='false',UNSLOTH_COMPILE_DISABLE='1')
     if secrets is None: secrets=json.loads(sys.stdin.readline())
     token=secrets.get('HF_TOKEN'); key=secrets.get('OPENCODE_API_KEY')
@@ -43,9 +52,19 @@ def main(secrets=None):
         doctor(root)
         from .assets import prepare_assets
         paths=prepare_assets(root,token,config,download_weights=True)
-    elif a.mode not in ('discover',): doctor(root)
+    elif a.mode not in ('discover','upload-checkpoint'): doctor(root)
     campaign=Campaign(config,paths,a.source_sha,token,key)
     if a.mode=='discover': emit('drive_artifacts',commits=campaign.store.discover()); return
+    if a.mode=='upload-checkpoint':
+        if not a.checkpoint_directory: raise ValueError('Select the exact closed local checkpoint directory')
+        directory=Path(a.checkpoint_directory).resolve()
+        if directory.parent!=(root/'checkpoints').resolve() or not (directory/'CLOSED.json').exists():
+            raise ValueError('Only a closed direct child of the campaign checkpoint directory may be retried')
+        receipt=campaign.store.commit(directory)
+        from .checkpoint_cache import prune
+        prune(root,campaign.bound,[directory])
+        emit('checkpoint_upload_recovered',receipt=receipt,gpu_training_performed=False)
+        return
     if a.mode=='qualify':
         from .qualify import qualify
         qualify(campaign); return

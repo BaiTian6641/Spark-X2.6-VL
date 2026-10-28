@@ -1,4 +1,4 @@
-"""Private model publication with a narrow allowlist; optimizer stays on Drive."""
+"""Private inference-model publication; optimizer stays in the checkpoint repo."""
 import gc,os,shutil
 from pathlib import Path
 from .common import HERE,read,write,sha,emit,identity
@@ -48,7 +48,7 @@ model = load(package)
 # Sound/music: row['_family']='sound_out'; model.generate_audio(row, empty_media(), seconds=15).
 ```
 
-Install the included hashed dependency lock in an isolated CPython3.13 CUDA13.0 environment as described in `RUN.md`. The export contains model weights, preprocessing/configuration, exact runtime source and original tokenizer/codec infrastructure. Optimizer, scheduler, private instructor ledger, credentials and raw training media are excluded. Resumable training snapshots remain in the operator's Drive project.
+Install the included hashed dependency lock in an isolated CPython3.13 CUDA13.0 environment as described in `RUN.md`. The export contains model weights, preprocessing/configuration, exact runtime source and original tokenizer/codec infrastructure. Optimizer, scheduler, private instructor ledger, credentials and raw training media are excluded. Resumable training snapshots remain in the separate private checkpoint repository; their small receipts and reports are backed up to the operator's Drive project.
 
 Source release: `{bound['source_archive_sha256']}`. Dataset media revision: `{dataset['media_revision']}`. Metadata revision: `{dataset['catalogue_revision']}`.
 '''

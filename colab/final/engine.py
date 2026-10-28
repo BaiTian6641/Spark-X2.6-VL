@@ -5,6 +5,8 @@ from collections import Counter,defaultdict
 from pathlib import Path
 from .common import HERE,canonical,identity,read,write,sha,disk_guard,emit,ComputeBudget
 from .data import Catalogue,CommittedCursor,MediaReader,prepare_media,FAMILIES,cursor_rows
+from .checkpoint_cache import acknowledged,prune,rebind_assets
+from .hf_checkpoints import receipt_path
 
 
 def rng_state():
@@ -73,9 +75,10 @@ def checkpoint(model,optimizer,scheduler,state,root,config,bound,store):
         required={'model.safetensors','optimizer.pt','scheduler.pt','rng.pt','STATE.json','config.json','BINDING.json','PARAMETERS.json','CLOSED.json'}
         if required<=names:
             if read(directory/'BINDING.json')!=bound or read(directory/'PARAMETERS.json')['sample_sha256']!=sample_hash(model): raise ValueError('Checkpoint name collides with a changed model/source')
-            receipt_path=directory.with_name(directory.name+'.drive-receipt.json')
-            result=read(receipt_path) if receipt_path.exists() else store.commit(directory)
+            receipt_file=receipt_path(directory)
+            result=read(receipt_file) if acknowledged(directory,bound) else store.commit(directory)
             state.update(last_checkpoint=result,last_checkpoint_local=str(directory),checkpoint_bytes=sum(p.stat().st_size for p in directory.rglob('*') if p.is_file()))
+            rebind_assets(model,directory); prune(root,bound,[directory])
             return result
         intent=directory/'INTENT.json'
         if not intent.exists() or read(intent).get('binding')!=bound: raise RuntimeError('Unknown incomplete local artifact; no automatic overwrite')
@@ -84,12 +87,8 @@ def checkpoint(model,optimizer,scheduler,state,root,config,bound,store):
         shutil.rmtree(directory)
     # Reserve the second complete slot before writing a new closed snapshot.
     estimate=max(state.get('qualified_checkpoint_reservation_bytes',config['initial_checkpoint_reservation_bytes']),int(state.get('checkpoint_bytes',0)))
+    prune(root,bound,[state.get('last_checkpoint_local')],incoming=directory)
     existing=[p for p in (root/'checkpoints').glob('*') if p.is_dir()]
-    if len(existing)>=2:
-        for old in sorted(existing,key=lambda p:p.stat().st_mtime)[:-1]:
-            if not old.with_name(old.name+'.drive-receipt.json').exists() or read(old/'BINDING.json')!=bound: raise RuntimeError('Uncommitted or foreign local checkpoint occupies a slot')
-            shutil.rmtree(old)
-        existing=[p for p in (root/'checkpoints').glob('*') if p.is_dir()]
     disk_guard(root,pending=estimate,reserve=estimate if not existing else 0)
     directory.mkdir(parents=True); write(directory/'INTENT.json',{'binding':bound,'stage':state['stage'],'updates':state.get('updates',0)}); started=time.monotonic()
     torch.cuda.synchronize(); save_model(model,str(directory/'model.safetensors'))
@@ -109,13 +108,9 @@ def checkpoint(model,optimizer,scheduler,state,root,config,bound,store):
     if local_bytes>estimate: raise RuntimeError('Measured checkpoint exceeds its reservation; preserve it and revise the disk profile before further writes')
     receipt=store.commit(directory); state['checkpoint_bytes']=local_bytes; state['last_checkpoint']=receipt; state['last_checkpoint_local']=str(directory)
     emit('checkpoint_measured',bytes=local_bytes,write_seconds=time.monotonic()-started,receipt=receipt)
-    # Reclaim only an older, campaign-owned, hash-verified durable local snapshot.
-    for old in existing:
-        receipt_path=old.with_name(old.name+'.drive-receipt.json')
-        if not receipt_path.exists(): raise RuntimeError('Refusing to reclaim a checkpoint without a durable receipt')
-        old_binding=read(old/'BINDING.json')
-        if old_binding!=bound: raise RuntimeError('Refusing to reclaim another campaign snapshot')
-        shutil.rmtree(old)
+    # Future snapshot copies must use the newly retained preprocessing/codec
+    # assets, not a restored directory that is about to be reclaimed.
+    rebind_assets(model,directory); prune(root,bound,[directory])
     return receipt
 
 def reload_paths(directory):
@@ -139,6 +134,7 @@ def load_checkpoint(directory,config,bound,model=None,load_optimizer=True):
     state=read(directory/'STATE.json')
     if model is None: model=SparkNative(reload_paths(directory),config,pretrained=False)
     model.set_stage(state.get('alignment_only',False)); load_model(model,str(directory/'model.safetensors'),strict=True,device='cpu')
+    rebind_assets(model,directory)
     if sample_hash(model)!=read(directory/'PARAMETERS.json')['sample_sha256']: raise ValueError('Reloaded parameter samples differ')
     optimizer=optimizer_for(model,config)
     from transformers import get_cosine_schedule_with_warmup
@@ -155,7 +151,7 @@ class Campaign:
     def __init__(self,config,paths,source_sha,token=None,key=None):
         self.c=config; self.root=Path(config['work_root']); self.paths=paths; self.bound=binding(config,source_sha)
         from .storage import ColdStore
-        self.store=ColdStore(self.root,config,self.bound); self.catalogue=Catalogue(self.root/'metadata/corpus.sqlite')
+        self.store=ColdStore(self.root,config,self.bound,token); self.catalogue=Catalogue(self.root/'metadata/corpus.sqlite')
         self.reader=MediaReader(self.root,read(HERE.parent/'formal/HF_FULL_DATASET_HANDOFF.json'),config,token,reserve=2*config['initial_checkpoint_reservation_bytes'])
         self.key=key; self._hf_token=token; self.model=None; self.state={'stage':'initial','updates':0,'completed_stages':[],'rsi_rounds':[]}
         self.budget=ComputeBudget(config,read(self.root/'compute-budget.json') if (self.root/'compute-budget.json').exists() else None)
@@ -178,6 +174,7 @@ class Campaign:
         write(self.root/'CAMPAIGN.json',self.state); self.last_checkpoint=time.monotonic(); return result
     def restore(self,receipt):
         directory=self.root/'checkpoints'/('restored-'+receipt['commit_sha256'][:12])
+        prune(self.root,self.bound,[self.state.get('last_checkpoint_local')],incoming=directory)
         commit=self.store.restore(receipt,directory)
         self.model,optimizer,scheduler,self.state=load_checkpoint(directory,self.c,self.bound,model=self.model)
         self.state['last_checkpoint_local']=str(directory); self.state['last_checkpoint']=receipt
@@ -187,7 +184,10 @@ class Campaign:
         if (directory/'INSTRUCTOR_LEDGER.json').exists():
             p=self.root/'instructor/LEDGER.json'; p.parent.mkdir(exist_ok=True); shutil.copy2(directory/'INSTRUCTOR_LEDGER.json',p)
         if (directory/'COMPUTE_BUDGET.json').exists():
-            self.budget=ComputeBudget(self.c,read(directory/'COMPUTE_BUDGET.json')); self.budget.observe(self.c['observed_compute_balance'],self.c['observed_cu_per_hour'])
+            # Replaying an older RSI parent must not rewind campaign spending.
+            self.budget.merge_checkpoint(read(directory/'COMPUTE_BUDGET.json'))
+            write(self.root/'compute-budget.json',self.budget.state)
+        prune(self.root,self.bound,[directory])
         foreign=commit['runtime_boot_id']!=Path('/proc/sys/kernel/random/boot_id').read_text().strip()
         proof={'schema_version':1,'passed':True,'fresh_vm':foreign,'parameter_samples_match':True,'optimizer_restored':True,'scheduler_restored':True,'rng_restored':True,'receipt':receipt,'binding':self.bound}
         write(self.root/'RESTORE_PROOF.json',proof); self.store.small_file(self.root/'RESTORE_PROOF.json','restore-proof')
@@ -380,17 +380,14 @@ class Campaign:
         if self.model is None: raise RuntimeError('Restore the reviewed initial or resumable campaign checkpoint first')
         slot=math.ceil(profile['complete_checkpoint_bytes']*1.10)
         self.reader.checkpoint_slot_bytes=slot; self.state['qualified_checkpoint_reservation_bytes']=slot
-        from colab.stage1.drive_checkpoint import project_usage
-        remaining_drive=self.c['drive_cap_bytes']-project_usage(self.store.service,self.c['drive_project_folder'])-100_000_000_000
-        # Fixed stage/RSI snapshots plus periodic commits must fit cold storage.
-        fixed=len(self.c['stages'])+3*self.c['instructor_rounds']
-        periodic_slots=math.floor(remaining_drive/slot)-fixed
-        if periodic_slots<1: raise RuntimeError('Drive project cannot retain the declared stage/RSI checkpoints and a periodic recovery history')
-        required_minutes=math.ceil(profile['projected_hours']*60/periodic_slots/10)*10
+        # Full snapshots live in HF commit history. Drive holds only reports,
+        # ledgers and receipt indexes, each checked against its cap on upload.
+        # HF quota errors preserve the local fallback and stop; no remote
+        # history is squashed because old revisions are needed for RSI/recovery.
         transfer_minutes=math.ceil(profile['qualification_complete_receipt'].get('seconds',0)*1.2*4/60/10)*10
-        self.effective_checkpoint_minutes=max(self.c['checkpoint_minutes'],required_minutes,transfer_minutes)
-        if self.effective_checkpoint_minutes>self.c['max_checkpoint_minutes']: raise RuntimeError('Cold-storage capacity requires a checkpoint interval beyond the reviewed maximum')
-        write(self.root/'STORAGE_PROFILE.json',{'measured_checkpoint_bytes':profile['complete_checkpoint_bytes'],'slot_with_margin':slot,'effective_checkpoint_minutes':self.effective_checkpoint_minutes,'requested_checkpoint_minutes':self.c['checkpoint_minutes'],'transfer_overhead_minutes_requirement':transfer_minutes,'cold_project_cap_bytes':self.c['drive_cap_bytes'],'no_cold_artifacts_deleted':True})
+        self.effective_checkpoint_minutes=max(self.c['checkpoint_minutes'],transfer_minutes)
+        if self.effective_checkpoint_minutes>self.c['max_checkpoint_minutes']: raise RuntimeError('Measured checkpoint transfer overhead exceeds the reviewed maximum interval')
+        write(self.root/'STORAGE_PROFILE.json',{'checkpoint_backend':'huggingface','checkpoint_repo':self.c['checkpoint_repo'],'measured_checkpoint_bytes':profile['complete_checkpoint_bytes'],'slot_with_margin':slot,'effective_checkpoint_minutes':self.effective_checkpoint_minutes,'requested_checkpoint_minutes':self.c['checkpoint_minutes'],'transfer_overhead_minutes_requirement':transfer_minutes,'drive_small_artifacts_cap_bytes':self.c['drive_cap_bytes'],'local_retained_after_commit':1,'local_peak_checkpoint_slots':2,'remote_history_squashed':False})
         emit('storage_profile',**read(self.root/'STORAGE_PROFILE.json'))
         if not self.state.get('completed_stages') and self.state['stage']=='initial':
             self.budget.check(profile['projected_hours']*3600)
