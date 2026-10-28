@@ -114,7 +114,9 @@ def _valid_recovery_proof(proof,profile):
 
 
 def direct(config,token,key,source_sha):
-    if not key: raise ValueError('OPENCODE_API_KEY is required: the campaign includes two instructor RSI rounds')
+    phase=config.get('run_phase','full')
+    if phase not in ('full','train','rsi','audit'): raise ValueError('Expected run_phase full, train, rsi or audit')
+    if phase in ('full','rsi') and not key: raise ValueError('OPENCODE_API_KEY is required for instructor rounds')
     from .teacher import eligibility
     eligibility(config)
     from .assets import prepare_assets,prepare_data
@@ -147,6 +149,8 @@ def direct(config,token,key,source_sha):
         else:
             local_state=read(state_path) if state_path.exists() else {}
             qualification_active=local_state.get('stage','').startswith('qualification-') and not local_state.get('completed_stages')
+            if phase not in ('full','train'):
+                raise RuntimeError('Run the full fine-tune phase before RSI or result checking')
             if latest and not qualification_active:
                 raise RuntimeError('A remote checkpoint exists without a bound qualification profile; refusing to restart qualification over trained history')
             profile=qualify(campaign)

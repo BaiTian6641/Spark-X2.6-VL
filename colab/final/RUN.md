@@ -19,7 +19,7 @@ The latest user instruction changes full checkpoint storage to **Hugging Face**.
 | Artifact | Destination |
 |---|---|
 | Existing pinned data | `datasets/TassP0lar/SparkX2.6-MM` |
-| Full resumable snapshots | Public sanitized model repo `TassP0lar/SparkX2.6-MM-checkpoints-g4-v8` |
+| Full resumable snapshots | Public sanitized model repo `TassP0lar/SparkX2.6-MM-checkpoints-g4-v9` |
 | Finished inference package | Public model repo `TassP0lar/SparkX2.6-MM-g4-v2` |
 | Protected evaluation rows and account metadata | Excluded from public artifacts; only aggregate/receipt state is retained |
 
@@ -75,6 +75,8 @@ The optional CPU preflight identifies model metadata, dataset/split preparation 
 8. If the projected complete curriculum exceeds the authorized wall/CU envelope, execution stops before formal training. A budget stop, OOM, failed recovery or incomplete stage cannot be labeled completed. No stage, epoch or RSI arm is silently shortened.
 9. On interruption, direct mode restores the latest verified checkpoint and bound profile/proof. Instructor intents/receipts are committed in the HF `ledger/` namespace before and after each POST, so uncertain outcomes are reconciled without automatic retry. For an upload failure, set `RETRY_CHECKPOINT_DIRECTORY` in the notebook's final cell and run it: `upload-checkpoint` performs no optimizer steps, reconciles/verifies the exact transaction and marks the session resumable. Do not retry concurrently with training.
 10. After all stages, both RSI rounds and the protected audit, the export is reloaded offline. Final publication verifies the exact remote inventory and every manifest file, including model LFS SHA256 and ordinary Git content hashes, and reconciles an already-committed matching release before another upload. Public artifacts exclude optimizer state, credentials, raw training media, protected evaluation rows, rationales and account observations.
+
+For the phase-split workflow, use `Spark_Full_Finetune.ipynb` for qualification and all six principal stages, `Spark_RSI_Post_Training.ipynb` for both instructor rounds, and `Spark_Result_Checking.ipynb` for the protected audit and publication. The phase field does not alter the checkpoint binding, so all three resume the same verified lineage.
 
 ## Storage and recovery
 

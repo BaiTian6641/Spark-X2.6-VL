@@ -110,7 +110,10 @@ def test_native_dit_v_prediction_reaches_spark_conditioning():
     model.projection=StableAudioProjectionModel(text_encoder_dim=32,conditioning_dim=32,min_value=0,max_value=512)
     model.bridge=Resampler(48,32,4)
     model.scheduler_config={'sigma_min':.3,'sigma_max':500.,'sigma_data':1.0}
-    model.freeze_fixed_conditioning()
+    from colab.final.model import SparkNative
+    model.vae=nn.Module();root=SparkNative.__new__(SparkNative);nn.Module.__init__(root)
+    root.spark=nn.Linear(1,1);root.sound_out=model;root.speech_out=types.SimpleNamespace(freeze_codec=lambda:None)
+    root.set_stage(False)
     assert not model.projection.start_number_conditioner.time_positional_embedding[0].weights.requires_grad
     hidden=torch.randn(1,7,48,requires_grad=True);z=torch.randn(1,8,16);noise=torch.randn_like(z)
     scaled,timestep,target=model.diffusion(z,noise,torch.tensor([2.0]))

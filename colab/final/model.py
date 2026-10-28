@@ -172,6 +172,7 @@ class SparkNative(nn.Module):
         if hasattr(self.sound_out.dit,'enable_gradient_checkpointing'): self.sound_out.dit.enable_gradient_checkpointing()
     def freeze_infrastructure(self):
         self.speech_out.freeze_codec(); self.sound_out.vae.requires_grad_(False)
+        self.sound_out.freeze_fixed_conditioning()
     def train(self,mode=True):
         super().train(mode); self.speech_out.codec_model.eval(); self.sound_out.vae.eval(); return self
     def set_stage(self,alignment_only=False):

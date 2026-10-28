@@ -29,7 +29,7 @@ The replacement `colab/oneshot` WSD schedule, 20-source expansion, 12 GB reserve
 
 Open the notebook on branch `codex/formal-colab`, select the G4 runtime, and click **Run all**. The notebook records the actual Git `HEAD` and hashes every tracked file. Set `REPO_COMMIT` to a full 40-character commit when an immutable launch is required.
 
-If an existing checkpoint repository contains an incompatible trained payload, choose a new empty repository. The runner will not overwrite or rebind that history. The current default is a new sanitized public `TassP0lar/SparkX2.6-MM-checkpoints-g4-v8` repository because the residual-codebook and time-conditioning repairs change the exact source binding.
+If an existing checkpoint repository contains an incompatible trained payload, choose a new empty repository. The runner will not overwrite or rebind that history. The current default is a new sanitized public `TassP0lar/SparkX2.6-MM-checkpoints-g4-v9` repository because the phase-split runtime changes the exact source binding.
 
 | Exit | Meaning | Action |
 | ---: | --- | --- |
@@ -46,8 +46,16 @@ The cumulative budget is **110 GPU-hours**, including setup, qualification, trai
 - Local active files stay under `/content/spark-formal`.
 - Two measured checkpoint slots, initially 44 GB each, plus a 10% post-qualification margin.
 - Ten bounded 2.3 GB TAR caches; no full dataset clone or second HF payload cache.
-- Full checkpoints go to public sanitized `TassP0lar/SparkX2.6-MM-checkpoints-g4-v8`; HF history is preserved for recovery and RSI parent/control snapshots. Protected evaluation rows and account metadata are excluded.
+- Full checkpoints go to public sanitized `TassP0lar/SparkX2.6-MM-checkpoints-g4-v9`; HF history is preserved for recovery and RSI parent/control snapshots. Protected evaluation rows and account metadata are excluded.
 - Final inference weights go to public `TassP0lar/SparkX2.6-MM-g4-v2` after offline reload and remote hash verification; protected evaluation reports are excluded.
+
+## Phase notebooks
+
+- `Spark_Full_Finetune.ipynb`: `RUN_PHASE=train`; qualification plus all six principal stages, then `train_complete`.
+- `Spark_RSI_Post_Training.ipynb`: `RUN_PHASE=rsi`; both instructor rounds only, then `rsi_complete`.
+- `Spark_Result_Checking.ipynb`: `RUN_PHASE=audit`; protected audit, offline reload, and final publication, then `audit_complete`.
+
+The phase field is excluded from the checkpoint binding so all three notebooks resume the same `g4-v9` lineage. Each session has its own 22-hour cooperative deadline within the 110-hour cumulative budget.
 
 ## Evidence limits
 

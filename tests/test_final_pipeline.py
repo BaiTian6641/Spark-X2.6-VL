@@ -291,6 +291,60 @@ def test_rsi_stop_skips_evaluation_and_phase_completion(tmp_path,phase):
     assert read(tmp_path/'CAMPAIGN.json')['stopped_reason']=='direct_wall_hours'
 
 
+def make_phase_campaign(tmp_path,phase,completed=False):
+    from types import SimpleNamespace
+    from colab.final.engine import Campaign
+    campaign=object.__new__(Campaign);calls=[]
+    campaign.c={'run_phase':phase,'stages':[{'name':'a'},{'name':'b'}],'instructor_rounds':2,
+                'instructor_enabled':True,'instructor_model':'mimo-v2.6-pro',
+                'checkpoint_repo':'TassP0lar/test',
+                'checkpoint_minutes':90,'max_checkpoint_minutes':180,
+                'drive_cap_bytes':1,'seed':1}
+    campaign.root=tmp_path;campaign.bound={'source':'test'};campaign.model=object();campaign.stop_reason=None
+    campaign.state={'stage':'initial','updates':0,'completed_stages':['a','b'] if completed else [],'rsi_rounds':[{'round':1},{'round':2}] if phase=='audit' else []}
+    campaign.reader=SimpleNamespace(checkpoint_slot_bytes=1);campaign.budget=SimpleNamespace(check=lambda seconds:None)
+    campaign.check_wall_budget=lambda seconds:None;campaign.catalogue=SimpleNamespace(plan=lambda stage,seed:[])
+    campaign.qualify_instructor_format=lambda:calls.append('format')
+    campaign.evaluate=lambda split,name,generate=False:calls.append(('eval',name)) or {}
+    def train(stage,order,resume=False):
+        calls.append(('train',stage['name']));campaign.state['completed_stages'].append(stage['name'])
+    campaign.train_order=train
+    def rsi(round_no):
+        calls.append(('rsi',round_no));campaign.state['rsi_rounds'].append({'round':round_no})
+    campaign.instructed_rsi=rsi
+    campaign.store=SimpleNamespace(small_file=lambda *args:None)
+    return campaign,calls
+
+
+def test_train_phase_runs_only_principal_stages(tmp_path):
+    campaign,calls=make_phase_campaign(tmp_path,'train')
+    result=campaign.run_formal({'binding':campaign.bound,'complete_checkpoint_bytes':1,'projected_hours':1,'qualification_complete_receipt':{'seconds':0}},require_recovery=False)
+    assert result['phase']=='train_complete' and [call for call in calls if call[0]=='train']==[('train','a'),('train','b')]
+    assert 'format' not in calls and not any(call[0]=='rsi' for call in calls)
+
+
+def test_rsi_phase_skips_principal_training_and_audit(tmp_path):
+    campaign,calls=make_phase_campaign(tmp_path,'rsi',completed=True)
+    result=campaign.run_formal({'binding':campaign.bound,'complete_checkpoint_bytes':1,'projected_hours':1,'qualification_complete_receipt':{'seconds':0}},require_recovery=False)
+    assert result['phase']=='rsi_complete' and not any(call[0]=='train' for call in calls)
+    assert calls.count('format')==1 and [call for call in calls if call[0]=='rsi']==[('rsi',1),('rsi',2)]
+
+
+def test_audit_phase_requires_rsi_then_publishes(tmp_path,monkeypatch):
+    campaign,calls=make_phase_campaign(tmp_path,'audit',completed=True)
+    monkeypatch.setattr('colab.final.publish.export_and_upload',lambda campaign,config:{'phase':'published'})
+    result=campaign.run_formal({'binding':campaign.bound,'complete_checkpoint_bytes':1,'projected_hours':1,'qualification_complete_receipt':{'seconds':0}},require_recovery=False)
+    assert result['phase']=='published' and calls==[('eval','pretrained-native-baseline'),('eval','final-protected-audit')]
+    assert campaign.state['phase_result']=='audit_complete' and campaign.state['training_complete']
+
+
+
+def test_phase_changes_preserve_checkpoint_binding():
+    from colab.final.engine import binding
+    base=binding(CONFIG,'a'*64)
+    for phase in ('full','train','rsi','audit'):
+        assert binding({**CONFIG,'run_phase':phase},'a'*64)==base
+
 def test_existing_checkpoint_retry_enforces_measured_reservation(tmp_path,monkeypatch):
     from types import SimpleNamespace
     from colab.final import engine

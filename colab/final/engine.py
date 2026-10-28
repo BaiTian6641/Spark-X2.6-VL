@@ -26,7 +26,7 @@ def census(model):
 
 def binding(config,source_sha):
     operational=('observed_compute_balance','observed_cu_per_hour','instructor_route_eligibility_receipt',
-                 'drive_project_folder','direct_wall_hours','enforce_compute_budget')
+                 'drive_project_folder','direct_wall_hours','enforce_compute_budget','run_phase')
     stable={k:v for k,v in config.items() if k not in operational}
     return {'source_archive_sha256':source_sha,'component_lock_sha256':sha(HERE/'components.lock.json'),'dataset_lock_sha256':sha(HERE/'dataset.lock.json'),'policy_sha256':identity(stable)}
 
@@ -501,32 +501,45 @@ class Campaign:
         if not self.state.get('completed_stages') and self.state['stage']=='initial':
             self.budget.check(profile['projected_hours']*3600)
             self.check_wall_budget(profile['projected_hours']*3600)
-        self.qualify_instructor_format()
+        phase=self.c.get('run_phase','full')
+        if phase not in ('full','train','rsi','audit'): raise ValueError('Expected run_phase full, train, rsi or audit')
+        if phase in ('rsi','audit'):
+            missing={s['name'] for s in self.c['stages']}-set(self.state.get('completed_stages',[]))
+            if missing: raise RuntimeError('Full fine-tune stages are incomplete: '+','.join(sorted(missing)))
+        if phase=='audit' and len(self.state.get('rsi_rounds',[]))!=self.c['instructor_rounds']:
+            raise RuntimeError('Both instructed-RSI rounds must complete before result checking')
+        if phase in ('full','rsi'): self.qualify_instructor_format()
         if not (self.root/'BASELINE.json').exists():
             base=self.evaluate('dev','pretrained-native-baseline',generate=True); write(self.root/'BASELINE.json',base); self.store.small_file(self.root/'BASELINE.json','baseline')
-        for i,stage in enumerate(self.c['stages']):
-            if stage['name'] in self.state.get('completed_stages',[]): continue
-            order=self.catalogue.plan(stage,self.c['seed']+i)
-            resume=self.state.get('stage')==stage['name'] and self.state.get('cursor') is not None
-            self.train_order(stage,order,resume=resume)
-            if self.stop_reason:
-                self.state.update(training_complete=False,stopped_reason=self.stop_reason)
-                write(self.root/'CAMPAIGN.json',self.state)
-                emit('campaign_stopped',reason=self.stop_reason,stage=stage['name'],
-                     curriculum_complete=False,capability_promoted=False)
-                return {'stopped':True,'reason':self.stop_reason,'stage':stage['name'],
-                        'last_checkpoint':self.state.get('last_checkpoint')}
-            self.evaluate('dev',stage['name'],generate=False)
-        for round_no in range(1,self.c['instructor_rounds']+1):
-            if any(r['round']==round_no for r in self.state.get('rsi_rounds',[])): continue
-            result=self.instructed_rsi(round_no)
-            if isinstance(result,dict) and result.get('stopped'):
-                emit('campaign_stopped',reason=self.stop_reason,stage=result['stage'],
-                     curriculum_complete=False,capability_promoted=False)
-                return result
-        if len(self.state.get('rsi_rounds',[]))!=self.c['instructor_rounds']: raise RuntimeError('Required instructed-RSI comparisons are incomplete')
-        self.evaluate('audit','final-protected-audit',generate=True)
-        self.state.update(training_complete=True,final_audit_complete=True,human_audio_review='pending',capability_claims_verified=False)
-        write(self.root/'CAMPAIGN.json',self.state); self.store.small_file(self.root/'CAMPAIGN.json','campaign-completion')
-        from .publish import export_and_upload
-        return export_and_upload(self,self.c)
+        if phase in ('full','train'):
+            for i,stage in enumerate(self.c['stages']):
+                if stage['name'] in self.state.get('completed_stages',[]): continue
+                order=self.catalogue.plan(stage,self.c['seed']+i)
+                resume=self.state.get('stage')==stage['name'] and self.state.get('cursor') is not None
+                self.train_order(stage,order,resume=resume)
+                if self.stop_reason:
+                    self.state.update(training_complete=False,stopped_reason=self.stop_reason)
+                    write(self.root/'CAMPAIGN.json',self.state)
+                    emit('campaign_stopped',reason=self.stop_reason,stage=stage['name'],
+                         curriculum_complete=False,capability_promoted=False)
+                    return {'stopped':True,'reason':self.stop_reason,'stage':stage['name'],
+                            'last_checkpoint':self.state.get('last_checkpoint')}
+                self.evaluate('dev',stage['name'],generate=False)
+        if phase in ('full','rsi'):
+            for round_no in range(1,self.c['instructor_rounds']+1):
+                if any(r['round']==round_no for r in self.state.get('rsi_rounds',[])): continue
+                result=self.instructed_rsi(round_no)
+                if isinstance(result,dict) and result.get('stopped'):
+                    emit('campaign_stopped',reason=self.stop_reason,stage=result['stage'],
+                         curriculum_complete=False,capability_promoted=False)
+                    return result
+            if len(self.state.get('rsi_rounds',[]))!=self.c['instructor_rounds']: raise RuntimeError('Required instructed-RSI comparisons are incomplete')
+        if phase in ('full','audit'):
+            self.evaluate('audit','final-protected-audit',generate=True)
+            self.state.update(training_complete=True,final_audit_complete=True,human_audio_review='pending',capability_claims_verified=False,phase_result='audit_complete')
+            write(self.root/'CAMPAIGN.json',self.state); self.store.small_file(self.root/'CAMPAIGN.json','campaign-completion')
+            from .publish import export_and_upload
+            return export_and_upload(self,self.c)
+        self.state['phase_result']=phase+'_complete'
+        write(self.root/'CAMPAIGN.json',self.state);self.store.small_file(self.root/'CAMPAIGN.json','phase-completion')
+        return {'phase':self.state['phase_result'],'last_checkpoint':self.state.get('last_checkpoint')}
