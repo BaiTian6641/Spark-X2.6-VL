@@ -70,3 +70,13 @@ def test_oversized_line_cannot_leak_a_secret_across_read_boundary(tmp_path,capsy
     evidence=capsys.readouterr().out+(tmp_path/'long.log').read_text()
     assert 'Oversized child output line omitted' in evidence and 'after oversized line' in evidence
     assert 'unique' not in evidence and 'SecretValue' not in evidence
+
+
+def test_flashattention_tuple_output_backpropagates_through_output_tensor():
+    import torch
+    from colab.final.run import _check_flash_attention_backward
+    torch.manual_seed(0)
+    q=torch.randn(1,2,8,8,dtype=torch.float32,requires_grad=True)
+    result=(torch.nn.functional.scaled_dot_product_attention(q,q,q),None)
+    _check_flash_attention_backward(torch,result,q)
+    assert torch.isfinite(q.grad).all() and q.grad.abs().sum()>0

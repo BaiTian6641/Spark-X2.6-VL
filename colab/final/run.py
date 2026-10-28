@@ -21,6 +21,13 @@ def doctor(root):
     report={'python':sys.version.split()[0],'torch':torch.__version__,'cuda':torch.version.cuda,'gpu':torch.cuda.get_device_name(),'capability':list(torch.cuda.get_device_capability()),'bf16':True,'studio_backend_file':str(Path(backend.__file__).resolve()),'studio_backend_sha256':sha(backend.__file__),'versions':{k:importlib.metadata.version(k) for k in ('unsloth','unsloth-zoo','transformers','trl','accelerate','bitsandbytes','diffusers','qwen-tts')},'actual_cuda_sdpa_backward':True,'full_native_model_qualified':False}
     write(Path(root)/'ENVIRONMENT.json',report); emit('environment_ready',**report); return report
 
+def _check_flash_attention_backward(torch,result,q):
+    out,_=result
+    out.float().square().mean().backward()
+    if not torch.isfinite(q.grad).all() or not q.grad.abs().sum():
+        raise RuntimeError('FlashAttention CUTE backward check failed')
+
+
 def direct_doctor(root):
     import importlib.metadata,subprocess
     import unsloth  # Must precede Transformers/Studio imports.
@@ -39,10 +46,8 @@ def direct_doctor(root):
     if not torch.isfinite(q.grad).all() or not q.grad.abs().sum(): raise RuntimeError('CUDA attention gradient check failed')
     from flash_attn.cute import flash_attn_func
     flash_q=torch.randn(1,4,32,128,device='cuda',dtype=torch.bfloat16,requires_grad=True)
-    flash_out=flash_attn_func(flash_q,flash_q,flash_q,causal=True)
-    flash_out.float().square().mean().backward()
-    if not torch.isfinite(flash_q.grad).all() or not flash_q.grad.abs().sum():
-        raise RuntimeError('FlashAttention CUTE backward check failed')
+    flash_result=flash_attn_func(flash_q,flash_q,flash_q,causal=True)
+    _check_flash_attention_backward(torch,flash_result,flash_q)
     report={'python':sys.version.split()[0],'torch':torch.__version__,'cuda':torch.version.cuda,
             'gpu':prop.name,'gpu_bytes':prop.total_memory,'capability':list(torch.cuda.get_device_capability()),
             'bf16':True,'studio_backend_file':str(Path(backend.__file__).resolve()),
