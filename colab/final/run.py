@@ -144,9 +144,11 @@ def direct(config,token,key,source_sha):
             profile,_=_restore_artifact(campaign,receipt,'QUALIFICATION.json')
             write(root/'QUALIFICATION_RECEIPT.json',receipt)
             emit('direct_profile_restored',revision=receipt['revision'])
-        elif latest:
-            raise RuntimeError('A remote checkpoint exists without a bound qualification profile; refusing to restart qualification over trained history')
         else:
+            local_state=read(state_path) if state_path.exists() else {}
+            qualification_active=local_state.get('stage','').startswith('qualification-') and not local_state.get('completed_stages')
+            if latest and not qualification_active:
+                raise RuntimeError('A remote checkpoint exists without a bound qualification profile; refusing to restart qualification over trained history')
             profile=qualify(campaign)
             storage_envelope(root,config,__import__('math').ceil(profile['complete_checkpoint_bytes']*1.10))
             write(root/'compute-budget.json',early.state)

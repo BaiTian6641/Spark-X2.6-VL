@@ -42,7 +42,7 @@ def artifact(kind, documents, created=1):
     }
 
 
-def execute(monkeypatch, tmp_path, items, docs):
+def execute(monkeypatch, tmp_path, items, docs, qualify_result=None):
     config = {
         'work_root': str(tmp_path), 'campaign_id': 'spark-test',
         'observed_compute_balance': None, 'observed_cu_per_hour': None,
@@ -88,9 +88,12 @@ def execute(monkeypatch, tmp_path, items, docs):
         'instructions': 1, 'original_instructions': 1, 'split_membership_sha256': 's' * 64,
     })
     monkeypatch.setattr('colab.final.engine.Campaign', Campaign)
-    monkeypatch.setattr('colab.final.qualify.qualify', lambda campaign: (_ for _ in ()).throw(AssertionError('unexpected requalification')))
+    if qualify_result is None:
+        monkeypatch.setattr('colab.final.qualify.qualify', lambda campaign: (_ for _ in ()).throw(AssertionError('unexpected requalification')))
+    else:
+        monkeypatch.setattr('colab.final.qualify.qualify', lambda campaign: qualify_result)
     monkeypatch.setattr('colab.final.qualify.recovery_check', lambda campaign, profile: (_ for _ in ()).throw(AssertionError('unexpected recovery rerun')))
-    run.direct(config, 'hf-secret', 'teacher-secret', 'a' * 64)
+    Campaign.instance.result = run.direct(config, 'hf-secret', 'teacher-secret', 'a' * 64)
     return Campaign.instance
 
 
@@ -109,3 +112,11 @@ def test_remote_checkpoint_without_profile_never_restarts_qualification(monkeypa
     latest = {'backend': 'huggingface', 'kind': 'checkpoint', **COMPLETE}
     with pytest.raises(RuntimeError, match='without a bound qualification profile'):
         execute(monkeypatch, tmp_path, [latest], docs)
+
+
+def test_failed_qualification_can_retry_before_formal_training(monkeypatch, tmp_path):
+    docs = documents()
+    write(tmp_path / 'CAMPAIGN.json', {'stage': 'qualification-studio', 'completed_stages': []})
+    latest = {'backend': 'huggingface', 'kind': 'checkpoint', **INITIAL}
+    campaign = execute(monkeypatch, tmp_path, [latest], docs, qualify_result=docs['qualification-profile'])
+    assert campaign.result == 10 and campaign.restored == []
