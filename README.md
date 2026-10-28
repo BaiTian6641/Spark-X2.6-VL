@@ -1,74 +1,61 @@
-# Spark X2.6 multimodal formal Colab pipeline
+# Spark X2.6 multimodal formal full-tuning pipeline
 
-[**Open the formal notebook in Colab**](https://colab.research.google.com/github/BaiTian6641/Spark-X2.6-VL/blob/fab1fa3b6e7428c79a5c496160ae871ccdf7a047/colab/Spark_Formal_Full_Finetune.ipynb) · [Review the notebook](https://github.com/BaiTian6641/Spark-X2.6-VL/blob/fab1fa3b6e7428c79a5c496160ae871ccdf7a047/colab/Spark_Formal_Full_Finetune.ipynb) · [Operator guide](colab/final/RUN.md)
+[**Open the formal notebook in Colab**](https://colab.research.google.com/github/BaiTian6641/Spark-X2.6-VL/blob/05a7ad773723e31e4d09f7282b75f93142be4437/colab/Spark_Formal_Full_Finetune.ipynb) · [Review notebook source](https://github.com/BaiTian6641/Spark-X2.6-VL/blob/05a7ad773723e31e4d09f7282b75f93142be4437/colab/Spark_Formal_Full_Finetune.ipynb) · [Complete operator guide](colab/final/RUN.md) · [Release report](reports/spark_multimodal/FORMAL_HF_CHECKPOINT_RELEASE_2026-10-27.md)
 
-Runtime source for the experimental full-parameter Spark X2.6 4B multimodal campaign. It combines SigLIP2 So400m NaFlex vision, tiles and spatial downshuffle; V-JEPA2.1 video features and explicit clocks; Whisper/CLAP audio understanding; native Qwen speech output; Stable Audio sound/music output; and two bounded instructor-guided replay comparisons. English and Chinese are the planned language coverage.
+The complete formal script for the English/Chinese multimodal Spark prototype is ready to run through its hardware and recovery checks. It uses Unsloth Studio's actual **headless training backend**. Its graphical UI is not launched, and custom-model speedup is measured during qualification.
 
-**The complete native CUDA campaign has not yet passed its hardware qualification.** CPU source/component tests and an install dry run are not evidence of a trained multimodal model. The notebook keeps the actual full-model profile and fresh-VM recovery gates before long formal training.
+The notebook is only **23,071 bytes**. It downloads a separate 5,019,537-byte source ZIP from runtime commit `669d9ce6ddbfa2d08d31bb4745008fdcd522eedc`, verifies SHA256 `7be91268cc09294d9aa29b9b9e6bcd447268a48764ddbbabf2f27f95d7be2332` and all 43 source files before executing. No large source archive or model weights are embedded in the notebook. [The release receipt](releases/RELEASE.json) binds the source and launcher.
 
-The notebook is a small launcher. It fetches `releases/spark-formal-runtime.zip` from a **full Git commit**, checks its SHA256 and exact source manifest, and extracts it to a release-specific local source directory. No source ZIP or model weights are embedded in the notebook. Runtime files are also available individually for review.
+## Complete configured workflow
 
-## Start or recover setup
+1. CPU environment, model access, source-grouped data/context audit and private checkpoint destination preflight.
+2. G4 CUDA/Studio whole-model qualification and fresh-VM full optimizer recovery.
+3. Finite bridge alignment, then full Spark vision tuning, temporal/AV tuning, speech/sound understanding, native speech/sound/music generation, and joint full tuning.
+4. Two MiMo-V2.6-Pro instructed replay rounds with matched uniform-replay controls and protected promotion evaluation.
+5. Final protected audit and native samples, offline export reload, then private HF model upload using Colab Secret `HF_TOKEN`.
 
-Open the pinned Colab link above. The launcher is **19,828 bytes**. Its runtime commit is `6f925694cf6cb8e43ca8a4c2791903c76a50e6b1`; the separately downloaded 5,010,530-byte source ZIP has SHA256 `c88f69aca289f5cb57919ca09daac9a9ae4db74086652d58cea4202b37200dce`. The notebook commit follows the runtime commit so it can pin immutable source without a circular build dependency. [The release receipt](releases/RELEASE.json) binds both artifacts.
+The architecture retains SigLIP2 So400m NaFlex with tiles and 2x2 spatial downshuffle; V-JEPA2.1 motion and explicit media clocks; Whisper/CLAP understanding; Qwen native speech output; and Stable Audio native sound/music output. Full Spark parameters train in the principal stages. The short bridge alignment freezes pretrained networks; codec/autoencoder infrastructure remains frozen. No LoRA or reduced-curriculum fallback is used.
 
-1. Use a **CPU runtime** for setup/preflight. Enable notebook access to Colab Secrets `HF_TOKEN` and `OPENCODE_API_KEY`. Do not paste either key in notebook cells, Git or chat.
-2. Run the source bootstrap, configuration and normal Google authentication cells. Keep the configured `/content/spark-formal` work root and intended Drive project folder. Review [the complete operator guide](colab/final/RUN.md).
-3. Run CPU environment setup and preflight. The setup repairs a previous isolated `env-cpu` containing Python but no pip. It validates isolation, synchronizes the complete hash-locked requirements and writes a readiness receipt only after `pip check`. It does not clear directories or delete data, checkpoints or Drive files.
-4. Only after CPU preflight, select the reviewed G4 Blackwell target, enter the actual current CU balance/rate and explicitly enable CUDA installation and qualification. GPU installation uses the same repair helper with the separate CUDA lock. The real Studio headless backend is used; the graphical UI is not launched.
-5. Follow the emitted qualification and cold-storage receipts for fresh-VM recovery, formal training, interrupted-session resume and final evaluation. `RUN_MODE='inspect'` and GPU-install/qualification flags are initially off. Opening this notebook does not start training or spend the instructor budget.
+All 304,861 published original instructions are represented by 315,359 complete bounded views, split by connected source groups. There are 290,685 training views and 603,668 configured stage exposures before RSI. The [dataset card](https://huggingface.co/datasets/TassP0lar/SparkX2.6-MM) preserves source citations, licenses and known coverage limits. Repeated training exposures are not additional media diversity. The [multimodal refinement review](reports/spark_multimodal/REFINEMENT_MULTIMODAL_REVIEW_2026-10-27.md) defines this project's scope; unrelated nested-learning work is excluded.
 
-Read the existing provider/account eligibility gate in the guide before instructor dataset review. The API key alone does not resolve that gate. The campaign retains the $50 cumulative instructor ceiling and the authorized 1000 CU envelope, and never silently shortens the curriculum to fit.
+## Storage for the 230 GB Colab disk
 
-## Visible preflight failures
+| Artifact | Destination | Retention |
+|---|---|---|
+| Published training data | HF dataset `TassP0lar/SparkX2.6-MM` | Pinned remote corpus;23 GB rolling local cache |
+| Full resumable checkpoints | Private HF model repo `TassP0lar/SparkX2.6-MM-checkpoints` | Atomically updated `checkpoint/`, exact commit receipts |
+| Finished inference model | Private HF model repo `TassP0lar/SparkX2.6-MM` | Clean export, separate from optimizer state |
+| Receipts, reports, instructor ledger | Existing cold Drive project | Small immutable uploads,2 TB project cap |
 
-An `environment_setup_complete` event means package setup passed; model, corpus and Drive checks still follow. The 2026-10-27 failure was HTTP403 `GatedRepo` from Stable Audio Open1.0. The user completed its access form, and the same Colab token then passed a read-only metadata probe.
+**After every successful checkpoint upload and verification, older local snapshots are purged.** One newest snapshot stays local; two slots may coexist during saving/restoring. The initial reservation is 55 GB per slot, replaced by the measured size plus margin after qualification. A 44 GB free floor is preserved. No whole-dataset LFS clone, checkpoint-repository clone, duplicate HF snapshot cache or random training I/O on Drive is used.
 
-The next actual Colab step exposed a missing CPU dependency: Transformers chat-template rendering requires Jinja2. The CPU lock now includes `Jinja2==3.1.6` and `MarkupSafe==3.0.4`, using the already reviewed CUDA versions/hashes. The isolated-environment test exercises `apply_chat_template` directly.
+Verification covers every remote file: size and LFS SHA256 for large objects, downloaded SHA256 for small Git files. A small receipt is backed up to Drive before deletion is acknowledged. Upload, checksum, quota or receipt-backup failure preserves the local fallback and new snapshot. Use the notebook's CPU-only upload-retry cell after the training process exits; it reconciles a lost response and does not repeat optimizer steps. A process lock prevents simultaneous training/retry/cleanup.
 
-The notebook now captures child stdout **and** stderr, prints progress and the exact stopped reason, reports the exit code, and saves bounded sanitized logs under `/content/spark-formal/logs`. It removes known secret values and signed URL queries before display/write. Ctrl-C forwards SIGINT once and continues reading the runner's checkpoint output until exit. The Hub access check verifies pinned metadata without following a signed CDN HEAD redirect; ordinary Hub/transport errors are no longer mislabeled as missing license approval. A failed retry invalidates earlier local readiness, and GPU commands require a successful preflight for the current source revision.
+Restore uses the receipt's exact HF revision and complete manifest, including weights, optimizer, scheduler, RNG, stage, frozen split and committed data cursor. Old remote revisions remain available for recovery and RSI. **Local cleanup does not reclaim HF history storage.** This script never squashes remote history or deletes unrelated data. HF private-storage quota is separate from local disk and Drive capacity; a rejected upload stops cleanup. Original workstation checkpoints remain local and untouched.
 
-For a `GatedRepo` error, review/request access at [Stable Audio Open1.0](https://huggingface.co/stabilityai/stable-audio-open-1.0) using the HF account that owns the Colab token. After approval, ensure the token permits reading that gated model and rerun the CPU cell. The pipeline never accepts terms or edits token scope. A new VM or environment reinstall is unnecessary for that access error.
+## Start the notebook
 
-The repaired release has now completed the **actual CPU preflight in Colab**: 304,861 original instructions, 315,359 views, zero context-audit failures, a committed 1,276-byte preflight artifact in Drive, and child exit code 0. Model access passed; local free storage was 218.05 decimal GB. No GPU training or instructor call occurred. [Repair report](reports/spark_multimodal/COLAB_PREFLIGHT_REPAIR_2026-10-27.md) records the evidence boundary and next gates.
+1. Open the pinned link above on **CPU**. Enable notebook access to `HF_TOKEN` and `OPENCODE_API_KEY` in Colab Secrets. HF needs component read access and write access to both private model repositories; do not put either secret in cells or files.
+2. Run source bootstrap, operator configuration, Google authentication and CPU setup/preflight in order. Keep active work under `/content/spark-formal`. Drive mounting is optional for browsing cold results.
+3. Select the G4 Blackwell runtime, enter its **current** CU balance/rate, enable `INSTALL_CUDA_ENVIRONMENT`, then run `RUN_QUALIFICATION` once. Preserve its emitted profile receipt.
+4. On a fresh VM, repeat setup and select `RUN_MODE='train'` with that profile receipt. The complete optimizer continuation check runs before the formal stages. Later sessions use `RUN_MODE='resume'` plus the exact verified checkpoint receipt.
+5. If upload failed while local files still exist, use `RETRY_CHECKPOINT_DIRECTORY` in the CPU recovery cell first. `DISCOVER_CHECKPOINTS` lists cold receipts and the latest verified HF checkpoint.
+6. The completed campaign uploads the private inference package automatically. `MODEL_UPLOAD_RECEIPT.json` identifies the exact verified final commit.
 
-## Bootstrap fix
+The $50 instructor and 1000 CU campaign limits remain configured. OpenCode Go's provider/account dataset-review eligibility field is still explicit in the guide; the script does not invent evidence or switch the chosen provider. Full CUDA qualification and recovery alone do not require instructor calls. GPU flags and `RUN_MODE='inspect'` initially prevent an accidental launch merely by opening the notebook.
 
-The previous notebook used `venv.EnvBuilder(with_pip=True)` and failed in the Colab system interpreter's `ensurepip` subprocess. The traceback did not include that subprocess's output, so the exact underlying `ensurepip` failure is unknown. A second bug accepted an existing Python executable as a completed environment.
+## Validation and current evidence
 
-`colab/final/bootstrap.py` uses only the standard library to fetch the pinned **uv 0.13.5** wheel, verifies both wheel and extracted executable hashes, and creates a pipless environment. `uv pip sync --require-hashes --only-binary :all:` installs the complete lock, including **pip 26.2.2**, independently of system `ensurepip`. Repeated setup audits matching packages; a failed sync invalidates a stale ready receipt. Installer state and temporary downloads stay under the local work root, outside Drive and the kernel environment. PyTorch packages use `--torch-backend cu130`; unrelated packages remain on PyPI.
+**71 focused tests passed for this release:** [68 runtime/data/native-component/checkpoint/notebook tests](validation/colab-formal-hf-checkpoint-tests-2026-10-27.log) and [three real isolated CPU bootstrap tests](validation/colab-formal-hf-bootstrap-tests-2026-10-27.log). Coverage includes real CPU optimizer serialization, repeated saves after cleanup, simulated Hub upload failures and lost responses, every-file remote verification, older-revision restore, receipt-backup failure, concurrency exclusion, CPU-only retry, cursor/cache behavior, native component gradients and the actual packaged notebook's hashes/import closure. One upstream Diffusers deprecation warning remains.
 
-The original ensurepip repair added `pip` to both dependency locks. This follow-up additionally adds the missing `Jinja2`/`MarkupSafe` CPU dependencies; existing training package versions remain unchanged. The CUDA environment's new install command passes a dry run; its installation and whole-model CUDA execution still need the notebook's hardware gates.
+The previous source release passed actual Colab CPU preflight and its chat-template audit. This source revision adds the checkpoint destination and must pass its own CPU preflight. The full native G4 campaign, live multi-gigabyte HF checkpoint transfer and trained multimodal quality are **not yet qualified**. No GPU training, instructor request or trained-model upload was performed while constructing this release. The final model card reports actual results and pending human audio review; it does not equate curriculum completion with broad capability acceptance.
 
-The archive/export packaging also includes the instructor accounting helper used by the RSI stage. Static import-closure checks and an isolated subprocess import verify that those modules are available outside the author's workspace.
+The earlier `ensurepip` and Jinja2 failures remain repaired: a hash-pinned external uv bootstrap creates/repairs isolated environments and synchronizes complete CPU/CUDA locks without replacing kernel packages. Child stdout/stderr are captured and sanitized, stopped reasons are visible, and Ctrl-C drains the checkpoint output. [Historical repair evidence](reports/spark_multimodal/COLAB_PREFLIGHT_REPAIR_2026-10-27.md) is retained separately.
 
-## Storage, data and model publication
+## Rebuild and provenance
 
-- Training uses the pinned [TassP0lar/SparkX2.6-MM dataset](https://huggingface.co/datasets/TassP0lar/SparkX2.6-MM). Its README preserves source citations and per-source terms. This code repository contains no training-media shards, datasets or model weights.
-- Active files use VM-local disk, a bounded 23GB rolling media cache, a 44GB free floor and two measured complete checkpoint slots. Do not clone all dataset LFS files into Colab's 230GB disk.
-- Google Drive is **cold storage** for closed, verified checkpoints and receipts, within the 2TB project cap. Training does not perform random model/data writes through a Drive mount.
-- The final completed model is uploaded using in-memory `HF_TOKEN` to the configured private **model** repository, default `TassP0lar/SparkX2.6-MM`. The dataset and model namespaces are separate. Resumable optimizer checkpoints remain in Drive.
-- Original workstation checkpoints remain local. A new runtime has a new source binding and is not interchangeable with an older trained checkpoint's source identity.
+Runtime files, component/data/environment locks, tests, the builder and the pinned upstream motion source archive are reviewable here. This repository contains no training media, credentials, notebook execution outputs or model weights.
 
-## Review, tests and rebuild
+First run `python scripts/build_final_colab.py --runtime-only`, copy its ZIP and manifest into `releases/` and commit the runtime. Then use `python scripts/build_final_colab.py --runtime-revision FULL_RUNTIME_COMMIT`, test and commit the small notebook and release receipt. The notebook always pins a full source commit rather than a moving branch.
 
-`releases/SOURCE_MANIFEST.json` lists every runtime file and SHA256. `colab/final/components.lock.json`, `dataset.lock.json`, the package locks and `bootstrap.lock.json` bind model sources, data, dependencies and installer separately. The upstream vision source is the pinned archive `colab/final/vendor/vjepa2-source.zip`; its MIT license and bundled third-party notices apply. Component models and datasets retain their own upstream licenses and access requirements; this repository grants no additional rights to their weights or data.
-
-The focused bootstrap tests require public PyPI access, CPython 3.13, and local test storage with at least 46GB free. They create/repair real environments, install CPU tooling, reject a bad package hash and verify that unrelated saved artifacts survive. They make no GPU, Drive or instructor requests. The notebook tests check schema, source inventory, immutable URL, code syntax, source tamper rejection and secret transport.
-
-The final repair passed **59 focused tests** (56 runtime/package/data tests plus three real isolated-environment tests), including actual subprocess stdout/stderr capture, secret redaction, native signal exit, graceful interrupt drain, changed pinned-file rejection, preflight readiness invalidation, notebook/package verification and existing native-component/storage/data tests. See the [repair test log](validation/colab-preflight-final-tests-2026-10-27.log). One upstream Diffusers deprecation warning remains. The earlier [49-test baseline](validation/colab-github-formal-final-tests-2026-10-27.log), [real bootstrap recovery tests](validation/colab-bootstrap-repair-tests-2026-10-27.log) and [CUDA lock dry run](validation/colab-cuda-lock-dry-run-2026-10-27.log) are also retained. The [updated CPU install/chat-template tests](validation/colab-chat-template-bootstrap-tests-2026-10-27.log) passed after adding Jinja2/MarkupSafe; the CUDA lock and installer are unchanged. These results do not establish full-model CUDA readiness or multimodal training quality.
-
-```bash
-UV_CACHE_DIR="$PWD/.test-cache" uv run --no-project --python 3.13 \
-  --with pytest==8.4.2 --with nbformat==5.10.4 \
-  python -m pytest -q tests/test_final_bootstrap.py tests/test_final_notebook.py \
-  --basetemp "$PWD/.test-tmp"
-```
-
-To release changes, first run `python scripts/build_final_colab.py --runtime-only`, copy its source ZIP/manifest from `output/colab-formal-final/` into `releases/`, and commit the reviewed runtime files and archive. Then run `python scripts/build_final_colab.py --runtime-revision FULL_RUNTIME_COMMIT`, copy `output/colab-formal-final/RELEASE.json` into `releases/`, test and commit the small notebook. Always publish the runtime commit as well as the launcher commit. Never replace the full source commit with a moving branch URL inside the notebook.
-
-## Plans and references
-
-The [formal campaign plan](reports/spark_multimodal/COLAB_CAMPAIGN_PLAN.md), [multimodal refinement review](reports/spark_multimodal/REFINEMENT_MULTIMODAL_REVIEW_2026-10-27.md) and [operator guide with component references](colab/final/RUN.md) describe the experimental scope, objective/data contracts and pending evaluations. Nested learning and unrelated architecture changes from the separate project are outside this runtime.
-
-Installer references: [uv environments](https://docs.astral.sh/uv/pip/environments/), [uv with PyTorch](https://docs.astral.sh/uv/guides/integration/pytorch/), [pinned uv metadata](https://pypi.org/pypi/uv/0.13.5/json), [pinned pip metadata](https://pypi.org/pypi/pip/26.2.2/json).
+See the [campaign plan with current storage amendment](reports/spark_multimodal/COLAB_CAMPAIGN_PLAN.md), [operator guide and component citations](colab/final/RUN.md), [HF upload guide](https://huggingface.co/docs/huggingface_hub/guides/upload), [atomic commit API](https://huggingface.co/docs/huggingface_hub/package_reference/hf_api#huggingface_hub.HfApi.create_commit), and [Unsloth Studio documentation](https://unsloth.ai/docs/new/unsloth-studio). Component and dataset terms apply separately; the composite is not relicensed wholesale.
