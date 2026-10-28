@@ -42,7 +42,7 @@
     "local_disk_profiles": "colab/formal/hf_storage_profiles.json",
     "drive_role": "not_used",
     "artifact_visibility": "public_sanitized",
-    "checkpoint_repo": "TassP0lar/SparkX2.6-MM-checkpoints-g4-v5",
+    "checkpoint_repo": "TassP0lar/SparkX2.6-MM-checkpoints-g4-v6",
     "model_repo": "TassP0lar/SparkX2.6-MM-g4-v2",
     "checkpoint_slots": 2,
     "checkpoint_slot_initial_bytes": 44000000000,

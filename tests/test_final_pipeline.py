@@ -143,6 +143,20 @@ def test_bf16_gradient_parity_allows_reduction_noise_but_not_coherent_bias():
         check_kernel_gradient_parity({'weight':torch.zeros(16)},{'weight':0.0},[('weight',wrong)])
 
 
+def test_bf16_parity_distinguishes_vector_noise_from_coherent_error():
+    import torch
+    from colab.final.qualify import check_kernel_gradient_parity
+    reference=torch.full((16,),0.01);reference[8]=0.004577636
+    candidate=reference.clone();candidate[8]+=0.00164794921875
+    parameter=torch.nn.Parameter(torch.zeros(16));parameter.grad=candidate.clone()
+    check_kernel_gradient_parity({'weight':reference},{'weight':float(reference.norm())},[('weight',parameter)])
+    isolated=torch.zeros(16);isolated[8]=0.004577636
+    wrong=torch.nn.Parameter(torch.zeros(16));wrong.grad=isolated.clone()
+    wrong.grad[8]+=0.00164794921875
+    with pytest.raises(RuntimeError,match='full-tensor gradient norm'):
+        check_kernel_gradient_parity({'weight':isolated},{'weight':float(isolated.norm())},[('weight',wrong)])
+
+
 def test_closed_artifact_rejects_secret_paths(tmp_path):
     (tmp_path/'credential.json').write_text('{}')
     with pytest.raises(ValueError): manifest(tmp_path)

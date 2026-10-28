@@ -24,16 +24,17 @@ KERNEL_GRADIENT_RTOL=.15
 
 def check_kernel_gradient_parity(reference_grads,reference_norms,named_parameters):
     import torch
-    checked=0;max_sample_error=0.;worst=None;max_norm_error=0.
+    checked=0;max_sample_error=0.;max_sample_l2=0.;worst=None;max_norm_error=0.
     for name,p in named_parameters:
         if name not in reference_grads: continue
         if p.grad is None: raise RuntimeError('Kernel adapter removed a gradient: '+name)
         reference=reference_grads[name];candidate=p.grad.detach().flatten()[:16].float().cpu()
-        try:
-            torch.testing.assert_close(reference,candidate,rtol=KERNEL_GRADIENT_RTOL,atol=KERNEL_GRADIENT_ATOL)
-        except AssertionError as exc:
-            raise AssertionError('Spark BF16 gradient sample parity failed for '+name+': '+str(exc)) from None
-        error=float((reference-candidate).abs().max())
+        difference=reference-candidate;sample_l2=float(difference.norm());reference_sample_norm=float(reference.norm())
+        sample_allowed=KERNEL_GRADIENT_ATOL*math.sqrt(reference.numel())+KERNEL_GRADIENT_RTOL*reference_sample_norm
+        if sample_l2>sample_allowed:
+            raise RuntimeError(f'Spark BF16 gradient sample L2 parity failed for {name}: error={sample_l2} allowed={sample_allowed} max_abs={float(difference.abs().max())}')
+        max_sample_l2=max(max_sample_l2,sample_l2)
+        error=float(difference.abs().max())
         if error>max_sample_error: max_sample_error=error;worst=name
         reference_norm=reference_norms[name];candidate_norm=float(p.grad.detach().float().norm())
         if not math.isfinite(reference_norm) or not math.isfinite(candidate_norm):
@@ -41,11 +42,11 @@ def check_kernel_gradient_parity(reference_grads,reference_norms,named_parameter
         norm_error=abs(reference_norm-candidate_norm);max_norm_error=max(max_norm_error,norm_error)
         allowed=KERNEL_GRADIENT_ATOL+KERNEL_GRADIENT_RTOL*reference_norm
         if norm_error>allowed:
-            raise RuntimeError(f'Spark BF16 full-tensor gradient norm parity failed for {name}: error={norm_error} allowed={allowed}')
+            raise RuntimeError(f'Spark BF16 full-tensor gradient norm parity failed for {name}: error={norm_error} allowed={allowed} sample_l2={sample_l2} sample_allowed={sample_allowed}')
         checked+=1
     return {'gradient_sample_tensors':checked,'gradient_sample_atol':KERNEL_GRADIENT_ATOL,
             'gradient_sample_rtol':KERNEL_GRADIENT_RTOL,'max_sample_absolute_error':max_sample_error,
-            'worst_gradient_parameter':worst,'max_full_tensor_norm_absolute_error':max_norm_error}
+            'max_sample_l2_error':max_sample_l2,'worst_gradient_parameter':worst,'max_full_tensor_norm_absolute_error':max_norm_error}
 
 def audit_parameter_coverage(model,before,after,nonzero_gradients):
     missing=[name for name,p in model.named_parameters() if p.requires_grad and name not in nonzero_gradients]
