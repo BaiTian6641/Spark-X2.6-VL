@@ -74,7 +74,7 @@ The launcher computes actual bytes before qualification and again after measurin
 | Non-borrowable free floor | 44 GB |
 | **Total** | **Must remain ≤ 230 GB and actual free capacity** |
 
-Checkpoints include all model branches, optimizer, scheduler, RNG, exact source/data/policy binding, and optimizer-committed cursor. Older verified HF revisions remain available. Local retention is at most two verified slots; unverified artifacts are never deleted.
+Checkpoints include all model branches, optimizer, scheduler, RNG, exact source/data/policy binding, and optimizer-committed cursor. Older verified HF revisions remain available in the same repository. Verification uses tree/HEAD LFS hashes and streamed SHA256 for ordinary Git blobs, so large text metadata does not require a separate repository or skipped verification. Local retention is at most two verified slots; unverified artifacts are never deleted.
 
 The cumulative wall budget is **110 hours**. Whole-model qualification measures per-family p90 forward/backward/update cost and projects the full curriculum with a 25% transfer/evaluation/teacher/control reserve. If the projection does not fit remaining time, formal training stops before launch. Actual time is also checked at optimizer boundaries. No epoch, family, or RSI arm is silently shortened.
 
@@ -97,7 +97,7 @@ Colab itself documents variable runtime limits and nonpersistent VMs; see the [C
 
 The focused local suite exercises actual behavior: official Spark chat layout, Qwen prefix/sub-talker alignment and cached frames, Stable Audio EDM equations, Spark microbatch and cached-generation parity, source-group splitting, target-role isolation, contiguous-prefix worker commits, checkpoint write/retry/restore/purge behavior, full-Git source hashing, and expected subprocess exit codes. These are CPU/source tests, not proof of full-model G4 residency, throughput, quality, or fresh-VM recovery.
 
-**Observed during this correction:** **61 focused tests passed**. The supplemental install also passed the real `pip check` with `datasets==4.3.0` and preserved its required `fsspec==2025.9.0`; the CUTE import succeeded. A direct CLI smoke reached the expected environment gate without starting model or dataset downloads. These checks used the pinned API stack where required; no full Colab G4 campaign was launched.
+**Observed during this correction:** **63 focused tests passed**. The supplemental install also passed the real `pip check` with `datasets==4.3.0` and preserved its required `fsspec==2025.9.0`; the CUTE import succeeded. The pinned Hub HEAD client and streaming checkpoint verifier passed a real local-HTTP smoke. A direct CLI smoke reached the expected environment gate without starting model or dataset downloads. These checks used the pinned API stack where required; no full Colab G4 campaign was launched.
 
 The first G4 run remains the required hardware gate. A completed notebook must not be described as validated unless its actual receipts show whole-model qualification, fresh-process recovery, all stages, both RSI rounds, protected audit, offline reload, and verified upload. Human speech intelligibility/tone review, sound/music listening, broad spatial/temporal benchmarks, and independent 3D evaluation remain separate acceptance work.
 

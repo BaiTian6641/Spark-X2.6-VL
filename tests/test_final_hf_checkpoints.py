@@ -18,7 +18,7 @@ class Hub:
     """In-memory remote boundary; uses the pinned library's real operation/types."""
     def __init__(self):
         self.exists=False; self.private=True; self.history={}; self.head='0'*40
-        self.fail=False; self.lose_response=False; self.corrupt=None; self.calls=0
+        self.fail=False; self.lose_response=False; self.corrupt=None; self.missing_lfs=None; self.calls=0
     def whoami(self): return {'name':'TassP0lar'}
     def repo_exists(self,*a,**kw): return self.exists
     def create_repo(self,*a,**kw):
@@ -47,7 +47,7 @@ class Hub:
             if not name.startswith(path_in_repo+'/'): continue
             digest=hashlib.sha256(data).hexdigest()
             if name==self.corrupt: digest='f'*64
-            lfs={'size':len(data),'oid':digest,'pointerSize':128} if name.endswith(('.pt','.safetensors','.zip')) else None
+            lfs={'size':len(data),'oid':digest,'pointerSize':128} if name.endswith(('.pt','.safetensors','.zip')) and name!=self.missing_lfs else None
             yield RepoFile(path=name,size=len(data),oid=hashlib.sha1(data).hexdigest(),lfs=lfs)
 
 
@@ -146,6 +146,29 @@ def test_remote_hash_failure_cannot_acknowledge_local_deletion(store):
     assert d.exists() and not acknowledged(d,BOUND)
     with pytest.raises(RuntimeError,match='Unverified'):prune(hf.root,BOUND,[])
     assert (d/'optimizer.pt').exists()
+
+
+def test_large_regular_blob_uses_head_and_stream_hash(store,monkeypatch):
+    hf,hub=store;d=snapshot(hf.root)
+    payload=b'{\"payload\":\"'+b'x'*(8*1024**2)+b'\"}'
+    (d/'PARAMETERS.json').write_bytes(payload)
+    monkeypatch.setattr(hf,'_head_remote',lambda path,revision:SimpleNamespace(etag=hashlib.sha1(payload).hexdigest(),size=len(payload)),raising=False)
+    streamed=[]
+    def stream_hash(path,revision,expected_bytes):
+        streamed.append((path,expected_bytes));assert hub.history[revision][PREFIX+path]==payload
+        return hashlib.sha256(payload).hexdigest()
+    monkeypatch.setattr(hf,'_stream_remote_sha256',stream_hash,raising=False)
+    receipt=hf.commit(d)
+    assert receipt['verified'] and streamed==[('PARAMETERS.json',len(payload))]
+
+
+def test_missing_tree_lfs_uses_head_sha256_without_large_download(store,monkeypatch):
+    hf,hub=store;d=snapshot(hf.root);payload=b'm'*(8*1024**2+1)
+    (d/'model.safetensors').write_bytes(payload);hub.missing_lfs='checkpoint/model.safetensors'
+    monkeypatch.setattr(hf,'_head_remote',lambda path,revision:SimpleNamespace(etag=hashlib.sha256(payload).hexdigest(),size=len(payload)),raising=False)
+    def forbidden_download(*args):raise AssertionError('LFS content must be verified by HEAD, not downloaded')
+    monkeypatch.setattr(hf,'_stream_remote_sha256',forbidden_download,raising=False)
+    assert hf.commit(d)['verified']
 
 
 def test_public_or_foreign_repository_is_never_overwritten(store):

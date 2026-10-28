@@ -56,6 +56,34 @@ class HFCheckpointStore:
         finally:
             session.close()
 
+    def _head_remote(self,path,revision):
+        from huggingface_hub import get_hf_file_metadata,hf_hub_url
+        return get_hf_file_metadata(hf_hub_url(self.repo,PREFIX+path,revision=revision),token=self.token,timeout=30)
+
+    def _stream_remote_sha256(self,path,revision,expected_bytes):
+        import requests
+        from huggingface_hub import hf_hub_url
+        session=requests.Session();session.trust_env=False
+        digest=hashlib.sha256();total=0
+        try:
+            with session.get(hf_hub_url(self.repo,PREFIX+path,revision=revision),
+                             headers={'Authorization':'Bearer '+self.token,'Accept-Encoding':'identity'},
+                             stream=True,timeout=(30,120)) as response:
+                if response.status_code!=200:
+                    raise RuntimeError(f'HF checkpoint content read failed (HTTP {response.status_code}): '+path)
+                for chunk in response.iter_content(1024*1024):
+                    digest.update(chunk);total+=len(chunk)
+                    if total>expected_bytes:
+                        raise ValueError('Remote HF checkpoint size differs: '+path)
+        except requests.RequestException:
+            raise RuntimeError('HF checkpoint content transport failed: '+path) from None
+        finally:
+            session.close()
+        if total!=expected_bytes:
+            raise ValueError('Remote HF checkpoint size differs: '+path)
+        return digest.hexdigest()
+
+
     def ensure_repository(self):
         """Small CPU preflight write; never publishes model weights or a key."""
         from huggingface_hub import CommitOperationAdd
@@ -127,7 +155,7 @@ class HFCheckpointStore:
             raise ValueError('Invalid checkpoint file identity')
 
     def _verify_remote(self, revision, marker_bytes, directory=None):
-        """Verify every LFS SHA256; download only ordinary small Git blobs."""
+        """Verify LFS hashes from tree/HEAD and stream-hash ordinary Git blobs."""
         from huggingface_hub.hf_api import RepoFile
         value = json.loads(marker_bytes); self._validate_marker(value)
         if self._read_remote(MARKER, revision) != marker_bytes:
@@ -140,16 +168,28 @@ class HFCheckpointStore:
             item = remote[PREFIX + f['path']]
             if item.size != f['bytes']:
                 raise ValueError('Remote HF checkpoint size differs: ' + f['path'])
-            lfs_sha = getattr(item.lfs, 'sha256', None) if item.lfs else None
+            lfs_sha=getattr(item.lfs,'sha256',None) if item.lfs else None
             if lfs_sha:
-                if lfs_sha != f['sha256']:
-                    raise ValueError('Remote HF checkpoint LFS hash differs: ' + f['path'])
-            else:
-                if f['bytes'] > 8*1024**2:
-                    raise RuntimeError('Large checkpoint file is missing Hub LFS hash metadata')
-                payload = self._read_remote(PREFIX + f['path'], revision, limit=8*1024**2)
-                if len(payload) != f['bytes'] or hashlib.sha256(payload).hexdigest() != f['sha256']:
-                    raise ValueError('Remote HF checkpoint Git blob differs: ' + f['path'])
+                if lfs_sha!=f['sha256']:
+                    raise ValueError('Remote HF checkpoint LFS hash differs: '+f['path'])
+                continue
+            if f['bytes']<=8*1024**2:
+                payload=self._read_remote(PREFIX+f['path'],revision,limit=8*1024**2)
+                if len(payload)!=f['bytes'] or hashlib.sha256(payload).hexdigest()!=f['sha256']:
+                    raise ValueError('Remote HF checkpoint Git blob differs: '+f['path'])
+                continue
+            metadata=self._head_remote(f['path'],revision)
+            etag=(metadata.etag or '').lower()
+            if metadata.size is not None and metadata.size!=f['bytes']:
+                raise ValueError('Remote HF checkpoint HEAD size differs: '+f['path'])
+            if re.fullmatch('[0-9a-f]{64}',etag):
+                if etag!=f['sha256']:
+                    raise ValueError('Remote HF checkpoint HEAD LFS hash differs: '+f['path'])
+                continue
+            if not re.fullmatch('[0-9a-f]{40}',etag):
+                raise RuntimeError('Large checkpoint file lacks verifiable Hub content metadata: '+f['path'])
+            if self._stream_remote_sha256(f['path'],revision,f['bytes'])!=f['sha256']:
+                raise ValueError('Remote HF checkpoint streamed Git blob differs: '+f['path'])
         return value
 
     def _receipt(self, revision, payload, seconds=0):

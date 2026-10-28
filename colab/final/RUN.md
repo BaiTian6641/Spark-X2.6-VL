@@ -19,13 +19,13 @@ The latest user instruction changes full checkpoint storage to **Hugging Face**.
 | Artifact | Destination |
 |---|---|
 | Existing pinned data | `datasets/TassP0lar/SparkX2.6-MM` |
-| Full resumable snapshots | Public sanitized model repo `TassP0lar/SparkX2.6-MM-checkpoints-g4-v2` |
+| Full resumable snapshots | Public sanitized model repo `TassP0lar/SparkX2.6-MM-checkpoints-g4-v3` |
 | Finished inference package | Public model repo `TassP0lar/SparkX2.6-MM-g4-v2` |
 | Protected evaluation rows and account metadata | Excluded from public artifacts; only aggregate/receipt state is retained |
 
 `HF_TOKEN` needs read access to component models and write access to **both configured model repositories**. No token is placed in a cell, file, argv or checkpoint. The dataset repository is not modified by this notebook.
 
-On a roughly230GB VM, the rolling media cache is23GB, the free floor44GB, and the initial full-checkpoint reservation44GB per slot. Two local snapshots may coexist during saving/upload. Every payload file is verified against the exact HF commit (LFS SHA256 for large objects, downloaded content SHA256 for ordinary small Git files). After the exact-revision receipt has also been backed up locally, only the newest local snapshot remains. Older verified local checkpoints are automatically purged. Upload, hash, quota or receipt-backup failures preserve the fallback and the new local checkpoint; they stop training rather than delete an unverified artifact.
+On a roughly230GB VM, the rolling media cache is23GB, the free floor44GB, and the initial full-checkpoint reservation44GB per slot. Two local snapshots may coexist during saving/upload. Every payload file is verified against the exact HF commit. Tree or HEAD metadata supplies LFS SHA256 hashes without downloading large weights; ordinary Git blobs are content-SHA256 checked, using streaming for files above8MiB. After the exact-revision receipt has also been backed up locally, only the newest local snapshot remains. Older verified local checkpoints are automatically purged. Upload, hash, quota or receipt-backup failures preserve the fallback and the new local checkpoint; they stop training rather than delete an unverified artifact.
 
 The remote `checkpoint/` directory is updated atomically. Old exact revisions remain in HF Git history for recovery and parent/candidate/control RSI. **Local purge does not reclaim HF history quota.** The script never squashes remote history or deletes unrelated files. Ensure the HF account has sufficient public storage; the program stops if the Hub rejects a write. Source model files, the active bounded shard cache, the newest checkpoint, original workstation checkpoints and unrelated data are not part of checkpoint cleanup.
 
