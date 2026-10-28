@@ -1,5 +1,7 @@
 # Spark X2.6 multimodal formal Colab pipeline
 
+[**Open the formal notebook in Colab**](https://colab.research.google.com/github/BaiTian6641/Spark-X2.6-VL/blob/bac6320946527102627a4682dffd34443993b6f0/colab/Spark_Formal_Full_Finetune.ipynb) · [Review the notebook](https://github.com/BaiTian6641/Spark-X2.6-VL/blob/bac6320946527102627a4682dffd34443993b6f0/colab/Spark_Formal_Full_Finetune.ipynb) · [Operator guide](colab/final/RUN.md)
+
 Runtime source for the experimental full-parameter Spark X2.6 4B multimodal campaign. It combines SigLIP2 So400m NaFlex vision, tiles and spatial downshuffle; V-JEPA2.1 video features and explicit clocks; Whisper/CLAP audio understanding; native Qwen speech output; Stable Audio sound/music output; and two bounded instructor-guided replay comparisons. English and Chinese are the planned language coverage.
 
 **The complete native CUDA campaign has not yet passed its hardware qualification.** CPU source/component tests and an install dry run are not evidence of a trained multimodal model. The notebook keeps the actual full-model profile and fresh-VM recovery gates before long formal training.
@@ -8,7 +10,7 @@ The notebook is a small launcher. It fetches `releases/spark-formal-runtime.zip`
 
 ## Start or recover setup
 
-The runnable notebook and release receipt are added after the runtime commit, so the notebook can name its immutable source commit without a circular build dependency. Open `colab/Spark_Formal_Full_Finetune.ipynb` in Colab after that launcher commit.
+Open the pinned Colab link above. The launcher is **19,679 bytes**, down from the previous6,673,993-byte embedded notebook. Its runtime commit is `b2bd280613bf1b82727513265cc5d154e1b7d8bd`; the separately downloaded5,000,398-byte source ZIP has SHA256 `1d290e5e373e80b27c81b20eb43e97f1880a8c8f7a4d9b81a4d99ae39d2f0fdc`. The notebook commit follows the runtime commit so it can pin immutable source without a circular build dependency. [The release receipt](releases/RELEASE.json) binds both artifacts.
 
 1. Use a **CPU runtime** for setup/preflight. Enable notebook access to Colab Secrets `HF_TOKEN` and `OPENCODE_API_KEY`. Do not paste either key in notebook cells, Git or chat.
 2. Run the source bootstrap, configuration and normal Google authentication cells. Keep the configured `/content/spark-formal` work root and intended Drive project folder. Review [the complete operator guide](colab/final/RUN.md).
@@ -26,6 +28,8 @@ The previous notebook used `venv.EnvBuilder(with_pip=True)` and failed in the Co
 
 Only `pip` was added to each original dependency lock. The prior training package versions were preserved. The CUDA environment's new install command passes a dry run; its installation and whole-model CUDA execution still need the notebook's hardware gates.
 
+The archive/export packaging also includes the instructor accounting helper used by the RSI stage. Static import-closure checks and an isolated subprocess import verify that those modules are available outside the author's workspace.
+
 ## Storage, data and model publication
 
 - Training uses the pinned [TassP0lar/SparkX2.6-MM dataset](https://huggingface.co/datasets/TassP0lar/SparkX2.6-MM). Its README preserves source citations and per-source terms. This code repository contains no training-media shards, datasets or model weights.
@@ -39,6 +43,8 @@ Only `pip` was added to each original dependency lock. The prior training packag
 `releases/SOURCE_MANIFEST.json` lists every runtime file and SHA256. `colab/final/components.lock.json`, `dataset.lock.json`, the package locks and `bootstrap.lock.json` bind model sources, data, dependencies and installer separately. The upstream vision source is the pinned archive `colab/final/vendor/vjepa2-source.zip`; its MIT license and bundled third-party notices apply. Component models and datasets retain their own upstream licenses and access requirements; this repository grants no additional rights to their weights or data.
 
 The focused bootstrap tests require public PyPI access, CPython 3.13, and local test storage with at least 46GB free. They create/repair real environments, install CPU tooling, reject a bad package hash and verify that unrelated saved artifacts survive. They make no GPU, Drive or instructor requests. The notebook tests check schema, source inventory, immutable URL, code syntax, source tamper rejection and secret transport.
+
+The full focused local suite passed **49 tests**, with one upstream Diffusers deprecation warning. Its [result log](validation/colab-github-formal-final-tests-2026-10-27.log), [real bootstrap recovery tests](validation/colab-bootstrap-repair-tests-2026-10-27.log) and [CUDA lock install dry run](validation/colab-cuda-lock-dry-run-2026-10-27.log) are retained. Separately, the six notebook/package tests passed from this GitHub checkout. These results do not establish full-model CUDA readiness or multimodal training quality.
 
 ```bash
 UV_CACHE_DIR="$PWD/.test-cache" uv run --no-project --python 3.13 \
