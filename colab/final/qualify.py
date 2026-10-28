@@ -19,6 +19,35 @@ def require_new_process(profile):
         raise RuntimeError('Run recovery in a new campaign subprocess after qualification finishes; keep the same G4 VM')
     return current
 
+KERNEL_GRADIENT_ATOL=5e-4
+KERNEL_GRADIENT_RTOL=.15
+
+def check_kernel_gradient_parity(reference_grads,reference_norms,named_parameters):
+    import torch
+    checked=0;max_sample_error=0.;worst=None;max_norm_error=0.
+    for name,p in named_parameters:
+        if name not in reference_grads: continue
+        if p.grad is None: raise RuntimeError('Kernel adapter removed a gradient: '+name)
+        reference=reference_grads[name];candidate=p.grad.detach().flatten()[:16].float().cpu()
+        try:
+            torch.testing.assert_close(reference,candidate,rtol=KERNEL_GRADIENT_RTOL,atol=KERNEL_GRADIENT_ATOL)
+        except AssertionError as exc:
+            raise AssertionError('Spark BF16 gradient sample parity failed for '+name+': '+str(exc)) from None
+        error=float((reference-candidate).abs().max())
+        if error>max_sample_error: max_sample_error=error;worst=name
+        reference_norm=reference_norms[name];candidate_norm=float(p.grad.detach().float().norm())
+        if not math.isfinite(reference_norm) or not math.isfinite(candidate_norm):
+            raise RuntimeError('Nonfinite kernel parity gradient norm: '+name)
+        norm_error=abs(reference_norm-candidate_norm);max_norm_error=max(max_norm_error,norm_error)
+        allowed=KERNEL_GRADIENT_ATOL+KERNEL_GRADIENT_RTOL*reference_norm
+        if norm_error>allowed:
+            raise RuntimeError(f'Spark BF16 full-tensor gradient norm parity failed for {name}: error={norm_error} allowed={allowed}')
+        checked+=1
+    return {'gradient_sample_tensors':checked,'gradient_sample_atol':KERNEL_GRADIENT_ATOL,
+            'gradient_sample_rtol':KERNEL_GRADIENT_RTOL,'max_sample_absolute_error':max_sample_error,
+            'worst_gradient_parameter':worst,'max_full_tensor_norm_absolute_error':max_norm_error}
+
+
 def qualify(campaign):
     import numpy as np,psutil,torch
     from transformers import get_constant_schedule
@@ -44,17 +73,16 @@ def qualify(campaign):
         with torch.autocast('cuda',dtype=torch.bfloat16): reference_loss,_=model.loss(row,media)
         reference_loss.backward()
         reference_grads={n:p.grad.detach().flatten()[:16].float().cpu().clone() for n,p in model.named_parameters() if p.grad is not None}
+        reference_norms={n:float(p.grad.detach().float().norm()) for n,p in model.named_parameters() if p.grad is not None}
     finally: module.eager_attention_forward=adapter
     optimizer.zero_grad(set_to_none=True)
     with torch.autocast('cuda',dtype=torch.bfloat16): candidate_loss,_=model.loss(row,media)
     candidate_loss.backward()
-    if abs(float(reference_loss)-float(candidate_loss))>.01: raise RuntimeError('Full Spark BF16 attention loss parity failed')
-    for name,p in model.named_parameters():
-        if name in reference_grads:
-            if p.grad is None: raise RuntimeError('Kernel adapter removed a gradient')
-            torch.testing.assert_close(reference_grads[name],p.grad.detach().flatten()[:16].float().cpu(),rtol=.15,atol=2e-4)
-    kernel_parity={'passed':True,'real_training_record':rid,'reference_loss':float(reference_loss),'sdpa_loss':float(candidate_loss),'gradient_sample_tensors':len(reference_grads),'scope':'Full resident Spark+vision BF16 loss and sampled-gradient comparison; CPU tests compare all tiny-decoder gradients'}
-    del reference_grads,reference_loss,candidate_loss; optimizer.zero_grad(set_to_none=True); model.train()
+    reference_value=float(reference_loss.detach());candidate_value=float(candidate_loss.detach())
+    if abs(reference_value-candidate_value)>.01: raise RuntimeError('Full Spark BF16 attention loss parity failed')
+    parity=check_kernel_gradient_parity(reference_grads,reference_norms,model.named_parameters())
+    kernel_parity={'passed':True,'real_training_record':rid,'reference_loss':reference_value,'sdpa_loss':candidate_value,**parity,'scope':'Full resident Spark+vision BF16 loss, sampled-gradient and full-tensor gradient-norm comparison; CPU tests compare all tiny-decoder gradients'}
+    del reference_grads,reference_norms,reference_loss,candidate_loss; optimizer.zero_grad(set_to_none=True); model.train()
     before=sample_parameters(model); seen=set(); timings=defaultdict(list); rows=campaign.catalogue.select('train'); by_family=defaultdict(list)
     for r in rows: by_family[r[1]].append(r[0])
     # Exercise Studio's actual patched SFT loop before the longer profile.

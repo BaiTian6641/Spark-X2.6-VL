@@ -82,6 +82,21 @@ def test_checkpoint_continuation_requires_new_process_but_not_new_vm():
     assert restored['boot_id']==current['boot_id'] and restored['pid']!=current['pid']
 
 
+def test_bf16_gradient_parity_allows_reduction_noise_but_not_coherent_bias():
+    import torch
+    from colab.final.qualify import check_kernel_gradient_parity
+    reference=torch.zeros(16);reference[14]=0.00023815
+    candidate=reference.clone();candidate[14]+=0.0002667596563696861
+    parameter=torch.nn.Parameter(torch.zeros(16));parameter.grad=candidate.clone()
+    report=check_kernel_gradient_parity({'weight':reference},{'weight':float(reference.norm())},[('weight',parameter)])
+    assert report['max_sample_absolute_error']==pytest.approx(0.0002667596563696861)
+    # Each element is below the absolute floor, but their coherent direction
+    # creates a full-tensor norm error that must still reject the gradient.
+    wrong=torch.nn.Parameter(torch.zeros(16));wrong.grad=torch.full((16,),0.00049)
+    with pytest.raises(RuntimeError,match='full-tensor gradient norm'):
+        check_kernel_gradient_parity({'weight':torch.zeros(16)},{'weight':0.0},[('weight',wrong)])
+
+
 def test_closed_artifact_rejects_secret_paths(tmp_path):
     (tmp_path/'credential.json').write_text('{}')
     with pytest.raises(ValueError): manifest(tmp_path)
