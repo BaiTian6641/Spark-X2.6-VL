@@ -84,7 +84,18 @@ def merge_instructor_ledgers(current,restored):
     merged['requests']=requests
     return merged
 
-def checkpoint(model,optimizer,scheduler,state,root,config,bound,store):
+def deferred_checkpoint_receipt(directory,bound):
+    from .storage import manifest
+    directory=Path(directory);snapshot=manifest(directory)
+    receipt={'backend':'local_deferred','directory':str(directory),'kind':'checkpoint',
+             'commit_sha256':identity(snapshot),'total_bytes':snapshot['total_bytes'],
+             'verified':False,'binding':bound,
+             'runtime_boot_id':Path('/proc/sys/kernel/random/boot_id').read_text().strip()}
+    write(receipt_path(directory),receipt)
+    return receipt
+
+
+def checkpoint(model,optimizer,scheduler,state,root,config,bound,store,defer_upload=False):
     import torch
     from safetensors.torch import save_model
     root=Path(root); name=f"{state['stage']}-{state.get('updates',0):08d}"; directory=root/'checkpoints'/name
@@ -98,9 +109,15 @@ def checkpoint(model,optimizer,scheduler,state,root,config,bound,store):
             receipt_file=receipt_path(directory)
             local_bytes=sum(p.stat().st_size for p in directory.rglob('*') if p.is_file())
             if local_bytes>estimate: raise RuntimeError('Measured checkpoint exceeds its reservation; preserve it and revise the disk profile before further writes')
-            result=read(receipt_file) if acknowledged(directory,bound) else store.commit(directory)
+            if acknowledged(directory,bound):
+                result=read(receipt_file)
+            elif defer_upload:
+                result=read(receipt_file) if receipt_file.exists() else deferred_checkpoint_receipt(directory,bound)
+            else:
+                result=store.commit(directory)
             state.update(last_checkpoint=result,last_checkpoint_local=str(directory),checkpoint_bytes=local_bytes)
-            rebind_assets(model,directory); prune(root,bound,[directory])
+            rebind_assets(model,directory)
+            if not defer_upload: prune(root,bound,[directory])
             return result
         intent=directory/'INTENT.json'
         if not intent.exists() or read(intent).get('binding')!=bound: raise RuntimeError('Unknown incomplete local artifact; no automatic overwrite')
@@ -127,11 +144,13 @@ def checkpoint(model,optimizer,scheduler,state,root,config,bound,store):
     write(directory/'CLOSED.json',{'binding':bound,'parameter_samples_sha256':sample_hash(model),'complete':True})
     local_bytes=sum(p.stat().st_size for p in directory.rglob('*') if p.is_file())
     if local_bytes>estimate: raise RuntimeError('Measured checkpoint exceeds its reservation; preserve it and revise the disk profile before further writes')
-    receipt=store.commit(directory); state['checkpoint_bytes']=local_bytes; state['last_checkpoint']=receipt; state['last_checkpoint_local']=str(directory)
+    receipt=deferred_checkpoint_receipt(directory,bound) if defer_upload else store.commit(directory)
+    state['checkpoint_bytes']=local_bytes;state['last_checkpoint']=receipt;state['last_checkpoint_local']=str(directory)
     emit('checkpoint_measured',bytes=local_bytes,write_seconds=time.monotonic()-started,receipt=receipt)
     # Future snapshot copies must use the newly retained preprocessing/codec
     # assets, not a restored directory that is about to be reclaimed.
-    rebind_assets(model,directory); prune(root,bound,[directory])
+    rebind_assets(model,directory)
+    if not defer_upload: prune(root,bound,[directory])
     return receipt
 
 def reload_paths(directory):
@@ -198,6 +217,7 @@ class Campaign:
         self.store=ColdStore(self.root,config,self.bound,token); self.catalogue=Catalogue(self.root/'metadata/corpus.sqlite')
         self.reader=MediaReader(self.root,read(HERE.parent/'formal/HF_FULL_DATASET_HANDOFF.json'),config,token,reserve=2*config['initial_checkpoint_reservation_bytes'])
         self.key=key; self._hf_token=token; self.model=None; self.state={'stage':'initial','updates':0,'completed_stages':[],'rsi_rounds':[]}
+        self.deferred_uploads=[];self.deferred_receipts={}
         self.budget=ComputeBudget(config,read(self.root/'compute-budget.json') if (self.root/'compute-budget.json').exists() else None)
         if config['observed_compute_balance'] and config['observed_cu_per_hour']: self.budget.observe(config['observed_compute_balance'],config['observed_cu_per_hour'])
         self.stop_reason=None; self.last_checkpoint=time.monotonic(); self.effective_checkpoint_minutes=config['checkpoint_minutes']
@@ -220,10 +240,20 @@ class Campaign:
             self.budget.check(seconds); self.check_wall_budget(seconds)
         except RuntimeError as exc: self.stop_reason=str(exc)
         write(self.root/'compute-budget.json',self.budget.state)
-    def save(self,optimizer,scheduler,cursor=None):
+    def flush_deferred_uploads(self):
+        for local in list(self.deferred_uploads):
+            result=self.store.commit(Path(local['directory']))
+            self.deferred_receipts[local['directory']]=result
+            self.deferred_uploads.remove(local)
+            if self.state.get('last_checkpoint_local')==local['directory']:
+                self.state['last_checkpoint']=result
+    def save(self,optimizer,scheduler,cursor=None,defer_upload=False):
+        if not defer_upload: self.flush_deferred_uploads()
         if cursor: self.state['cursor']=cursor.state()
         self.budget_check(); write(self.root/'CAMPAIGN.json',self.state)
-        result=checkpoint(self.model,optimizer,scheduler,self.state,self.root,self.c,self.bound,self.store)
+        result=checkpoint(self.model,optimizer,scheduler,self.state,self.root,self.c,self.bound,self.store,defer_upload=defer_upload)
+        self.deferred_receipts[self.state['last_checkpoint_local']]=result
+        if defer_upload and result.get('backend')=='local_deferred': self.deferred_uploads.append(result)
         write(self.root/'CAMPAIGN.json',self.state); self.last_checkpoint=time.monotonic(); return result
     def restore(self,receipt):
         directory=self.root/'checkpoints'/('restored-'+receipt['commit_sha256'][:12])
@@ -319,7 +349,7 @@ class Campaign:
         self.model.config.torch_dtype=torch.float32
         workers=self.c['dataloader_workers']
         loader_options={'dataloader_prefetch_factor':self.c['dataloader_prefetch'],'dataloader_persistent_workers':True} if workers else {}
-        args=backend.SFTConfig(output_dir=str(self.root/'trainer-scratch'),per_device_train_batch_size=microbatch,gradient_accumulation_steps=accumulation,max_steps=remaining,bf16=True,fp16=False,gradient_checkpointing=False,remove_unused_columns=False,max_length=self.c['max_sequence'],packing=False,dataset_kwargs={'skip_prepare_dataset':True},dataloader_num_workers=workers,dataloader_pin_memory=False,save_strategy='no',logging_steps=10,report_to='none',max_grad_norm=self.c['clip_norm'],warmup_ratio=0,seed=self.c['seed'],ignore_data_skip=True,lr_scheduler_type='cosine',**loader_options)
+        args=backend.SFTConfig(output_dir=str(self.root/'trainer-scratch'),per_device_train_batch_size=microbatch,gradient_accumulation_steps=accumulation,max_steps=remaining,bf16=True,fp16=False,gradient_checkpointing=False,remove_unused_columns=False,max_length=self.c['max_sequence'],packing=False,accelerator_config={'dispatch_batches':False},dataset_kwargs={'skip_prepare_dataset':True},dataloader_num_workers=workers,dataloader_pin_memory=False,save_strategy='no',logging_steps=10,report_to='none',max_grad_norm=self.c['clip_norm'],warmup_ratio=0,seed=self.c['seed'],ignore_data_skip=True,lr_scheduler_type='cosine',**loader_options)
         class FormalStudio(backend.UnslothTrainer):
             def run_formal(self):
                 self.model=campaign.model; self.tokenizer=campaign.model.tokenizer; self.load_in_4bit=False; self.is_vlm=False; self.is_audio=False

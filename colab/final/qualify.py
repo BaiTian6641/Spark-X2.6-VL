@@ -74,7 +74,8 @@ def qualify(campaign):
     campaign.model=SparkNative(campaign.paths,c); model=campaign.model; model.set_stage(False); model.train()
     optimizer=optimizer_for(model,c); scheduler=get_constant_schedule(optimizer)
     campaign.state.update(stage='qualification-initial',alignment_only=False,updates=0,planned_updates=1,warmup_steps=0,scheduler_kind='constant')
-    initial=campaign.save(optimizer,scheduler)
+    initial=campaign.save(optimizer,scheduler,defer_upload=True)
+    initial_key=campaign.state['last_checkpoint_local']
     # Compare the custom kernel adapter against the exact original full
     # decoder on real image data before timing or making optimizer updates.
     import sys
@@ -103,6 +104,7 @@ def qualify(campaign):
     optimizer.zero_grad(set_to_none=True); del optimizer,scheduler; gc.collect(); torch.cuda.empty_cache()
     mixed_order=[by_family[fam][0] for fam in FAMILIES]
     campaign.train_order({'name':'qualification-studio','alignment_only':False},mixed_order)
+    initial=campaign.deferred_receipts[initial_key]
     studio_receipt=campaign.state['last_checkpoint']
     model,optimizer,_,campaign.state=load_checkpoint(campaign.state['last_checkpoint_local'],c,campaign.bound,model=model)
     for group in optimizer.param_groups: group['lr']=group['initial_lr']

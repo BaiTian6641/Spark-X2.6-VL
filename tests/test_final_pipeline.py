@@ -61,6 +61,22 @@ def test_media_collator_has_tensor_batch_size_anchor(tmp_path):
     assert find_batch_size(batch)==1 and batch['source_indices'].tolist()==[4]
     assert batch['examples'][0][0]['_family']=='text'
 
+
+def test_native_ragged_batches_work_without_accelerate_dispatch():
+    from accelerate.data_loader import prepare_data_loader
+    from torch.utils.data import DataLoader
+    from colab.final.data import cursor_dataset
+    cursor=CommittedCursor(['a','b','c']);dataset=cursor_dataset(cursor.order,cursor)
+    def collate(rows):
+        import torch
+        return {'source_indices':torch.tensor([row['_index'] for row in rows]),
+                'examples':[{'rid':row['rid'],'text':'native-string'} for row in rows]}
+    loader=DataLoader(dataset,batch_size=2,num_workers=0,collate_fn=collate)
+    prepared=prepare_data_loader(loader,num_processes=1,dispatch_batches=False,put_on_device=False)
+    batches=list(prepared)
+    assert [batch['source_indices'].tolist() for batch in batches]==[[0,1],[2]]
+    assert [[row['rid'] for row in batch['examples']] for batch in batches]==[['a','b'],['c']]
+
 def test_output_targets_never_condition_recognition_or_generation():
     row={'task':'speech_synthesis','audio':['voice.flac'],'audio_direction':'text_to_audio','media_role':'target','target':{'kind':'waveform','path':'voice.flac'}}
     assert family(row)=='speech_out'; assert conditioning_members(row)==[]

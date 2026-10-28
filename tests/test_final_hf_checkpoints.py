@@ -305,6 +305,33 @@ def test_real_cpu_optimizer_snapshots_retry_then_purge_and_can_save_again(store,
     assert len([p for p in (hf.root/'checkpoints').glob('unit-*') if p.is_dir()])==1
 
 
+def test_deferred_initial_checkpoint_uploads_only_after_studio_success(store,monkeypatch):
+    import torch
+    from colab.final.engine import checkpoint,Campaign
+    hf,hub=store
+    class TinyModel(torch.nn.Linear):
+        def named_groups(self):
+            for name,p in self.named_parameters(): yield 'spark',name,p
+    model=TinyModel(3,2);assets=hf.root/'assets/spark';assets.mkdir(parents=True)
+    (assets/'tokenizer.json').write_text('{"persist":true}');model.paths={'spark':assets}
+    optimizer=torch.optim.AdamW(model.parameters(),lr=.01)
+    scheduler=torch.optim.lr_scheduler.LambdaLR(optimizer,lambda step:1.)
+    monkeypatch.setattr(torch.cuda,'synchronize',lambda:None)
+    monkeypatch.setattr('colab.final.engine.disk_guard',lambda *a,**kw:None)
+    cold=object.__new__(ColdStore);cold.root=hf.root;cold.binding=BOUND;cold.hf=hf
+    cold.small_file=lambda *a,**kw:{'commit_file_id':'test-index','commit_sha256':'d'*64}
+    config={**hf.c,'initial_checkpoint_reservation_bytes':64*1024**2}
+    state={'stage':'deferred-initial','updates':0,'completed_stages':[]}
+    write(hf.root/'compute-budget.json',{'used_cu':0.0,'active_seconds':0.0})
+    deferred=checkpoint(model,optimizer,scheduler,state,hf.root,config,BOUND,cold,defer_upload=True)
+    assert deferred['backend']=='local_deferred' and not deferred['verified'] and hub.calls==0
+    campaign=object.__new__(Campaign);campaign.store=cold;campaign.state=state
+    campaign.deferred_uploads=[deferred];campaign.deferred_receipts={}
+    campaign.flush_deferred_uploads()
+    assert campaign.deferred_uploads==[] and hub.calls>0
+    assert state['last_checkpoint']['backend']=='huggingface' and state['last_checkpoint']['verified']
+
+
 def test_upload_only_cli_is_cpu_and_refuses_a_concurrent_campaign(store,monkeypatch,capsys):
     import fcntl,sys
     from colab.final import run,engine
