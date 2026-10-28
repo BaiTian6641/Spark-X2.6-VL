@@ -14,6 +14,18 @@ The source path includes the verified runtime hash, so it can coexist with the e
 
 ## Campaign operation
 
+### If CPU setup succeeds but the campaign stops
+
+`environment_setup_complete` proves that package installation passed. It does not prove model access, dataset validation or Drive readiness. The launcher now captures both child stdout and stderr into notebook output, including the exact `stopped` event, exit code and recovery action. Bounded, sanitized per-invocation logs are saved under `/content/spark-formal/logs`. Credentials, bearer values and signed URL queries are removed before display or logging. Ctrl-C signals the runner once and drains its remaining output while it saves; inspect the actual committed receipt before calling a checkpoint resumable.
+
+The observed 2026-10-27 CPU failure was **HTTP403 `GatedRepo` from Hugging Face**, with the correct publishing account and a fine-grained token. Stable Audio model access had not been granted. The user subsequently completed its access form; a read-only Colab metadata probe then succeeded with the same token. This was separate from the earlier `ensurepip` installation failure.
+
+If this happens in another account, review/request access on the [Stable Audio Open1.0 page](https://huggingface.co/stabilityai/stable-audio-open-1.0), using the same account that owns `HF_TOKEN`. The form accepts the model license and shares the submitted contact details with the model owner. Once access is granted, ensure a fine-grained token permits reading this gated model and rerun CPU preflight in the same VM. Do not paste the token into code. The runtime does not accept terms or broaden token scope. It checks the pinned file's Hub metadata without following a signed CDN HEAD redirect; access denial, transport failure and metadata mismatch produce different errors. Successful metadata access does not establish download throughput or publication write permission.
+
+Progress events identify model metadata, dataset/split preparation, full-corpus context audit and Drive cold storage. A failed retry invalidates any previous successful local preflight receipt, and GPU commands require a successful receipt for the current source release. No GPU training or instructor call occurs in this preflight.
+
+### Running the campaign
+
 1. Open the notebook in Colab with a **CPU runtime first**. Enable notebook access to the Secrets named `HF_TOKEN` and `OPENCODE_API_KEY`. The HF token needs read access to the original models and write access to the intended private **model** repository. The dataset repository of the same name is a separate namespace.
 2. Obtain access to [Stable Audio Open 1.0](https://huggingface.co/stabilityai/stable-audio-open-1.0) with that HF account after reviewing its terms. The program checks access and never accepts terms automatically. This replaces the earlier Small candidate: its tools pin an incompatible Python/Torch environment, and its 11-second limit would crop the released sound/music targets. The Diffusers path supports the complete clips used here.
 3. Review the configuration, Drive folder and instructor route eligibility. `instructor_route_eligibility_receipt` must contain provider `OpenCode Go`, model `mimo-v2.6-pro`, endpoint `https://opencode.ai/inference/go/openai/v1/chat/completions`, `permits_dataset_review: true`, an `evidence_url` and `checked_at`. Populate it from provider/account evidence, not an invented approval. Prior endpoint readiness does not establish eligibility for dataset review. The notebook can do CPU preflight and CUDA qualification while this is pending; the long formal campaign requires it.

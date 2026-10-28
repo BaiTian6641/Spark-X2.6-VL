@@ -21,12 +21,13 @@ def doctor(root):
     report={'python':sys.version.split()[0],'torch':torch.__version__,'cuda':torch.version.cuda,'gpu':torch.cuda.get_device_name(),'capability':list(torch.cuda.get_device_capability()),'bf16':True,'studio_backend_file':str(Path(backend.__file__).resolve()),'studio_backend_sha256':sha(backend.__file__),'versions':{k:importlib.metadata.version(k) for k in ('unsloth','unsloth-zoo','transformers','trl','accelerate','bitsandbytes','diffusers','qwen-tts')},'actual_cuda_sdpa_backward':True,'full_native_model_qualified':False}
     write(Path(root)/'ENVIRONMENT.json',report); emit('environment_ready',**report); return report
 
-def main():
+def main(secrets=None):
     p=argparse.ArgumentParser(description=__doc__); p.add_argument('mode',choices=('cpu','doctor','qualify','discover','recover','train','resume')); p.add_argument('--config',required=True);p.add_argument('--source-sha',required=True); p.add_argument('--profile-receipt');p.add_argument('--resume-receipt');a=p.parse_args()
     if not re.fullmatch('[0-9a-f]{64}',a.source_sha): raise ValueError('Source archive SHA256 is required')
     config=validate_config(read(a.config)); root=Path(config['work_root']); root.mkdir(parents=True,exist_ok=True)
     os.environ.update(HF_HOME=str(root/'hf-metadata-cache'),HF_HUB_DISABLE_TELEMETRY='1',HF_HUB_DISABLE_XET='1',TORCH_HOME=str(root/'torch-metadata-cache'),WANDB_DISABLED='true',TOKENIZERS_PARALLELISM='false',UNSLOTH_COMPILE_DISABLE='1')
-    secrets=json.loads(sys.stdin.readline()); token=secrets.get('HF_TOKEN'); key=secrets.get('OPENCODE_API_KEY')
+    if secrets is None: secrets=json.loads(sys.stdin.readline())
+    token=secrets.get('HF_TOKEN'); key=secrets.get('OPENCODE_API_KEY')
     if not token: raise ValueError('HF_TOKEN is unavailable')
     if a.mode=='cpu':
         from .preflight import run
@@ -34,7 +35,9 @@ def main():
     if a.mode=='doctor': doctor(root);return
     from .engine import Campaign
     receipt=read(root/'asset-receipt.json') if (root/'asset-receipt.json').exists() else None
-    if not receipt or not (root/'PREFLIGHT.json').exists(): raise RuntimeError('Run the CPU preflight on this VM before GPU work')
+    preflight=read(root/'PREFLIGHT.json') if (root/'PREFLIGHT.json').exists() else {}
+    if not receipt or not preflight.get('passed') or preflight.get('source_archive_sha256')!=a.source_sha:
+        raise RuntimeError('Run a successful CPU preflight for this source release on this VM before GPU work')
     paths={k:Path(v) for k,v in receipt['paths'].items()}
     if a.mode=='qualify':
         doctor(root)
@@ -68,10 +71,13 @@ def main():
     campaign.run_formal(profile)
 
 if __name__=='__main__':
-    try: main()
+    secrets={}
+    try:
+        secrets=json.loads(sys.stdin.readline())
+        main(secrets)
     except (Exception,KeyboardInterrupt) as exc:
         # No traceback containing response bodies, credentials or signed URLs.
-        message=str(exc)
-        if any(marker in message.lower() for marker in ('bearer ','hf_','sk-','token=')): message='Sensitive transport detail suppressed; inspect the sanitized local ledger/receipt.'
+        from .launcher import sanitize
+        message=sanitize(str(exc),secrets.values())
         emit('stopped',error_type=type(exc).__name__,reason=message[:1500],training_completion_claimed=False)
         raise SystemExit(2)

@@ -132,7 +132,9 @@ if MOUNT_DRIVE_FOR_BROWSING:
 ''')
     md('''## Install isolated CPU tooling, then preflight
 
-This cell installs into a separate environment. It does not replace the notebook kernel's PyTorch. A wheel-and-binary-hash-verified `uv` installer creates pipless virtual environments and synchronizes complete package locks, including a pinned `pip`. System `ensurepip` is not needed. An earlier isolated environment with Python but no pip is repaired in place. Setup records readiness only after the complete installation and dependency check pass. On a new VM repeat this setup and CPU preflight before GPU recovery.''')
+This cell installs into a separate environment. It does not replace the notebook kernel's PyTorch. A wheel-and-binary-hash-verified `uv` installer creates pipless virtual environments and synchronizes complete package locks, including a pinned `pip`. System `ensurepip` is not needed. An earlier isolated environment with Python but no pip is repaired in place. Setup records readiness only after the complete installation and dependency check pass. On a new VM repeat this setup and CPU preflight before GPU recovery.
+
+Campaign stdout and stderr stream into this cell, with secret values and signed URL queries removed. Each invocation also saves a bounded sanitized log under `/content/spark-formal/logs`. A failure reports its exit code and actual reason. If the reason is `GatedRepo`, review the Stable Audio access form using the HF account that owns your token; once access is granted, rerun this cell without resetting the VM. A fine-grained token must also permit reading that gated model.''')
     code('''import importlib.util, subprocess, shutil
 assert sys.version_info[:2] == (3,13), 'This reviewed lock targets CPython3.13; qualify another release if Colab changes Python'
 # Load only this release's standard-library helper, even after an older setup.
@@ -140,6 +142,9 @@ _spec = importlib.util.spec_from_file_location('spark_environment_bootstrap', SO
 _bootstrap = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_bootstrap)
 CPU_PYTHON = _bootstrap.install_environment(WORK, SOURCE_ROOT, 'cpu', base_python=sys.executable)
+_spec = importlib.util.spec_from_file_location('spark_campaign_launcher', SOURCE_ROOT/'colab/final/launcher.py')
+_launcher = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_launcher)
 
 def run_campaign(mode, gpu=False, profile_receipt=None, resume_receipt=None):
     python = str(WORK/('env-cuda' if gpu else 'env-cpu')/'bin/python')
@@ -150,23 +155,10 @@ def run_campaign(mode, gpu=False, profile_receipt=None, resume_receipt=None):
             receipt_path.write_text(json.dumps(value))
             args += [option,str(receipt_path)]
     env = os.environ.copy()
-    # No token in environment variables, argv, logs or configuration files.
-    for name in ('HF_TOKEN','HUGGING_FACE_HUB_TOKEN','OPENCODE_API_KEY'):
-        env.pop(name,None)
     env['PYTHONPATH'] = str(SOURCE_ROOT)
-    env['PYTHONUNBUFFERED'] = '1'
-    process = subprocess.Popen(args,cwd=SOURCE_ROOT,env=env,stdin=subprocess.PIPE)
-    secret_payload = json.dumps({'HF_TOKEN':HF_SECRET,'OPENCODE_API_KEY':INSTRUCTOR_SECRET}) + chr(10)
-    try:
-        process.communicate(input=secret_payload.encode())
-    except KeyboardInterrupt:
-        process.send_signal(__import__('signal').SIGINT)
-        process.wait()  # The runner saves at the next optimizer boundary.
-        raise
-    finally:
-        del secret_payload
-    if process.returncode:
-        raise RuntimeError('Campaign stopped. Read the sanitized reason/committed receipt above; do not mark the run completed.')
+    log_path = WORK/'logs'/(mode+'-'+__import__('uuid').uuid4().hex+'.log')
+    return _launcher.run_process(args, cwd=SOURCE_ROOT, env=env,
+        secrets={'HF_TOKEN':HF_SECRET,'OPENCODE_API_KEY':INSTRUCTOR_SECRET}, log_path=log_path)
 
 run_campaign('cpu')
 ''')
@@ -178,7 +170,8 @@ The actual Studio backend ships inside the pinned Unsloth wheel. Its full graphi
     code('''INSTALL_CUDA_ENVIRONMENT = False  # Set True after switching to G4 and entering current usage observations.
 if INSTALL_CUDA_ENVIRONMENT:
     assert CONFIG['observed_compute_balance'] and CONFIG['observed_cu_per_hour'], 'Update and rerun operator configuration'
-    assert (WORK/'PREFLIGHT.json').exists(), 'CPU preflight must pass on this VM first'
+    _preflight = json.loads((WORK/'PREFLIGHT.json').read_text())
+    assert _preflight.get('passed') and _preflight.get('source_archive_sha256') == SOURCE_SHA256, 'CPU preflight must pass for this source on this VM first'
     # Optional native SoX executable used by the upstream package; decoding in
     # this pipeline uses SoundFile/PyAV and preserves the released waveforms.
     if not shutil.which('sox'):

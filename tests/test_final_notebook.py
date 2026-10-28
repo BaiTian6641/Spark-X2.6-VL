@@ -92,11 +92,23 @@ def test_export_runtime_keeps_instructor_and_environment_setup_dependencies(tmp_
     subprocess.run([sys.executable,'-I','-c',"import sys; sys.path.insert(0,sys.argv[1]); import colab.final.teacher",str(runtime)],cwd=tmp_path,check=True)
 
 
-def test_secret_stdin_uses_a_real_newline_not_literal_backslash_n():
-    nb=json.load(open('colab/Spark_Formal_Full_Finetune.ipynb'));found=False
-    for cell in nb['cells']:
-        if cell['cell_type']!='code': continue
-        for n in ast.walk(ast.parse(''.join(cell['source']))):
-            if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='secret_payload' for t in n.targets):
-                assert isinstance(n.value.right,ast.Call) and n.value.right.func.id=='chr' and n.value.right.args[0].value==10; found=True
-    assert found
+def test_notebook_runner_uses_the_captured_output_helper(tmp_path,monkeypatch):
+    import io,contextlib,os,sys
+    from colab.final import launcher
+    nb=json.load(open('colab/Spark_Formal_Full_Finetune.ipynb'))
+    tree=ast.parse(''.join(nb['cells'][8]['source']))
+    runner=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='run_campaign')
+    python=tmp_path/'env-cpu/bin/python';python.parent.mkdir(parents=True);python.symlink_to(sys.executable)
+    # Execute the actual notebook wrapper against a real child module, replacing
+    # only the heavyweight campaign. Child fd output must reach Python capture.
+    module=tmp_path/'colab/final';module.mkdir(parents=True)
+    (module.parent/'__init__.py').touch();(module/'__init__.py').touch()
+    (module/'run.py').write_text("import json,sys,os\ns=json.loads(sys.stdin.readline())\nassert s['HF_TOKEN']=='test-credential'\nassert 'HF_TOKEN' not in os.environ\nprint('child stdout',flush=True)\nprint('child stderr',file=sys.stderr,flush=True)\n")
+    state=dict(WORK=tmp_path,SOURCE_ROOT=tmp_path,CONFIG_PATH=tmp_path/'config',SOURCE_SHA256='a'*64,
+               HF_SECRET='test-credential',INSTRUCTOR_SECRET=None,json=json,os=os,_launcher=launcher)
+    exec(compile(ast.Module(body=[runner],type_ignores=[]),'notebook-runner','exec'),state)
+    monkeypatch.setenv('HF_TOKEN','must-not-be-inherited')
+    stream=io.StringIO()
+    with contextlib.redirect_stdout(stream): state['run_campaign']('cpu')
+    assert 'child stdout' in stream.getvalue() and 'child stderr' in stream.getvalue()
+    assert 'test-credential' not in stream.getvalue()

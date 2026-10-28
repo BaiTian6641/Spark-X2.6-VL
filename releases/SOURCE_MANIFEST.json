@@ -9,8 +9,8 @@
     },
     {
       "path": "colab/final/RUN.md",
-      "bytes": 16580,
-      "sha256": "d6f8f0a47555e2ab6ac350ddd2daae5e1f84796fc1a9642868355dc3fba86a58"
+      "bytes": 18767,
+      "sha256": "7746bf301b9ea910802bfd5be0f78e221dfb3d004a99185e4e39c25c8940a81c"
     },
     {
       "path": "colab/final/__init__.py",
@@ -19,8 +19,8 @@
     },
     {
       "path": "colab/final/assets.py",
-      "bytes": 6567,
-      "sha256": "fce8117fd1970be82758f4725addafab5a00a5007364d5986f6b060b0144025a"
+      "bytes": 8221,
+      "sha256": "43737c9394a22d0c54354affb59c0c905e4dfa4a80a1392864371c94170a8449"
     },
     {
       "path": "colab/final/bootstrap.lock.json",
@@ -73,6 +73,11 @@
       "sha256": "9d9e8d5b83fe2e5aedf4f12efb20e4f3e6c9254389c75a900e1556d916dfa66f"
     },
     {
+      "path": "colab/final/launcher.py",
+      "bytes": 5190,
+      "sha256": "ec9aec6403692656c1af439cfc3fff3edab0840348e1a8d2df940493c85d99d4"
+    },
+    {
       "path": "colab/final/model.py",
       "bytes": 21246,
       "sha256": "7925dcff11208b84491a90d5de6be76fe291ea370a573da99d3b2602bb6d3690"
@@ -84,8 +89,8 @@
     },
     {
       "path": "colab/final/preflight.py",
-      "bytes": 4419,
-      "sha256": "832e807280b7aedce2498c57cdcc8c3a2c6c64057498881753cea4e3a2f947ab"
+      "bytes": 5544,
+      "sha256": "f29507c8567fbd0a98f5e618720af7ad78f6a42dfeac1083f2c8670415c53abb"
     },
     {
       "path": "colab/final/publish.py",
@@ -119,8 +124,8 @@
     },
     {
       "path": "colab/final/run.py",
-      "bytes": 5871,
-      "sha256": "2287bc9bd3b58b9a52b4d59cdc9a3b132c86374d4f7824c07dfc8601deb24bc1"
+      "bytes": 6042,
+      "sha256": "590592337667b6b9c37c76545803162b65b5a399f01d15967268b88ec550dee2"
     },
     {
       "path": "colab/final/storage.py",

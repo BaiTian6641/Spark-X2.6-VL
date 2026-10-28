@@ -23,6 +23,7 @@ def context_audit(root,config):
                 media={'image':config['max_visual_tokens'],'video':config['max_visual_tokens']+config['motion_tokens'],'audiovisual':config['max_visual_tokens']+config['motion_tokens']+config['audio_tokens'],'speech_in':config['audio_tokens'],'sound_in':config['audio_tokens']}.get(fam,0)
                 seq=len(prompt)+(0 if fam.endswith('_out') else len(answer))+media
                 maximum[fam]=max(maximum[fam],seq); counts[fam]+=1; total+=1
+                if total%10000==0: emit('context_audit_progress',views_checked=total,original_instructions=original)
                 if seq>config['max_sequence'] or (not fam.endswith('_out') and len(answer)>config['max_answer_tokens']): failures.append({'id':v['id'],'family':fam,'sequence':seq,'answer_tokens':len(answer)})
                 if fam=='speech_out' and (not v['metadata'].get('text') or v['metadata']['text'] not in v['prompt']): failures.append({'id':v['id'],'reason':'TTS utterance missing from prompt'})
     report={'schema_version':1,'passed':not failures,'original_instructions':original,'derived_training_views':total,'counts':dict(counts),'max_conservative_sequences':dict(maximum),'failures':failures[:100],'failure_count':len(failures),'adapter':'24-event complete score views; full waveform retained; source groups unchanged'}
@@ -32,12 +33,28 @@ def context_audit(root,config):
 
 def run(config,token,source_sha):
     validate_config(config); root=Path(config['work_root']); root.mkdir(parents=True,exist_ok=True)
+    # A failed retry must not leave an earlier successful readiness claim active.
+    write(root/'PREFLIGHT.json',{'passed':False,'training_ready':False,'source_archive_sha256':source_sha,'status':'running','created_unix':time.time()})
+    try: return _run(config,token,source_sha)
+    except (Exception,KeyboardInterrupt) as exc:
+        from .launcher import sanitize
+        write(root/'PREFLIGHT.json',{'passed':False,'training_ready':False,'source_archive_sha256':source_sha,'status':'stopped','error_type':type(exc).__name__,'reason':sanitize(str(exc),(token,))[:2000],'created_unix':time.time()})
+        raise
+
+
+def _run(config,token,source_sha):
+    root=Path(config['work_root'])
     if platform.python_version_tuple()[:2]!=('3','13'): raise RuntimeError('This reviewed environment is CPython3.13; do not install the CUDA lock on an unqualified Python version')
+    emit('cpu_preflight_stage',stage='model_access_and_metadata',gpu_training_performed=False,teacher_api_calls=0)
     prepare_assets(root,token,config,download_weights=False)
-    data=prepare_data(root,token,config); audit=context_audit(root,config)
+    emit('cpu_preflight_stage',stage='dataset_metadata_and_source_splits')
+    data=prepare_data(root,token,config)
+    emit('cpu_preflight_stage',stage='full_corpus_context_audit')
+    audit=context_audit(root,config)
     from .engine import binding
     # engine imports no torch until a training/recovery method executes.
     from .storage import ColdStore
+    emit('cpu_preflight_stage',stage='drive_cold_storage')
     store=ColdStore(root,config,binding(config,source_sha)); drive=store.service.about().get(fields='storageQuota').execute()['storageQuota']
     free=shutil.disk_usage(root).free
     report={'schema_version':1,'passed':True,'source_archive_sha256':source_sha,'dataset_split_sha256':data['split_membership_sha256'],'context':audit,'local_free_bytes':free,'drive_quota':drive,'gated_audio_model_access':True,'teacher_api_calls':0,'gpu_training_performed':False,'training_ready':False,'remaining_gates':['whole-model CUDA profile and two real native continuation updates after fresh-VM recovery','provider/account eligibility for OpenCode Go dataset review','observed Colab CU balance/rate and complete-curriculum budget fit'],'created_unix':time.time()}

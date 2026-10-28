@@ -41,21 +41,45 @@ def fetch(url,path,entry,token=None,reserve=0):
         raise RuntimeError('Asset transport failed: '+type(exc).__name__) from None
     finally: session.close()
 
+def check_gated_access(spec,token):
+    """Check Hub authorization/identity without HEADing the signed CDN URL."""
+    from huggingface_hub import get_hf_file_metadata,hf_hub_url
+    from huggingface_hub.errors import GatedRepoError,HfHubHTTPError
+    entry=next(f for f in spec['files'] if f['path'].endswith('.safetensors'))
+    repo=spec['repository']; page=f'https://huggingface.co/{repo}'
+    try:
+        metadata=get_hf_file_metadata(hf_hub_url(repo,entry['path'],revision=spec['revision']),token=token,timeout=30)
+    except GatedRepoError as exc:
+        status=exc.response.status_code if exc.response is not None else 'unknown'
+        raise RuntimeError(f'Model access denied (HTTP {status}, GatedRepo): {repo}. '
+                           f'Using the same HF account as HF_TOKEN, review/request access at {page}. '
+                           'After approval, ensure the fine-grained token permits reading this gated model, '
+                           'then rerun CPU preflight. No license is accepted automatically.') from None
+    except HfHubHTTPError as exc:
+        status=exc.response.status_code if exc.response is not None else 'unknown'
+        raise RuntimeError(f'Model metadata request failed (HTTP {status}): {repo}. '
+                           'Check token read scope, pinned revision and Hub availability; '
+                           'this response does not establish missing license approval.') from None
+    except Exception as exc:
+        raise RuntimeError(f'Model metadata transport failed for {repo}: {type(exc).__name__}. '
+                           'Retry CPU preflight after resolving connectivity; access denial is not established.') from None
+    if metadata.commit_hash!=spec['revision'] or metadata.size!=entry['bytes'] or metadata.etag!=entry['sha256']:
+        raise ValueError(f'Gated model metadata differs from the frozen size, revision or SHA256: {repo}')
+    emit('model_access_verified',repository=repo,revision=spec['revision'],weights_downloaded=False)
+
+
 def prepare_assets(root,token,config,download_weights=True):
     from huggingface_hub import HfApi
     root=Path(root); lock=read(HERE/'components.lock.json'); paths={}
     api=HfApi(token=token)
     if not token: raise ValueError('HF_TOKEN must be enabled in Colab Secrets')
     who=api.whoami()
-    if api.get_token_permission()=='read': raise ValueError('HF_TOKEN must permit writing the final private model repository, not only reading datasets')
+    role=(who.get('auth',{}).get('accessToken') or {}).get('role')
+    if role=='read': raise ValueError('HF_TOKEN must permit writing the final private model repository, not only reading datasets')
     if who.get('name')!='TassP0lar': raise ValueError('HF_TOKEN belongs to an unexpected publishing account')
+    emit('hf_identity_verified',account=who['name'],token_role=role,publication_write_access_proven=False)
     # Check gated access before allocating a GPU or downloading other weights.
-    import requests
-    gated=lock['sound_out']; f=next(v for v in gated['files'] if v['path'].endswith('.safetensors'))
-    with requests.Session() as session:
-        session.trust_env=False
-        response=session.head(f"https://huggingface.co/{gated['repository']}/resolve/{gated['revision']}/{f['path']}",headers={'Authorization':'Bearer '+token},allow_redirects=True,timeout=60)
-        if response.status_code!=200: raise RuntimeError('HF account must first receive access to stabilityai/stable-audio-open-1.0; no terms are accepted automatically')
+    check_gated_access(lock['sound_out'],token)
     remaining=sum(v['bytes'] for k,v in lock.items() if k!='motion')+lock['motion']['checkpoint']['bytes']
     if download_weights: disk_guard(root,pending=remaining,reserve=2*config['initial_checkpoint_reservation_bytes'])
     for key,spec in lock.items():
