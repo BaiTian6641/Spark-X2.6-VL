@@ -18,6 +18,7 @@ The replacement `colab/oneshot` WSD schedule, 20-source expansion, 12 GB reserve
 ## Requirements
 
 - G4 / RTX PRO 6000 Blackwell with at least 90,000,000,000 GPU bytes and BF16.
+- `flash-attn-4[cu13]`: supplemental Blackwell/CUDA-13 environment with import and BF16 backward-kernel checks.
 - `INSTRUCTOR_MODEL`: defaults to `mimo-v2.6-pro`; this is an allowed operator selection, not independently verified provider eligibility or instructor competence.
 - Conservative 230 GB local-disk envelope; 44 GB non-borrowable free floor.
 - `HF_TOKEN`: component read access plus model/checkpoint write access for `TassP0lar`; public snapshots are sanitized.

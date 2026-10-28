@@ -42,6 +42,7 @@ class Hub:
             self.lose_response=False; raise RuntimeError('simulated lost commit response')
         return SimpleNamespace(oid=self.head)
     def list_repo_tree(self,repo,revision,path_in_repo,**kw):
+        self.expand_seen=kw.get('expand',False)
         for name,data in self.history[revision].items():
             if not name.startswith(path_in_repo+'/'): continue
             digest=hashlib.sha256(data).hexdigest()
@@ -73,6 +74,7 @@ def acknowledge(directory,receipt):
 def test_atomic_versioned_upload_verifies_all_files_and_restores_old_revision(store,monkeypatch):
     hf,hub=store; first=snapshot(hf.root)
     r1=hf.commit(first);assert r1['verified'] and r1['private']
+    assert hub.expand_seen is True
     second=snapshot(hf.root,'step-2',b'new weights')
     (second/'reload-assets/tokenizer.json').unlink()
     r2=hf.commit(second)

@@ -35,6 +35,8 @@ Useful engineering corrections were retained: media inside Spark's first user tu
 
 **Dependency correction:** the environment pins `diffusers==0.38.0`. The older 0.35.2 path hits the documented TorchAO 0.17 import incompatibility, and versions before 0.38.0 retain reported `trust_remote_code` vulnerabilities. Native EDM tests pass with the locked TorchAO 0.17 API.
 
+**FlashAttention:** `requirements-flash-attn.lock` adds the separate Blackwell/CUDA-13 CuTeDSL environment (`flash-attn-4[cu13]==4.0.0b36`). `direct_doctor` verifies `pip check`, CUTE import, and an actual BF16 backward kernel on the assigned GPU; installation alone is not treated as proof of acceleration.
+
 Primary references: [Spark model card](https://huggingface.co/XHToken/Spark-X2.6-4B), [SigLIP2 documentation](https://huggingface.co/docs/transformers/model_doc/siglip2), [V-JEPA 2](https://github.com/facebookresearch/vjepa2), [Qwen3-TTS report](https://arxiv.org/html/2601.15621v1), [Qwen SFT code](https://github.com/QwenLM/Qwen3-TTS), [Stable Audio card](https://huggingface.co/stabilityai/stable-audio-open-1.0), [Diffusers Stable Audio](https://github.com/huggingface/diffusers/tree/v0.38.0/src/diffusers/pipelines/stable_audio), and [NVIDIA RTX PRO 6000 specifications](https://www.nvidia.com/en-us/products/workstations/professional-desktop-gpus/rtx-pro-6000-family/).
 
 ## 4. Corpus decision

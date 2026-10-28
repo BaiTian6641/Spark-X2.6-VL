@@ -133,7 +133,7 @@ class HFCheckpointStore:
         if self._read_remote(MARKER, revision) != marker_bytes:
             raise ValueError('Remote HF checkpoint commit marker differs')
         remote = {f.path: f for f in self.api.list_repo_tree(self.repo, path_in_repo='checkpoint',
-                  repo_type='model', revision=revision, recursive=True) if isinstance(f, RepoFile)}
+                  repo_type='model', revision=revision, recursive=True, expand=True) if isinstance(f, RepoFile)}
         if set(remote) != {PREFIX + f['path'] for f in value['files']} | {MARKER}:
             raise ValueError('Remote HF checkpoint inventory differs')
         for f in value['files']:

@@ -37,10 +37,16 @@ def direct_doctor(root):
     q=torch.randn(1,4,32,128,device='cuda',dtype=torch.bfloat16,requires_grad=True)
     result=torch.nn.functional.scaled_dot_product_attention(q,q,q); result.float().square().mean().backward()
     if not torch.isfinite(q.grad).all() or not q.grad.abs().sum(): raise RuntimeError('CUDA attention gradient check failed')
+    from flash_attn.cute import flash_attn_func
+    flash_q=torch.randn(1,4,32,128,device='cuda',dtype=torch.bfloat16,requires_grad=True)
+    flash_out=flash_attn_func(flash_q,flash_q,flash_q,causal=True)
+    flash_out.float().square().mean().backward()
+    if not torch.isfinite(flash_q.grad).all() or not flash_q.grad.abs().sum():
+        raise RuntimeError('FlashAttention CUTE backward check failed')
     report={'python':sys.version.split()[0],'torch':torch.__version__,'cuda':torch.version.cuda,
             'gpu':prop.name,'gpu_bytes':prop.total_memory,'capability':list(torch.cuda.get_device_capability()),
             'bf16':True,'studio_backend_file':str(Path(backend.__file__).resolve()),
-            'studio_backend_sha256':sha(backend.__file__),'direct_mode':True}
+            'studio_backend_sha256':sha(backend.__file__),'direct_mode':True,'flash_attn_cute_backward':True}
     write(Path(root)/'ENVIRONMENT.json',report); emit('environment_ready',**report); return report
 
 DIRECT_QUALIFICATION_EXIT=10
