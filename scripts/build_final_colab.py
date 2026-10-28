@@ -10,7 +10,7 @@ FINAL=ROOT/'colab/final'
 def digest(x): return hashlib.sha256(x).hexdigest()
 def build(runtime_revision=None, runtime_only=False):
     selected=[p for p in FINAL.rglob('*') if p.is_file() and ('research' not in p.relative_to(FINAL).parts) and '__pycache__' not in p.parts and p.suffix not in ('.log','.partial')]
-    extras=['reports/spark_multimodal/COLAB_CAMPAIGN_PLAN.md','reports/spark_multimodal/REFINEMENT_MULTIMODAL_REVIEW_2026-10-27.md','colab/__init__.py','colab/preflight.py','colab/stage1/__init__.py','colab/stage1/common.py','colab/stage1/drive_checkpoint.py','colab/stage1/requirements.in','colab/formal/__init__.py','colab/formal/rolling_cache.py','colab/formal/shard_dataset.py','colab/formal/local_storage.py','colab/formal/HF_FULL_DATASET_HANDOFF.json']
+    extras=['reports/spark_multimodal/COLAB_CAMPAIGN_PLAN.md','reports/spark_multimodal/REFINEMENT_MULTIMODAL_REVIEW_2026-10-27.md','colab/__init__.py','colab/preflight.py','colab/stage1/__init__.py','colab/stage1/common.py','colab/stage1/drive_checkpoint.py','colab/stage1/requirements.in','colab/formal/__init__.py','colab/formal/rolling_cache.py','colab/formal/shard_dataset.py','colab/formal/local_storage.py','colab/formal/teacher_readiness.py','colab/formal/HF_FULL_DATASET_HANDOFF.json']
     selected+= [ROOT/p for p in extras]
     selected=sorted(set(selected)); files=[]; output=io.BytesIO()
     with zipfile.ZipFile(output,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=9) as z:

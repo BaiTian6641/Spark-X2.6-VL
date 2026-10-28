@@ -58,6 +58,40 @@ def test_bootstrap_cell_verifies_before_writing_and_refuses_modified_source(tmp_
         exec(compile(code,'launcher','exec'),{})
 
 
+def test_runtime_archive_has_every_local_import_and_instructor_imports_in_isolation(tmp_path):
+    import importlib.util,subprocess,sys
+    archive=Path('output/colab-formal-final/spark-formal-runtime.zip')
+    if not archive.exists(): archive=Path('releases/spark-formal-runtime.zip')
+    with zipfile.ZipFile(archive) as z:
+        names=set(z.namelist())
+        for name in sorted(n for n in names if n.endswith('.py')):
+            module=name[:-3].replace('/','.')
+            package=module.removesuffix('.__init__') if name.endswith('/__init__.py') else module.rsplit('.',1)[0]
+            for node in ast.walk(ast.parse(z.read(name))):
+                modules=[]
+                if isinstance(node,ast.ImportFrom):
+                    modules=[importlib.util.resolve_name('.'*node.level+(node.module or ''),package) if node.level else node.module]
+                elif isinstance(node,ast.Import): modules=[alias.name for alias in node.names]
+                for required in modules:
+                    if required and (required=='colab' or required.startswith('colab.')):
+                        prefix=required.replace('.','/')
+                        assert prefix+'.py' in names or prefix+'/__init__.py' in names, f'{name} needs missing runtime {required}'
+        z.extractall(tmp_path)
+    code="import sys; sys.path.insert(0,sys.argv[1]); import colab.final.teacher as t; assert t.MODEL=='mimo-v2.6-pro'; assert callable(t.costs)"
+    subprocess.run([sys.executable,'-I','-c',code,str(tmp_path)],cwd=tmp_path,check=True)
+
+
+def test_export_runtime_keeps_instructor_and_environment_setup_dependencies(tmp_path):
+    import subprocess,sys
+    from types import SimpleNamespace
+    from colab.final.engine import copy_reload_assets
+    copy_reload_assets(SimpleNamespace(paths={}),tmp_path)
+    runtime=tmp_path/'runtime'
+    for name in ('colab/formal/teacher_readiness.py','colab/final/bootstrap.lock.json','colab/final/requirements-preflight.lock','colab/stage1/requirements.in'):
+        assert (runtime/name).is_file()
+    subprocess.run([sys.executable,'-I','-c',"import sys; sys.path.insert(0,sys.argv[1]); import colab.final.teacher",str(runtime)],cwd=tmp_path,check=True)
+
+
 def test_secret_stdin_uses_a_real_newline_not_literal_backslash_n():
     nb=json.load(open('colab/Spark_Formal_Full_Finetune.ipynb'));found=False
     for cell in nb['cells']:

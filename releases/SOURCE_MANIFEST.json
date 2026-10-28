@@ -59,8 +59,8 @@
     },
     {
       "path": "colab/final/engine.py",
-      "bytes": 34668,
-      "sha256": "8b024cd48e6817c2580def48ff4ac51b867164c1ba376a4e4ab6345e897bd2d8"
+      "bytes": 34890,
+      "sha256": "522a20c54c3603d30a9b15e3b93a4dfc21fdb3dcdc4a8bdeeb632b82d92e6c66"
     },
     {
       "path": "colab/final/evaluate.py",
@@ -161,6 +161,11 @@
       "path": "colab/formal/shard_dataset.py",
       "bytes": 6840,
       "sha256": "28cb394ad3bc1d50c765f5e2e1d3c4c0b76e376f2d4fe43745586599aeeb6105"
+    },
+    {
+      "path": "colab/formal/teacher_readiness.py",
+      "bytes": 6405,
+      "sha256": "c1b60ea20bd8f8ee18e119ef4f7076ba3759844be2277ff14d306398317f43ed"
     },
     {
       "path": "colab/preflight.py",

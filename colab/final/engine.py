@@ -59,8 +59,8 @@ def copy_reload_assets(model,destination):
     # Every saved package carries the reviewed inference/runtime source and lock.
     runtime=destination/'runtime'
     release=HERE.parents[1]
-    include=[p for p in (release/'colab').rglob('*.py') if '__pycache__' not in p.parts and (p.parent==HERE or p.name=='__init__.py' or p.relative_to(release).as_posix() in ('colab/preflight.py','colab/stage1/common.py','colab/stage1/drive_checkpoint.py','colab/formal/rolling_cache.py','colab/formal/shard_dataset.py','colab/formal/local_storage.py'))]
-    include += [HERE/'components.lock.json',HERE/'dataset.lock.json',HERE/'requirements.lock',HERE.parent/'formal/HF_FULL_DATASET_HANDOFF.json']
+    include=[p for p in (release/'colab').rglob('*.py') if '__pycache__' not in p.parts and (p.parent==HERE or p.name=='__init__.py' or p.relative_to(release).as_posix() in ('colab/preflight.py','colab/stage1/common.py','colab/stage1/drive_checkpoint.py','colab/stage1/requirements.in','colab/formal/rolling_cache.py','colab/formal/shard_dataset.py','colab/formal/local_storage.py','colab/formal/teacher_readiness.py'))]
+    include += [HERE/'components.lock.json',HERE/'dataset.lock.json',HERE/'bootstrap.lock.json',HERE/'requirements.lock',HERE/'requirements-preflight.lock',HERE/'requirements.in',HERE/'requirements-preflight.in',HERE.parent/'stage1/requirements.in',HERE.parent/'formal/HF_FULL_DATASET_HANDOFF.json']
     for src in include:
         dest=runtime/src.relative_to(release); dest.parent.mkdir(parents=True,exist_ok=True); shutil.copy2(src,dest)
 
