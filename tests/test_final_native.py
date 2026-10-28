@@ -84,7 +84,7 @@ def test_native_talker_official_layout_subtalker_alignment_and_gradients():
     torch.testing.assert_close(seen['hidden'],expected[0,1:4])
     loss.backward()
     assert torch.isfinite(hidden.grad).all() and hidden.grad.abs().sum()>0
-    assert model.talker.code_predictor.lm_head[0].weight.grad.abs().sum()>0
+    assert all(head.weight.grad is not None and head.weight.grad.abs().sum()>0 for head in model.talker.code_predictor.lm_head)
     assert model.talker.model.layers[0].self_attn.q_proj.weight.grad.abs().sum()>0
 
 def test_native_talker_cached_frames_match_full_prefill():
@@ -110,6 +110,8 @@ def test_native_dit_v_prediction_reaches_spark_conditioning():
     model.projection=StableAudioProjectionModel(text_encoder_dim=32,conditioning_dim=32,min_value=0,max_value=512)
     model.bridge=Resampler(48,32,4)
     model.scheduler_config={'sigma_min':.3,'sigma_max':500.,'sigma_data':1.0}
+    model.freeze_fixed_conditioning()
+    assert not model.projection.start_number_conditioner.time_positional_embedding[0].weights.requires_grad
     hidden=torch.randn(1,7,48,requires_grad=True);z=torch.randn(1,8,16);noise=torch.randn_like(z)
     scaled,timestep,target=model.diffusion(z,noise,torch.tensor([2.0]))
     torch.testing.assert_close(timestep,torch.tensor([.25*__import__('math').log(2.)]))
@@ -119,6 +121,9 @@ def test_native_dit_v_prediction_reaches_spark_conditioning():
     torch.nn.functional.mse_loss(out,target).backward()
     assert torch.isfinite(hidden.grad).all() and hidden.grad.abs().sum()>0
     assert model.dit.proj_out.weight.grad.abs().sum()>0
+    assert model.projection.start_number_conditioner.time_positional_embedding[0].weights.grad is None
+    assert model.projection.start_number_conditioner.time_positional_embedding[1].weight.grad.abs().sum()>0
+    assert model.projection.end_number_conditioner.time_positional_embedding[0].weights.grad.abs().sum()>0
     assert type(model.scheduler()).__name__=='EDMDPMSolverMultistepScheduler'
 
 def test_diffusers_pretrained_loaders_accept_torch_dtype(tmp_path):

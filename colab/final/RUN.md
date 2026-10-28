@@ -19,7 +19,7 @@ The latest user instruction changes full checkpoint storage to **Hugging Face**.
 | Artifact | Destination |
 |---|---|
 | Existing pinned data | `datasets/TassP0lar/SparkX2.6-MM` |
-| Full resumable snapshots | Public sanitized model repo `TassP0lar/SparkX2.6-MM-checkpoints-g4-v6` |
+| Full resumable snapshots | Public sanitized model repo `TassP0lar/SparkX2.6-MM-checkpoints-g4-v8` |
 | Finished inference package | Public model repo `TassP0lar/SparkX2.6-MM-g4-v2` |
 | Protected evaluation rows and account metadata | Excluded from public artifacts; only aggregate/receipt state is retained |
 

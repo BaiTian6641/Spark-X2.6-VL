@@ -65,7 +65,10 @@ class NativeSpeechOutput(nn.Module):
         loss=F.cross_entropy(self.talker.codec_head(out).float().flatten(0,1),labels.flatten())
         # Official SFT alignment: frame i's residual codebooks use the hidden
         # state after frame i, not the preceding codec-BOS/frame-i-1 state.
-        _,sub=self.talker.forward_sub_talker_finetune(codes,out[0,1:len(codes)+1])
+        logits,_=self.talker.forward_sub_talker_finetune(codes,out[0,1:len(codes)+1])
+        # These logits already predict codes[:,1:]. A generic causal-LM loss
+        # would shift the labels again and ignore the final residual head.
+        sub=F.cross_entropy(logits.float().flatten(0,1),codes[:,1:].flatten())
         return loss+.3*sub,int(codes.numel()+1)
     def loss(self,hidden,audio,row):
         wav,sr=audio; mono=wav.mean(axis=0)
@@ -108,9 +111,14 @@ class NativeSoundOutput(nn.Module):
         self.bridge=Resampler(spark_hidden,dim,policy['generator_prefix_tokens'])
         from diffusers import EDMDPMSolverMultistepScheduler
         self.scheduler_config=dict(EDMDPMSolverMultistepScheduler.from_pretrained(path,subfolder='scheduler',local_files_only=True).config)
-        self.vae.requires_grad_(False); self.vae.eval()
+        self.vae.requires_grad_(False); self.vae.eval(); self.freeze_fixed_conditioning()
     @property
     def device(self): return next(self.dit.parameters()).device
+    def freeze_fixed_conditioning(self):
+        # Every target is a full clip starting at zero. The start frequency
+        # weights have no gradient path; keep their values but not in the optimizer.
+        self.projection.start_number_conditioner.time_positional_embedding[0].weights.requires_grad_(False)
+
     def conditioning(self,hidden,seconds):
         duration=torch.tensor([seconds],device=self.device,dtype=torch.float32)
         output=self.projection(text_hidden_states=self.bridge(hidden),start_seconds=torch.zeros_like(duration),end_seconds=duration)
