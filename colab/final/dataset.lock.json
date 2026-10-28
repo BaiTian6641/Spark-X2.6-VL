@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "repo_id": "TassP0lar/SparkX2.6-MM",
+  "media_revision": "f472f980a6c95d3e9844f27e6045c8c09b21536a",
+  "catalogue_revision": "b8ddb27084b0aec0daf28bf5c67075f4f516eb6a",
+  "catalogue_url": "https://huggingface.co/datasets/TassP0lar/SparkX2.6-MM/resolve/b8ddb27084b0aec0daf28bf5c67075f4f516eb6a/releases/full-ft-v1/formal-index-v1/packets.jsonl.gz",
+  "catalogue": {
+    "path": "packets.jsonl.gz",
+    "bytes": 164187805,
+    "sha256": "e108efdca6b31c49bc22c7d8dc58ed25eaeebeaa1dcaee2107854702ebc4a207"
+  },
+  "index": {
+    "path": "releases/full-ft-v1/formal-index-v1/INDEX.json",
+    "bytes": 3388,
+    "sha256": "53f2b1b29c53c93665a1dd95dd49a25d9777b9a8485513b5b4e2d9e6ca590747"
+  }
+}

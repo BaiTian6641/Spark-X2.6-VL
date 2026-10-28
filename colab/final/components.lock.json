@@ -1,0 +1,473 @@
+{
+  "spark": {
+    "repository": "XHToken/Spark-X2.6-4B",
+    "revision": "66e3ae7bee54e0a523d692cb8ef841f35409807b",
+    "files": [
+      {
+        "path": "LICENSE",
+        "bytes": 11338,
+        "sha256": null,
+        "git_blob_sha1": "b7456707c547e5df6a88ee0255ad9c422ac52f9b"
+      },
+      {
+        "path": "README.md",
+        "bytes": 14127,
+        "sha256": null,
+        "git_blob_sha1": "a990cff99ef94e8323b88ea4427018a838b4c732"
+      },
+      {
+        "path": "config.json",
+        "bytes": 2035,
+        "sha256": null,
+        "git_blob_sha1": "2c6a1864a9dbd661704d7699f17adbc186547687"
+      },
+      {
+        "path": "configuration_spark.py",
+        "bytes": 4329,
+        "sha256": null,
+        "git_blob_sha1": "cca611a0302679df685ca442d21c2756884aa47e"
+      },
+      {
+        "path": "generation_config.json",
+        "bytes": 281,
+        "sha256": null,
+        "git_blob_sha1": "d47d113162317c2d4338dd7f0727663b6aa9fb57"
+      },
+      {
+        "path": "merges.txt",
+        "bytes": 1567883,
+        "sha256": null,
+        "git_blob_sha1": "3f921c3aed6a693e3dcfd15b7171467fcade71b3"
+      },
+      {
+        "path": "model-00001-of-00005.safetensors",
+        "bytes": 1982449560,
+        "sha256": "9ba8a59a47ce4197d5c749c76c04272e0b4b880747b31b9167a82d8757e90665",
+        "git_blob_sha1": "6931575797f91477d6146a659efc899ecb10c61e"
+      },
+      {
+        "path": "model-00002-of-00005.safetensors",
+        "bytes": 1993132424,
+        "sha256": "f0cad973670dda858a177d62a1845f9ec3c3e2a7a1cdbd34f98ab6789fbd452d",
+        "git_blob_sha1": "8b089fa769c5dc6d97597c3cbb7cf43c037b5d95"
+      },
+      {
+        "path": "model-00003-of-00005.safetensors",
+        "bytes": 1993225080,
+        "sha256": "479c8aecd24d1d4c6c2243541b36acc6a84df4c0706a7ccaacda748eac46b8e8",
+        "git_blob_sha1": "473a4954bc8277d8a0c329d76a547850fb9c7765"
+      },
+      {
+        "path": "model-00004-of-00005.safetensors",
+        "bytes": 1993132448,
+        "sha256": "766cd843c58676b0be533b465368a76f574f36bea074f4d16f7e37d910423d08",
+        "git_blob_sha1": "b9b4aca04f7a30448f0c477abfac9345b1807794"
+      },
+      {
+        "path": "model-00005-of-00005.safetensors",
+        "bytes": 262252896,
+        "sha256": "e2cb22cc6aa1dccdc30042170841058a1a8cffb7e9eb57356c86ae14fc4ca0e3",
+        "git_blob_sha1": "d2638ca7b017096414c681fcce955a51ae62b38e"
+      },
+      {
+        "path": "model.safetensors.index.json",
+        "bytes": 24133,
+        "sha256": null,
+        "git_blob_sha1": "065dd034896142c54055eec0961b99fd15f304ca"
+      },
+      {
+        "path": "modeling_spark.py",
+        "bytes": 19418,
+        "sha256": null,
+        "git_blob_sha1": "4e48c7a98111e2a8457970fad0361db3404c154f"
+      },
+      {
+        "path": "special_tokens_map.json",
+        "bytes": 156,
+        "sha256": null,
+        "git_blob_sha1": "9a77af52dba6347730c06368baa133534a2ac129"
+      },
+      {
+        "path": "tokenizer.json",
+        "bytes": 10115786,
+        "sha256": "710cce15cf3565674c499f9413997c6e8101f2bdd96245cff8f0311fb501248c",
+        "git_blob_sha1": "59e23a7cec1b1f11068e98f357cd441e8dad4a6e"
+      },
+      {
+        "path": "tokenizer_config.json",
+        "bytes": 5841,
+        "sha256": null,
+        "git_blob_sha1": "3744e6bd35bf786fb626752b2594dd483a7a4aa5"
+      },
+      {
+        "path": "vocab.json",
+        "bytes": 3032795,
+        "sha256": null,
+        "git_blob_sha1": "9cca33b9d8dc48d4fe1ae44743b0b7c1df5bf0c1"
+      }
+    ],
+    "bytes": 8238990530,
+    "gated": false,
+    "license": "apache-2.0"
+  },
+  "vision": {
+    "repository": "google/siglip2-so400m-patch16-naflex",
+    "revision": "cc24074f717b612951c2dead130904ab9b65a81e",
+    "files": [
+      {
+        "path": "README.md",
+        "bytes": 3389,
+        "sha256": null,
+        "git_blob_sha1": "c6da9c3373e752526c4c8808ede085f30c205f21"
+      },
+      {
+        "path": "config.json",
+        "bytes": 590,
+        "sha256": null,
+        "git_blob_sha1": "70b4ae5f068c1f5b9d6809f700f9ec042278ef13"
+      },
+      {
+        "path": "model.safetensors",
+        "bytes": 4542792928,
+        "sha256": "11a61a2068800d5f4f35cb041c1fea25de86ce87725e4c97a9ed046d0b22c076",
+        "git_blob_sha1": "bb8b8fe484791f9534218d992144cc1e266bf341"
+      },
+      {
+        "path": "preprocessor_config.json",
+        "bytes": 393,
+        "sha256": null,
+        "git_blob_sha1": "0b394ef874fa00123ca80d5456646592a052e50e"
+      },
+      {
+        "path": "special_tokens_map.json",
+        "bytes": 636,
+        "sha256": null,
+        "git_blob_sha1": "8d6368f7e735fbe4781bf6e956b7c6ad0586df80"
+      },
+      {
+        "path": "tokenizer.json",
+        "bytes": 34356304,
+        "sha256": "58a1696e79c9d97937389ed116f552a15c84811d7b8023918b86f4bc5775b1b0",
+        "git_blob_sha1": "f09cc022e166541fe83243037fd684e7f1e98dbf"
+      },
+      {
+        "path": "tokenizer.model",
+        "bytes": 4241003,
+        "sha256": "61a7b147390c64585d6c3543dd6fc636906c9af3865a5548f27f31aee1d4c8e2",
+        "git_blob_sha1": "796efe9ab515c15e146ce7588e6d7b9b8134dbf8"
+      },
+      {
+        "path": "tokenizer_config.json",
+        "bytes": 40160,
+        "sha256": null,
+        "git_blob_sha1": "3555266818f1cba8595ca97e26cd117ef1714bfb"
+      }
+    ],
+    "bytes": 4581435403,
+    "gated": false,
+    "license": "apache-2.0"
+  },
+  "speech_in": {
+    "repository": "openai/whisper-small",
+    "revision": "973afd24965f72e36ca33b3055d56a652f456b4d",
+    "files": [
+      {
+        "path": "README.md",
+        "bytes": 20153,
+        "sha256": null,
+        "git_blob_sha1": "0277360c2131c5d741658f7fe5d26c1377bcfb9a"
+      },
+      {
+        "path": "added_tokens.json",
+        "bytes": 34604,
+        "sha256": null,
+        "git_blob_sha1": "e3d256c988462aa153dcabe2aa38b8e9b436c06f"
+      },
+      {
+        "path": "config.json",
+        "bytes": 1967,
+        "sha256": null,
+        "git_blob_sha1": "113bb3efe3a7396f2ea629eef12637bd8085238d"
+      },
+      {
+        "path": "generation_config.json",
+        "bytes": 3868,
+        "sha256": null,
+        "git_blob_sha1": "d3823179a367fa912e3b911b3d2e71ab2a028290"
+      },
+      {
+        "path": "merges.txt",
+        "bytes": 493869,
+        "sha256": null,
+        "git_blob_sha1": "6038932a2a1f09a66991b1c2adae0d14066fa29e"
+      },
+      {
+        "path": "model.safetensors",
+        "bytes": 966995080,
+        "sha256": "1d7734884874f1a1513ed9aa760a4f8e97aaa02fd6d93a3a85d27b2ae9ca596b",
+        "git_blob_sha1": "b737d9fc4345d96e8f69b440ab742a269bf7e734"
+      },
+      {
+        "path": "normalizer.json",
+        "bytes": 52666,
+        "sha256": null,
+        "git_blob_sha1": "dd6ae819ad738ac1a546e9f9282ef325c33b9ea0"
+      },
+      {
+        "path": "preprocessor_config.json",
+        "bytes": 184990,
+        "sha256": null,
+        "git_blob_sha1": "c2048dfa9fd94a052e62e908d2c4dfb18534b4d2"
+      },
+      {
+        "path": "special_tokens_map.json",
+        "bytes": 2194,
+        "sha256": null,
+        "git_blob_sha1": "bf69932dca4b3719b59fdd8f6cc1978109509f6c"
+      },
+      {
+        "path": "tokenizer.json",
+        "bytes": 2480466,
+        "sha256": null,
+        "git_blob_sha1": "1e95340ff836fad1b5932e800fb7b8c5e6d78a74"
+      },
+      {
+        "path": "tokenizer_config.json",
+        "bytes": 282683,
+        "sha256": null,
+        "git_blob_sha1": "d13b786c04765fb1a06492b53587752cd67665ea"
+      },
+      {
+        "path": "vocab.json",
+        "bytes": 835550,
+        "sha256": null,
+        "git_blob_sha1": "d7016e21da8776c8a9d577d0f559600f09a240eb"
+      }
+    ],
+    "bytes": 971388090,
+    "gated": false,
+    "license": "apache-2.0"
+  },
+  "sound_in": {
+    "repository": "laion/clap-htsat-unfused",
+    "revision": "8fa0f1c6d0433df6e97c127f64b2a1d6c0dcda8a",
+    "files": [
+      {
+        "path": "README.md",
+        "bytes": 4454,
+        "sha256": null,
+        "git_blob_sha1": "b866f5bee496710d19b98792fc0f68481b181f2a"
+      },
+      {
+        "path": "config.json",
+        "bytes": 5390,
+        "sha256": null,
+        "git_blob_sha1": "70624c940dc3d35b36bc9de57ee5a958c86e032a"
+      },
+      {
+        "path": "merges.txt",
+        "bytes": 456356,
+        "sha256": null,
+        "git_blob_sha1": "6636bda4a1fd7a63653dffb22683b8162c8de956"
+      },
+      {
+        "path": "preprocessor_config.json",
+        "bytes": 541,
+        "sha256": null,
+        "git_blob_sha1": "e8636819eeb1b19f1e5b6f572eca1a101144062e"
+      },
+      {
+        "path": "pytorch_model.bin",
+        "bytes": 614525833,
+        "sha256": "1cd3c601bc4afe0fa87be3de4c13dd2cfadd249fac1e29acf74a9b296c3219bb",
+        "git_blob_sha1": "787863087e2243832044c13d5df8a25df65b0da8"
+      },
+      {
+        "path": "special_tokens_map.json",
+        "bytes": 280,
+        "sha256": null,
+        "git_blob_sha1": "d5698132694f4f1bcff08fa7d937b1701812598e"
+      },
+      {
+        "path": "tokenizer.json",
+        "bytes": 2108746,
+        "sha256": null,
+        "git_blob_sha1": "99f518e1ee65361b4d772c6f805508dbf30cfd8b"
+      },
+      {
+        "path": "tokenizer_config.json",
+        "bytes": 384,
+        "sha256": null,
+        "git_blob_sha1": "058e2e071e2a76af9dc9a10940053477ce8329d3"
+      },
+      {
+        "path": "vocab.json",
+        "bytes": 798293,
+        "sha256": null,
+        "git_blob_sha1": "4ebe4bb3f3114daf2e4cc349f24873a1175a35d7"
+      }
+    ],
+    "bytes": 617900277,
+    "gated": false,
+    "license": "apache-2.0"
+  },
+  "speech_out": {
+    "repository": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+    "revision": "5d83992436eae1d760afd27aff78a71d676296fc",
+    "files": [
+      {
+        "path": "README.md",
+        "bytes": 3640,
+        "sha256": null,
+        "git_blob_sha1": "50931da8c9b34f7233394b5c3063a47ef3285acf"
+      },
+      {
+        "path": "config.json",
+        "bytes": 4494,
+        "sha256": null,
+        "git_blob_sha1": "4e923f500f5c3eeb78d44072e7049b28817c2e04"
+      },
+      {
+        "path": "generation_config.json",
+        "bytes": 245,
+        "sha256": null,
+        "git_blob_sha1": "1872b16d4535564abf2db5d6debe6cddd82b7f2e"
+      },
+      {
+        "path": "merges.txt",
+        "bytes": 1671839,
+        "sha256": null,
+        "git_blob_sha1": "20024bfe7c83998e9aeaf98a0cd6a2ce6306c2f0"
+      },
+      {
+        "path": "model.safetensors",
+        "bytes": 1829344272,
+        "sha256": "180b3b10eb1c9f1b4db7806d5475bae3071c0243c299d49926bab1da3b6946f6",
+        "git_blob_sha1": "401a365c4572f09f44d48bb336fdbf94cd1e3ad2"
+      },
+      {
+        "path": "preprocessor_config.json",
+        "bytes": 127,
+        "sha256": null,
+        "git_blob_sha1": "0525dd953bb9241912f7147666f0d535165d5d4f"
+      },
+      {
+        "path": "speech_tokenizer/config.json",
+        "bytes": 2336,
+        "sha256": null,
+        "git_blob_sha1": "06cc8dc4c5ec8a1929086b71b98c313020d9268b"
+      },
+      {
+        "path": "speech_tokenizer/configuration.json",
+        "bytes": 76,
+        "sha256": null,
+        "git_blob_sha1": "ab58e2eaf53cd14a1a2a7527d9261ceea93a24cd"
+      },
+      {
+        "path": "speech_tokenizer/model.safetensors",
+        "bytes": 682293092,
+        "sha256": "836b7b357f5ea43e889936a3709af68dfe3751881acefe4ecf0dbd30ba571258",
+        "git_blob_sha1": "026d66bfb5d730dcfd56450c5e9e51b3ef4e0712"
+      },
+      {
+        "path": "speech_tokenizer/preprocessor_config.json",
+        "bytes": 234,
+        "sha256": null,
+        "git_blob_sha1": "ba40914f4f49ab98a8ca545d4892ef7291a39592"
+      },
+      {
+        "path": "tokenizer_config.json",
+        "bytes": 7344,
+        "sha256": null,
+        "git_blob_sha1": "6ff9fd60cc623bb54bbd603cbd418c97a11528d7"
+      },
+      {
+        "path": "vocab.json",
+        "bytes": 2776833,
+        "sha256": null,
+        "git_blob_sha1": "4783fe10ac3adce15ac8f358ef5462739852c569"
+      }
+    ],
+    "bytes": 2516104532,
+    "gated": false,
+    "license": "apache-2.0"
+  },
+  "sound_out": {
+    "repository": "stabilityai/stable-audio-open-1.0",
+    "revision": "f21265c1e2710b3bd2386596943f0007f55f802e",
+    "files": [
+      {
+        "path": "README.md",
+        "bytes": 8342,
+        "sha256": null,
+        "git_blob_sha1": "3d885b931f93cf475e68acc8ab41473b057ef2a5"
+      },
+      {
+        "path": "model_index.json",
+        "bytes": 498,
+        "sha256": null,
+        "git_blob_sha1": "a2e08e9778cc18fdc1c039092f5912abd687d3af"
+      },
+      {
+        "path": "projection_model/config.json",
+        "bytes": 181,
+        "sha256": null,
+        "git_blob_sha1": "1cbca1a6bfc87ee7ba4b427ae1a6567dbb7578fb"
+      },
+      {
+        "path": "projection_model/diffusion_pytorch_model.safetensors",
+        "bytes": 1586944,
+        "sha256": "032102e2b0e4b9b9e19c648dc476345157b97906752a7b4b7a0133900f340926",
+        "git_blob_sha1": "2c679c320f8da20db55fce301eeb7acdbc64ef28"
+      },
+      {
+        "path": "scheduler/scheduler_config.json",
+        "bytes": 411,
+        "sha256": null,
+        "git_blob_sha1": "0b2751bbf251c66bcb66f985c7f01dcd0611b0d6"
+      },
+      {
+        "path": "transformer/config.json",
+        "bytes": 391,
+        "sha256": null,
+        "git_blob_sha1": "886f818d47bbf280b5c273288b5f50c1d974bc79"
+      },
+      {
+        "path": "transformer/diffusion_pytorch_model.safetensors",
+        "bytes": 4227806200,
+        "sha256": "65ae9715febfeb2dc9f33aa506c2bda69fd2ddf8ebc483fb2df090df4ca506fd",
+        "git_blob_sha1": "a80dd8393ed3fd16450e220459d93426258c4bea"
+      },
+      {
+        "path": "vae/config.json",
+        "bytes": 350,
+        "sha256": null,
+        "git_blob_sha1": "b8419aca11a4ddd9dd4ce3ea26dd59dd563cb189"
+      },
+      {
+        "path": "vae/diffusion_pytorch_model.safetensors",
+        "bytes": 624490240,
+        "sha256": "2131cdb52020b2473707465449d8bdb4f6cca61c93150a947baca02bc58ffd7b",
+        "git_blob_sha1": "b93a744a45f447a225ff779b9c12e0f4e6ce1c36"
+      }
+    ],
+    "bytes": 4853893557,
+    "gated": "auto",
+    "license": "other"
+  },
+  "motion": {
+    "repository": "facebookresearch/vjepa2",
+    "revision": "204698b45b3712590f06245fbfba32d3be539812",
+    "source_archive": {
+      "path": "vendor/vjepa2-source.zip",
+      "bytes": 4721142,
+      "sha256": "7e07b634ce33d743efbc81f2caae5a140170c90299de6266e14f8a0123e8ba76"
+    },
+    "checkpoint": {
+      "url": "https://dl.fbaipublicfiles.com/vjepa2/vjepa2_1_vitb_dist_vitG_384.pt",
+      "bytes": 1664223428,
+      "sha256": "848a77c33cc9e6649ed2119c9bea1e2c569bcdab9539ff3e7c02ccc2959ddf4d"
+    },
+    "license": "MIT, see pinned source LICENSE and upstream model notice"
+  }
+}

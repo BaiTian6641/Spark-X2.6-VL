@@ -1,0 +1,122 @@
+{
+  "schema_version": 1,
+  "campaign_id": "spark-mm-formal-v1",
+  "work_root": "/content/spark-formal",
+  "model_repo": "TassP0lar/SparkX2.6-MM",
+  "model_repo_private": true,
+  "drive_project_folder": "1ELmWWHxpCb3IGM2LZDQV-u7NiLxK12T_",
+  "drive_cap_bytes": 2000000000000,
+  "checkpoint_slots": 2,
+  "checkpoint_minutes": 90,
+  "initial_checkpoint_reservation_bytes": 55000000000,
+  "cache_bytes_per_component": 2300000000,
+  "max_compute_units": 1000,
+  "observed_compute_balance": null,
+  "observed_cu_per_hour": null,
+  "compute_reserve_cu": 25,
+  "balance_refresh_hours": 12,
+  "seed": 39526,
+  "gradient_accumulation": 8,
+  "max_sequence": 2048,
+  "max_answer_tokens": 2048,
+  "learning_rate": 1e-05,
+  "connector_learning_rate": 0.0001,
+  "audio_output_learning_rate": 5e-06,
+  "weight_decay": 0.01,
+  "warmup_ratio": 0.03,
+  "clip_norm": 1.0,
+  "thumbnail_patches": 256,
+  "tile_patches": 576,
+  "detail_tiles": 4,
+  "max_visual_tokens": 768,
+  "video_semantic_frames": 4,
+  "motion_frames": 16,
+  "motion_size": 384,
+  "motion_tokens": 256,
+  "audio_tokens": 384,
+  "generator_prefix_tokens": 32,
+  "split_percent": {
+    "train": 92,
+    "dev": 4,
+    "promotion": 2,
+    "audit": 2
+  },
+  "stages": [
+    {
+      "name": "bridge_alignment",
+      "families": [
+        "image",
+        "video",
+        "audiovisual",
+        "speech_in",
+        "sound_in",
+        "speech_out",
+        "sound_out"
+      ],
+      "epochs": 1,
+      "alignment_only": true,
+      "max_records_per_family": 256
+    },
+    {
+      "name": "vision_full",
+      "families": [
+        "image",
+        "text"
+      ],
+      "epochs": 1
+    },
+    {
+      "name": "temporal_full",
+      "families": [
+        "video",
+        "audiovisual"
+      ],
+      "epochs": 1,
+      "replay_fraction": 0.2
+    },
+    {
+      "name": "audio_understanding_full",
+      "families": [
+        "speech_in",
+        "sound_in"
+      ],
+      "epochs": 1,
+      "replay_fraction": 0.2
+    },
+    {
+      "name": "audio_generation_full",
+      "families": [
+        "speech_out",
+        "sound_out"
+      ],
+      "epochs": 1,
+      "replay_fraction": 0.2
+    },
+    {
+      "name": "joint_full",
+      "families": [
+        "image",
+        "video",
+        "audiovisual",
+        "speech_in",
+        "sound_in",
+        "speech_out",
+        "sound_out",
+        "text"
+      ],
+      "epochs": 1
+    }
+  ],
+  "evaluation_per_family_language": 32,
+  "instructor_budget_usd": 50,
+  "instructor_rounds": 2,
+  "instructor_records_per_round": 32,
+  "instructor_per_request_reservation_usd": 0.5,
+  "instructor_route_eligibility_receipt": null,
+  "instructor_max_completion_tokens": 2048,
+  "rsi_epochs": 2,
+  "promotion_max_relative_loss_regression": 0.03,
+  "allow_unreviewed_final_publication": false,
+  "max_checkpoint_minutes": 180,
+  "max_loss_weight": 5.0
+}

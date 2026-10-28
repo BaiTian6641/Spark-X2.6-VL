@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "name": "uv",
+  "version": "0.13.5",
+  "platform": "linux-x86_64",
+  "url": "https://files.pythonhosted.org/packages/3a/ad/3c2a81d66d1839063662e5b6c0002ec31f8ee987dbc5295747627ca6160a/uv-0.13.5-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+  "bytes": 17211825,
+  "sha256": "fa8d26e08e34c29c0c4e820cf3181757086d547240b4f4d31ff1d8bd810ca946",
+  "wheel_member": "uv-0.13.5.data/scripts/uv",
+  "binary_bytes": 37597160,
+  "binary_sha256": "8a70db72685b7138121bfcda71fa1a00cb709ed9f1fdc4ecf1dd871e8e167e52"
+}

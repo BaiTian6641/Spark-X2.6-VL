@@ -1,0 +1,34 @@
+# Candidate for the observed CPython 3.13 / RTX PRO 6000 Blackwell runtime.
+# Studio's training code ships inside unsloth's wheel. Its full [studio] UI extra
+# currently requires huggingface-hub>=1.32, conflicting with Transformers 4.57.
+# Install the actual training backend with its imported supporting packages;
+# do not bypass dependency resolution or install an incompatible UI extra.
+torch==2.11.0
+torchvision==0.26.0
+torchaudio==2.11.0
+triton==3.6.0
+unsloth==2026.10.9
+unsloth-zoo==2026.10.9
+transformers==4.57.3
+tokenizers==0.22.2
+huggingface-hub==0.36.2
+trl==0.23.1
+accelerate==1.12.0
+peft==0.18.1
+datasets==4.3.0
+bitsandbytes==0.50.2
+xformers==0.0.35
+torchao==0.17.0
+diffusers==0.35.2
+fastapi==0.141.1
+uvicorn==0.52.1
+structlog>=24.1.0
+pyjwt==2.15.1
+jinja2>=3.1
+json5>=0.9.25
+pandas==2.3.3
+matplotlib==3.10.9
+psutil
+pillow
+requests
+pytest

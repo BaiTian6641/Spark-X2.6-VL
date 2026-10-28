@@ -1,0 +1,201 @@
+{
+  "schema_version": 1,
+  "scope": "formal native multimodal runtime source only",
+  "files": [
+    {
+      "path": "colab/__init__.py",
+      "bytes": 73,
+      "sha256": "abb344c69bd6bbe88edf7e74637e010a90e19db9776b738c19c86222350701ab"
+    },
+    {
+      "path": "colab/final/RUN.md",
+      "bytes": 16580,
+      "sha256": "d6f8f0a47555e2ab6ac350ddd2daae5e1f84796fc1a9642868355dc3fba86a58"
+    },
+    {
+      "path": "colab/final/__init__.py",
+      "bytes": 86,
+      "sha256": "e9309b21922f57a6b1c449e7e4a9663f1ddf348c757bd12b9ee7d97b2546f056"
+    },
+    {
+      "path": "colab/final/assets.py",
+      "bytes": 6567,
+      "sha256": "fce8117fd1970be82758f4725addafab5a00a5007364d5986f6b060b0144025a"
+    },
+    {
+      "path": "colab/final/bootstrap.lock.json",
+      "bytes": 543,
+      "sha256": "46d91e6853fddce8c16fad6b23a8efa085f3bc752600506536099ebb384ff898"
+    },
+    {
+      "path": "colab/final/bootstrap.py",
+      "bytes": 10422,
+      "sha256": "a729eeb3898adfbdab4f4824c02b3d87a84ec2c692249fec8d7d1618fad4ff6b"
+    },
+    {
+      "path": "colab/final/campaign.json",
+      "bytes": 2838,
+      "sha256": "c4063bda06a66c036210eda28eb5411f455f3afd54502de9824ad74861eb7ac8"
+    },
+    {
+      "path": "colab/final/common.py",
+      "bytes": 4129,
+      "sha256": "b0124b92117661b14d31f04780064b39c05124ae4da55fac075c679d475ff41e"
+    },
+    {
+      "path": "colab/final/components.lock.json",
+      "bytes": 14560,
+      "sha256": "d5614c35647a0af77d831d5a1580f058813a94cfa718fadfe2baefeca0308979"
+    },
+    {
+      "path": "colab/final/data.py",
+      "bytes": 20116,
+      "sha256": "333115ca0d0989dd5f0e4c7f1bea136ce064935da604793a7d4cb40df0697046"
+    },
+    {
+      "path": "colab/final/dataset.lock.json",
+      "bytes": 714,
+      "sha256": "6347f53b8bb0400476e3e64db0548d20efdf0128774625566a4f82efa4940f87"
+    },
+    {
+      "path": "colab/final/engine.py",
+      "bytes": 34668,
+      "sha256": "8b024cd48e6817c2580def48ff4ac51b867164c1ba376a4e4ab6345e897bd2d8"
+    },
+    {
+      "path": "colab/final/evaluate.py",
+      "bytes": 7444,
+      "sha256": "665d2543e797794c3063fa6c4c0bd94f57865d91c6ca1d5ea302fc888e929160"
+    },
+    {
+      "path": "colab/final/inference.py",
+      "bytes": 1027,
+      "sha256": "9d9e8d5b83fe2e5aedf4f12efb20e4f3e6c9254389c75a900e1556d916dfa66f"
+    },
+    {
+      "path": "colab/final/model.py",
+      "bytes": 21246,
+      "sha256": "7925dcff11208b84491a90d5de6be76fe291ea370a573da99d3b2602bb6d3690"
+    },
+    {
+      "path": "colab/final/outputs.py",
+      "bytes": 10969,
+      "sha256": "ecf57413851a81872ef28caa70f225dcf2a09ee50b4ad378d949db0d8fa406c3"
+    },
+    {
+      "path": "colab/final/preflight.py",
+      "bytes": 4419,
+      "sha256": "832e807280b7aedce2498c57cdcc8c3a2c6c64057498881753cea4e3a2f947ab"
+    },
+    {
+      "path": "colab/final/publish.py",
+      "bytes": 11537,
+      "sha256": "67d77fcb807d86fea9beff5793565c4c1c714ba586b1a6df42eea93e0bc82265"
+    },
+    {
+      "path": "colab/final/qualify.py",
+      "bytes": 12623,
+      "sha256": "7d55f9c8ad8e06456cdacce76e203275c4942fccc820b843d9012d343b0d2e65"
+    },
+    {
+      "path": "colab/final/requirements-preflight.in",
+      "bytes": 282,
+      "sha256": "5a10ae20923d4a4217cef7321eb7ec2649169f9fdef03454f3e8d3d5de7806ab"
+    },
+    {
+      "path": "colab/final/requirements-preflight.lock",
+      "bytes": 86281,
+      "sha256": "69de609cb0d458ec2f398ffb7433e4e1952e4096a933df3082b8d282d6870275"
+    },
+    {
+      "path": "colab/final/requirements.in",
+      "bytes": 345,
+      "sha256": "1b39c3d27953ec0eba46ea57399ae0b8b0aad69cef2f678eff07d6164108a8c5"
+    },
+    {
+      "path": "colab/final/requirements.lock",
+      "bytes": 337963,
+      "sha256": "5b0c515d49fe885e15b6099a877ba94e8e5d7be2086f8162dc5e82e6afe5ee9a"
+    },
+    {
+      "path": "colab/final/run.py",
+      "bytes": 5871,
+      "sha256": "2287bc9bd3b58b9a52b4d59cdc9a3b132c86374d4f7824c07dfc8601deb24bc1"
+    },
+    {
+      "path": "colab/final/storage.py",
+      "bytes": 8559,
+      "sha256": "e6b5d03bc276b526bbeb61a775b4e662923a97aaf92180c6f483acec55a23903"
+    },
+    {
+      "path": "colab/final/teacher.py",
+      "bytes": 8977,
+      "sha256": "bc8bf52a2b1eb1632adc29e9658a342cbfeaacfac1c0b459e97d859b796c1722"
+    },
+    {
+      "path": "colab/final/vendor/vjepa2-source.zip",
+      "bytes": 4721142,
+      "sha256": "7e07b634ce33d743efbc81f2caae5a140170c90299de6266e14f8a0123e8ba76"
+    },
+    {
+      "path": "colab/formal/HF_FULL_DATASET_HANDOFF.json",
+      "bytes": 6835,
+      "sha256": "55835e361ad410cc4264d2e5468d42b3250c2efdf702be202cbf566d97d92ce8"
+    },
+    {
+      "path": "colab/formal/__init__.py",
+      "bytes": 84,
+      "sha256": "08c28e2ec46ab56e6ac977dbd62f407f3b8e9ce77ea246ac3f8b74a1ce6349e2"
+    },
+    {
+      "path": "colab/formal/local_storage.py",
+      "bytes": 1041,
+      "sha256": "02596558c36d9b9d721fe2c3f35b8b5d4c456751edbcab301bc1af0169d524a2"
+    },
+    {
+      "path": "colab/formal/rolling_cache.py",
+      "bytes": 35518,
+      "sha256": "247d0a6621015ae6c9dcd085140e811590ab8935d5e5d62f70c6b88f419f7c4b"
+    },
+    {
+      "path": "colab/formal/shard_dataset.py",
+      "bytes": 6840,
+      "sha256": "28cb394ad3bc1d50c765f5e2e1d3c4c0b76e376f2d4fe43745586599aeeb6105"
+    },
+    {
+      "path": "colab/preflight.py",
+      "bytes": 10892,
+      "sha256": "9ce5312c9fdc4d4f0ae52cf973b2e298768853de6084b5054eb52102ec1da002"
+    },
+    {
+      "path": "colab/stage1/__init__.py",
+      "bytes": 83,
+      "sha256": "e85be0e2d35293e705cc76a89b5eb8889640557bd5a9c854a787f6fce663cd4a"
+    },
+    {
+      "path": "colab/stage1/common.py",
+      "bytes": 3655,
+      "sha256": "97a4ab55e0f6c60f459bd0ec21ed9136731e3fb3657c06ba208db46480fff008"
+    },
+    {
+      "path": "colab/stage1/drive_checkpoint.py",
+      "bytes": 12730,
+      "sha256": "ebb5517b24f855be14e90c13a77ad2a2d419eb3f19b26411130a850295e5bacc"
+    },
+    {
+      "path": "colab/stage1/requirements.in",
+      "bytes": 849,
+      "sha256": "533febbb8f6a317c11eff49935a6c49dda3d0cb9778254732ee7027abf41d6ab"
+    },
+    {
+      "path": "reports/spark_multimodal/COLAB_CAMPAIGN_PLAN.md",
+      "bytes": 39913,
+      "sha256": "fecc46130377bd1937b0e145ac66becf86c01d6e5c6c56d170bd8aa543881243"
+    },
+    {
+      "path": "reports/spark_multimodal/REFINEMENT_MULTIMODAL_REVIEW_2026-10-27.md",
+      "bytes": 15361,
+      "sha256": "8cb9896718d39628c4f4b966b6cd0034349ce812a7a0bee92a9400a9492558f9"
+    }
+  ]
+}

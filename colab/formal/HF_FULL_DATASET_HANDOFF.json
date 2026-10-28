@@ -1,0 +1,154 @@
+{
+  "schema_version": 1,
+  "publication_status": "published_and_anonymous_access_verified",
+  "repo_id": "TassP0lar/SparkX2.6-MM",
+  "revision": "f472f980a6c95d3e9844f27e6045c8c09b21536a",
+  "components": [
+    {
+      "id": "docci",
+      "prefix": "releases/docci-training-source-v1",
+      "release_bytes": 2783000,
+      "release_sha256": "369f9293b341c75d8c02a6a4afef3bfa13ab312476b7f74a9079da5be76c503d",
+      "source_manifest_sha256": "0bd2e5898bfda9f0fa1fb0d6ba5d5dd2296ba44e6a2753d6e9f652260e6ee249",
+      "source_packets": 8776,
+      "instruction_records": 8776,
+      "tar_bytes": 2104033280,
+      "shards": 2
+    },
+    {
+      "id": "openimages",
+      "prefix": "releases/full-ft-v1/openimages",
+      "release_bytes": 29889888,
+      "release_sha256": "d74c2a9e8e0810f637fa12e274e846835a28d44f057517d504c57820a595130e",
+      "source_manifest_sha256": "3ef7f7d1d99220badd7538f7a7a7b6757df2de7f5163a31e3accdc185b133f84",
+      "source_packets": 100000,
+      "instruction_records": 100000,
+      "tar_bytes": 31644139520,
+      "shards": 30
+    },
+    {
+      "id": "vision-core",
+      "prefix": "releases/full-ft-v1/vision-core",
+      "release_bytes": 2635831,
+      "release_sha256": "adec06ded34a38173fa868cd05de6419d80f04a52f291932e2cf8253a2c4098a",
+      "source_manifest_sha256": "4f8d82f2951d7a1197d023f3e4c5b0316a222ed1d31fc587a6b5168d63c272ff",
+      "source_packets": 7192,
+      "instruction_records": 42215,
+      "tar_bytes": 1181675520,
+      "shards": 2
+    },
+    {
+      "id": "video",
+      "prefix": "releases/full-ft-v1/real-video",
+      "release_bytes": 314566,
+      "release_sha256": "67bb0d422fbd0b52774a72ef4b9181ba814a36e89ddc3168960eddff6a411dd2",
+      "source_manifest_sha256": "c43426558e7741d11eda2c5ec4d1c52baf21d55d34cfa35cd6a693d964d05cba",
+      "source_packets": 919,
+      "instruction_records": 2358,
+      "tar_bytes": 7562475520,
+      "shards": 8
+    },
+    {
+      "id": "av",
+      "prefix": "releases/full-ft-v1/audiovisual",
+      "release_bytes": 1099870,
+      "release_sha256": "040737890f8f63bd4c1c9fbe18aaea479d35ccf4c3f2f3cb7bcb0a26d89dd13b",
+      "source_manifest_sha256": "c1dd38c4b58ad35c94875027a1673b3699f7dba9ee0c639056dded1ded432da0",
+      "source_packets": 2100,
+      "instruction_records": 2100,
+      "tar_bytes": 590305280,
+      "shards": 1
+    },
+    {
+      "id": "speech",
+      "prefix": "releases/full-ft-v1/speech",
+      "release_bytes": 11109262,
+      "release_sha256": "2786e2e94c88cb214b01233424c558a1b38f248ac93015d378304c773dd99fc2",
+      "source_manifest_sha256": "864f81b4a1a6dd02a314a7ac7318a5c9c448946c541d04b2a28ef71e9f1747b2",
+      "source_packets": 32890,
+      "instruction_records": 65780,
+      "tar_bytes": 4737658880,
+      "shards": 5
+    },
+    {
+      "id": "sound",
+      "prefix": "releases/full-ft-v1/sound",
+      "release_bytes": 5097570,
+      "release_sha256": "122b8c85b6504e8380b4ad1b566ae2e0f8a1b81b617daf9228bc6db5941cecd1",
+      "source_manifest_sha256": "12a99a2efd10ae27c43014c3dc0b5558e901c680047013d0cdb0a607fdfc7620",
+      "source_packets": 9911,
+      "instruction_records": 19822,
+      "tar_bytes": 6939392000,
+      "shards": 7
+    },
+    {
+      "id": "music",
+      "prefix": "releases/full-ft-v1/music",
+      "release_bytes": 351838,
+      "release_sha256": "d5156dbb66cfbcef656ba628a5bb5396849c82ee47d539256526957bb477dffe",
+      "source_manifest_sha256": "31836feacbf89e599f6e7292aede5edff60c6a804263f636a59ae0abd1896e3d",
+      "source_packets": 1027,
+      "instruction_records": 4108,
+      "tar_bytes": 730910720,
+      "shards": 1
+    },
+    {
+      "id": "timelapse",
+      "prefix": "releases/full-ft-v1/real-timelapse",
+      "release_bytes": 26790,
+      "release_sha256": "e714e7aec8d7fa2ebd9fd310884842f87131623ea0bc10e95423f33f9911dc4a",
+      "source_manifest_sha256": "aff946ccd1c393c22a71931879884c5ea04e0da0cf54075d67523629c74f0a70",
+      "source_packets": 72,
+      "instruction_records": 360,
+      "tar_bytes": 466401280,
+      "shards": 1
+    },
+    {
+      "id": "ocr",
+      "prefix": "releases/full-ft-v1/ocr",
+      "release_bytes": 3269309,
+      "release_sha256": "286bf6f048cf5f7eda66ebfe290c2c011866d82f7c43ad5a256e449f7aa2473a",
+      "source_manifest_sha256": "b5f7493078e697e509bd02a6c3aa7e5f1c3732adaeaf065cd2af6cac9dca4086",
+      "source_packets": 9671,
+      "instruction_records": 19342,
+      "tar_bytes": 2261350400,
+      "shards": 3
+    }
+  ],
+  "text_prefix": "releases/full-ft-v1/text",
+  "instruction_records": 304861,
+  "instruction_language_counts": {
+    "en": 225055,
+    "zh": 79806
+  },
+  "published_artifact_bytes": 59156985427,
+  "training_ready": false,
+  "instructor_calls": 0,
+  "gpu_training_performed": false,
+  "format_contract": {
+    "grouped_schema": "spark_shared_media_task_variants_v1",
+    "instruction_policy": "Use every task_variants row or a declared sampler; top-level compatibility prompt is not an extra instruction. Preserve per-variant media order, clocks, source groups and roles.",
+    "generation_policy": "Real waveform target.path is an output target; do not condition recognition/generation on target media unintentionally. No codec latents are included.",
+    "source_groups": "Keep recording/work/speaker/book/photo/article/sequence families together; OCR and text share article groups.",
+    "storage": "Bounded active local TAR cache; Drive cold only; preserve44GB local free floor and two measured checkpoint slots. Avoid full LFS clone in230GB Colab.",
+    "preflight_change_required": "Open Images RELEASE29,889,888bytes exceeds old16MiB fixture-preflight bound. Qualify reviewed larger metadata bounds before a paid run."
+  },
+  "remaining_gates": [
+    "CPU full-corpus rolling reader and task-variant/target-role adapter qualification",
+    "Fresh reviewed CUDA/Unsloth Studio runtime release containing all native multimodal branches",
+    "Actual full-model optimizer/decoder gradient, memory and exact fresh-VM recovery checks",
+    "Independent multimodal baseline evaluation and human audio review",
+    "Budgeted instructor/RSI data creation and controlled evaluation after a trained parent exists"
+  ],
+  "remote_verification_receipt": "evidence/hf-full-dataset-remote-verification-2026-10-27.json",
+  "verified_utc": "2026-10-27T21:46:40.262538+00:00",
+  "formal_notebook_handoff": {
+    "notebook": "colab/Spark_Formal_Full_Finetune.ipynb",
+    "runtime": "colab/final",
+    "catalogue_revision": "b8ddb27084b0aec0daf28bf5c67075f4f516eb6a",
+    "cpu_reader_and_role_audit": "passed; evidence/formal-final-real-reader-2026-10-27.json",
+    "all_corpus_context_audit": "passed; evidence/formal-final-context-audit-2026-10-27.json",
+    "training_ready": false,
+    "remaining_runtime_gate": "actual full-model CUDA/Studio profile and fresh-VM recovery; CPU tests are not GPU evidence"
+  }
+}
