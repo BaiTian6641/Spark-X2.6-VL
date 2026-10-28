@@ -1,0 +1,8 @@
+........................................................                 [100%]
+=============================== warnings summary ===============================
+tests/test_final_native.py::test_native_dit_v_prediction_reaches_spark_conditioning
+  /tmp/spark-native-test-env/lib/python3.13/site-packages/diffusers/models/transformers/transformer_2d.py:35: FutureWarning: `Transformer2DModelOutput` is deprecated and will be removed in version 1.0.0. Importing `Transformer2DModelOutput` from `diffusers.models.transformer_2d` is deprecated and this will be removed in a future version. Please use `from diffusers.models.modeling_outputs import Transformer2DModelOutput`, instead.
+    deprecate("Transformer2DModelOutput", "1.0.0", deprecation_message)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+56 passed, 1 warning in 3.45s

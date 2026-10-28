@@ -2,17 +2,17 @@
   "schema_version": 2,
   "notebook": {
     "path": "colab/Spark_Formal_Full_Finetune.ipynb",
-    "bytes": 19679,
-    "sha256": "7613359b8f67a6e7c1abcd0bf4f5cd51c29dfc220512a7a78d31052f3d854f00"
+    "bytes": 19828,
+    "sha256": "bb29870e0a46ef1af5bb8349cc75e50ab278a7e1433b15142db1245248102ebc"
   },
   "source_archive": {
     "path": "releases/spark-formal-runtime.zip",
-    "bytes": 5000398,
-    "sha256": "1d290e5e373e80b27c81b20eb43e97f1880a8c8f7a4d9b81a4d99ae39d2f0fdc",
-    "github_commit": "b2bd280613bf1b82727513265cc5d154e1b7d8bd",
-    "url": "https://raw.githubusercontent.com/BaiTian6641/Spark-X2.6-VL/b2bd280613bf1b82727513265cc5d154e1b7d8bd/releases/spark-formal-runtime.zip"
+    "bytes": 5004242,
+    "sha256": "154a8ba4b2a888bc1b6372a8a551a5c5f40881f8d5ffe0edafba2d0dee71ddfd",
+    "github_commit": "8862d94a88eba2e573993a817cd72b666a1d06ad",
+    "url": "https://raw.githubusercontent.com/BaiTian6641/Spark-X2.6-VL/8862d94a88eba2e573993a817cd72b666a1d06ad/releases/spark-formal-runtime.zip"
   },
-  "source_files": 40,
+  "source_files": 41,
   "training_executed": false,
   "instructor_requests_made": 0
 }
