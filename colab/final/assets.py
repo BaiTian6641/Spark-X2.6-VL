@@ -13,10 +13,10 @@ def verified(path,entry):
         for b in iter(lambda:source.read(8*1024**2),b''): h.update(b)
     return h.hexdigest()==entry['git_blob_sha1']
 
-def fetch(url,path,entry,token=None,reserve=0):
+def fetch(url,path,entry,token=None,reserve=0,verified_existing=False):
     import requests
     path=Path(path); path.parent.mkdir(parents=True,exist_ok=True)
-    if verified(path,entry): return path
+    if verified_existing or verified(path,entry): return path
     disk_guard(path.parent,pending=entry['bytes'],reserve=reserve)
     partial=path.with_name(path.name+'.partial'); start=partial.stat().st_size if partial.exists() else 0
     if start>entry['bytes']: raise ValueError('Oversized partial download')
@@ -80,15 +80,28 @@ def prepare_assets(root,token,config,download_weights=True):
     emit('hf_identity_verified',account=who['name'],token_role=role,publication_write_access_proven=False)
     # Check gated access before allocating a GPU or downloading other weights.
     check_gated_access(lock['sound_out'],token)
-    remaining=sum(v['bytes'] for k,v in lock.items() if k!='motion')+lock['motion']['checkpoint']['bytes']
-    if download_weights: disk_guard(root,pending=remaining,reserve=2*config['initial_checkpoint_reservation_bytes'])
+    checks={};remaining=0
+    for key,spec in lock.items():
+        if key=='motion': continue
+        for f in spec['files']:
+            candidate=root/'assets'/key/f['path'];weight=f['path'].endswith(('.safetensors','.bin'))
+            valid=verified(candidate,f) if download_weights or not weight else False
+            checks[candidate]=valid
+            if download_weights and weight and not valid: remaining+=f['bytes']
+    motion_path=root/'assets/motion.pt';motion_valid=verified(motion_path,lock['motion']['checkpoint']) if download_weights else False
+    checks[motion_path]=motion_valid
+    if download_weights and not motion_valid: remaining+=lock['motion']['checkpoint']['bytes']
+    from .run import directory_bytes
+    allocated=directory_bytes(root/'checkpoints') if (root/'checkpoints').exists() else 0
+    checkpoint_reserve=max(0,2*config['initial_checkpoint_reservation_bytes']-allocated) if download_weights else 0
+    if download_weights: disk_guard(root,pending=remaining,reserve=checkpoint_reserve)
     for key,spec in lock.items():
         if key=='motion': continue
         path=root/'assets'/key; paths[key]=path
         for f in spec['files']:
             is_weight=f['path'].endswith(('.safetensors','.bin'))
             if is_weight and not download_weights: continue
-            fetch(f"https://huggingface.co/{spec['repository']}/resolve/{spec['revision']}/{f['path']}",path/f['path'],f,token,reserve=2*config['initial_checkpoint_reservation_bytes'] if download_weights else 0)
+            fetch(f"https://huggingface.co/{spec['repository']}/resolve/{spec['revision']}/{f['path']}",path/f['path'],f,token,reserve=checkpoint_reserve,verified_existing=checks[path/f['path']])
         emit('component_ready',component=key,revision=spec['revision'],weights=download_weights)
     motion=lock['motion']; archive=HERE/motion['source_archive']['path']
     if sha(archive)!=motion['source_archive']['sha256']: raise ValueError('V-JEPA source archive changed')
@@ -100,8 +113,8 @@ def prepare_assets(root,token,config,download_weights=True):
         z.extractall(source)
         prefix=z.namelist()[0].split('/')[0]
     paths['motion_source']=source/prefix
-    paths['motion']=root/'assets/motion.pt'
-    if download_weights: fetch(motion['checkpoint']['url'],paths['motion'],motion['checkpoint'],reserve=2*config['initial_checkpoint_reservation_bytes'])
+    paths['motion']=motion_path
+    if download_weights: fetch(motion['checkpoint']['url'],paths['motion'],motion['checkpoint'],reserve=checkpoint_reserve,verified_existing=checks[motion_path])
     write(root/'asset-receipt.json',{'component_lock_sha256':sha(HERE/'components.lock.json'),'weights_downloaded':download_weights,'gated_access_checked':True,'paths':{k:str(v) for k,v in paths.items()}})
     return paths
 

@@ -7,7 +7,7 @@ from colab.stage1.common import safe_relative
 from colab.stage1.drive_checkpoint import upload_file,project_usage
 from colab.preflight import download_verified,drive_metadata,validate_drive_id
 
-REQUIRED={'model.safetensors','optimizer.pt','scheduler.pt','rng.pt','STATE.json','config.json','BINDING.json','PARAMETERS.json','CLOSED.json'}
+REQUIRED={'model.safetensors','optimizer.pt','scheduler.pt','rng.pt','STATE.json','config.json','BINDING.json','PARAMETERS.json','CLOSED.json','COMPUTE_BUDGET.json'}
 
 def manifest(directory):
     directory=Path(directory); files=[]
@@ -94,6 +94,9 @@ class ColdStore:
             write(receipt_path(directory),receipt)
         emit('drive_committed',**receipt); return receipt
     def restore(self,receipt,destination):
+        if receipt.get('backend')=='huggingface_artifact':
+            if self.hf is None: raise ValueError('HF durable artifact restore is not configured')
+            return self.hf.restore_artifact(receipt,destination)
         if receipt.get('backend')=='huggingface':
             if self.hf is None: raise ValueError('HF checkpoint restore is not configured')
             return self.hf.restore(receipt,destination)
@@ -125,6 +128,8 @@ class ColdStore:
         src=Path(path); directory=self.root/'durable-ledgers'/(kind+'-'+identity(src.read_bytes().hex())[:16])
         directory.mkdir(parents=True,exist_ok=True); target=directory/src.name
         if not target.exists(): shutil.copy2(src,target)
+        if self.service is None and self.hf is not None:
+            return self.hf.commit_artifact(directory,kind)
         return self.commit(directory,kind=kind)
     def discover(self):
         """List campaign commits; no unauthenticated mutable 'latest' pointer."""
@@ -132,6 +137,7 @@ class ColdStore:
         if self.service is None:
             if self.hf is not None:
                 latest=self.hf.latest()
+                items.extend(self.hf.discover_artifacts())
                 if latest: items.append({**latest,'name':'HF latest verified resumable checkpoint'})
             return items
         token=None

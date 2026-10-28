@@ -31,6 +31,7 @@ class NotebookTests(unittest.TestCase):
         self.assertIn('git_source_sha256', joined)
         self.assertIn('"git", "clone"', joined)
         self.assertIn('"colab.final.run", "direct"', joined)
+        self.assertIn('"upload-checkpoint"', joined)
         self.assertIn('allow_codes=(DIRECT_QUALIFICATION_EXIT, DIRECT_SESSION_EXIT)', joined)
         self.assertIn('"drive_project_folder": None', joined)
         self.assertIn('INSTRUCTOR_MODEL', joined)
@@ -111,6 +112,19 @@ class StorageAndResumeTests(unittest.TestCase):
             with patch('shutil.disk_usage', return_value=types.SimpleNamespace(free=100_000_000_000)):
                 with self.assertRaises(RuntimeError):
                     storage_envelope(root, CONFIG, CONFIG['initial_checkpoint_reservation_bytes'])
+    def test_populated_storage_envelope_charges_only_additional_reservations(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'checkpoints').mkdir(); (root / 'media-cache').mkdir()
+            allocations = [10_000_000_000, 44_000_000_000, 23_000_000_000]
+            with patch('colab.final.run.directory_bytes', side_effect=allocations):
+                with patch('shutil.disk_usage', return_value=types.SimpleNamespace(free=92_000_000_000)):
+                    storage_envelope(root, CONFIG, CONFIG['initial_checkpoint_reservation_bytes'])
+            with patch('colab.final.run.directory_bytes', side_effect=allocations):
+                with patch('shutil.disk_usage', return_value=types.SimpleNamespace(free=91_999_999_999)):
+                    with self.assertRaises(RuntimeError):
+                        storage_envelope(root, CONFIG, CONFIG['initial_checkpoint_reservation_bytes'])
+
 
     def test_public_model_export_excludes_protected_material(self):
         from colab.final.publication import public_artifact

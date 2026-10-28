@@ -20,10 +20,6 @@ _EVALUATION_AGGREGATE_KEYS = {
     'split', 'membership_sha256', 'by_stratum', 'scope',
     'human_audio_review', 'broad_multimodal_capability_passed',
 }
-_JSON_SANITIZE = {
-    'STATE.json', 'config.json', 'INSTRUCTOR_LEDGER.json',
-    'provenance/BASELINE.json', 'provenance/INSTRUCTOR_FORMAT_PROBE.json',
-}
 
 
 def public_value(value):
@@ -57,13 +53,16 @@ def public_artifact(source, destination, kind):
         if not path.is_file():
             continue
         relative = path.relative_to(source).as_posix()
-        if relative in ('INTENT.json', 'COMPUTE_BUDGET.json', 'MODEL_RELEASE.json'):
+        if relative in ('INTENT.json', 'MODEL_RELEASE.json'):
             continue
         if kind == 'model' and (relative == 'RUN.md' or relative.startswith(('evaluation/', 'design/'))):
             continue
         target = destination / relative
         target.parent.mkdir(parents=True, exist_ok=True)
-        if relative in _JSON_SANITIZE:
+        if relative == 'COMPUTE_BUDGET.json':
+            budget = read(path)
+            write(target, {key: budget.get(key, 0.0) for key in ('used_cu', 'active_seconds')})
+        elif path.suffix == '.json':
             write(target, public_value(read(path)))
         else:
             os.link(path, target)

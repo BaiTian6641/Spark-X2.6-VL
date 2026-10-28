@@ -80,3 +80,23 @@ def test_flashattention_tuple_output_backpropagates_through_output_tensor():
     result=(torch.nn.functional.scaled_dot_product_attention(q,q,q),None)
     _check_flash_attention_backward(torch,result,q)
     assert torch.isfinite(q.grad).all() and q.grad.abs().sum()>0
+
+
+@pytest.mark.parametrize('code',[0,3,10])
+def test_direct_exit_code_reaches_notebook(tmp_path,monkeypatch,code):
+    from types import SimpleNamespace
+    import colab.final.run as runner
+    monkeypatch.setattr(runner,'direct',lambda *args:code)
+    args=SimpleNamespace(mode='direct',source_sha='a'*64)
+    assert runner.dispatch(args,{'work_root':str(tmp_path)},{'HF_TOKEN':'test-only-secret'})==code
+
+
+def test_failure_stack_has_locations_without_credentials():
+    from colab.final.run import failure_stack
+    secret='test-only-secret'
+    try:
+        raise ValueError('unsafe '+secret)
+    except ValueError as exc:
+        stack=failure_stack(exc,{'HF_TOKEN':secret})
+    assert stack[-1]['function']=='test_failure_stack_has_locations_without_credentials'
+    assert stack[-1]['line']>0 and secret not in json.dumps(stack)

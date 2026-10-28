@@ -142,7 +142,7 @@ class SparkNative(nn.Module):
         from transformers import ClapModel,ClapAudioModel,ClapAudioConfig
         if pretrained:
             return ClapModel.from_pretrained(path,local_files_only=True,dtype=torch.float32).audio_model.audio_encoder
-        return ClapAudioModel(ClapAudioConfig.from_pretrained(path,local_files_only=True))
+        return ClapAudioModel(ClapAudioConfig.from_pretrained(path,local_files_only=True)).audio_encoder
     @staticmethod
     def load_motion(source,checkpoint):
         sys.path.insert(0,str(source))

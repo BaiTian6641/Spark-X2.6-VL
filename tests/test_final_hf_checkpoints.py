@@ -63,6 +63,7 @@ def snapshot(root,name='step-1',weight=b'weights'):
     directory=root/'checkpoints'/name;directory.mkdir(parents=True)
     for filename in REQUIRED: (directory/filename).write_bytes(weight if filename.endswith(('.pt','.safetensors')) else b'{}')
     write(directory/'BINDING.json',BOUND)
+    write(directory/'COMPUTE_BUDGET.json',{'used_cu':1.25,'active_seconds':60.0,'observed_balance':'private-account','rate':8.9})
     (directory/'reload-assets').mkdir();(directory/'reload-assets/tokenizer.json').write_bytes(b'{"vocab":1}')
     return directory
 
@@ -107,13 +108,13 @@ def test_public_checkpoint_is_sanitized_and_restores(store,monkeypatch):
     write(d/'config.json',{'observed_compute_balance':'private-account','instructor_route_eligibility_receipt':{'private':'evidence'}})
     write(d/'INSTRUCTOR_LEDGER.json',{'requests':[{'status':'accounted','reservation_usd':0.5,'decision':{'priority':3,'training_action':'replay_original','rationale':'protected-rationale'}}]})
     (d/'provenance').mkdir();write(d/'provenance/BASELINE.json',{'by_stratum':{'image:en':{'mean_loss':1.0}},'rows':[{'reference':'protected-answer'}]})
-    write(d/'COMPUTE_BUDGET.json',{'observed_balance':'private-account'})
+    write(d/'COMPUTE_BUDGET.json',{'used_cu':1.25,'active_seconds':60.0,'observed_balance':'private-account','rate':8.9})
     receipt=hf.commit(d)
     assert receipt['private'] is False and hub.private is False
     history=hub.history[receipt['revision']]
     public_text=json.dumps(history,default=lambda value:value.decode(errors='ignore') if isinstance(value,bytes) else value)
     assert 'protected-answer' not in public_text and 'protected-rationale' not in public_text and 'private-account' not in public_text
-    assert 'checkpoint/COMPUTE_BUDGET.json' not in history
+    assert json.loads(history['checkpoint/COMPUTE_BUDGET.json'])=={'used_cu':1.25,'active_seconds':60.0}
     state=json.loads(history['checkpoint/STATE.json'])
     assert state['orchestration']['candidate_order']==['rid-1']
     assert 'rows' not in state['orchestration']['parent_eval']
@@ -130,6 +131,9 @@ def test_public_checkpoint_is_sanitized_and_restores(store,monkeypatch):
     hf.restore(receipt,recovered)
     assert json.loads((recovered/'STATE.json').read_text())['orchestration']['candidate_order']==['rid-1']
     assert 'rows' not in json.loads((recovered/'provenance/BASELINE.json').read_text())
+    from colab.final.common import ComputeBudget
+    budget=ComputeBudget(CONFIG);budget.merge_checkpoint(read(recovered/'COMPUTE_BUDGET.json'))
+    assert budget.state['used_cu']>=1.25 and budget.state['active_seconds']>=60.0
 
 def test_lost_response_reconciles_same_transaction_without_another_commit(store):
     hf,hub=store;hf.ensure_repository();d=snapshot(hf.root)
@@ -152,9 +156,9 @@ def test_large_regular_blob_uses_head_and_stream_hash(store,monkeypatch):
     hf,hub=store;d=snapshot(hf.root)
     payload=b'{\"payload\":\"'+b'x'*(8*1024**2)+b'\"}'
     (d/'PARAMETERS.json').write_bytes(payload)
-    monkeypatch.setattr(hf,'_head_remote',lambda path,revision:SimpleNamespace(etag=hashlib.sha1(payload).hexdigest(),size=len(payload)),raising=False)
+    monkeypatch.setattr(hf,'_head_remote',lambda path,revision,prefix=PREFIX:SimpleNamespace(etag=hashlib.sha1(payload).hexdigest(),size=len(payload)),raising=False)
     streamed=[]
-    def stream_hash(path,revision,expected_bytes):
+    def stream_hash(path,revision,expected_bytes,prefix=PREFIX):
         streamed.append((path,expected_bytes));assert hub.history[revision][PREFIX+path]==payload
         return hashlib.sha256(payload).hexdigest()
     monkeypatch.setattr(hf,'_stream_remote_sha256',stream_hash,raising=False)
@@ -165,7 +169,7 @@ def test_large_regular_blob_uses_head_and_stream_hash(store,monkeypatch):
 def test_missing_tree_lfs_uses_head_sha256_without_large_download(store,monkeypatch):
     hf,hub=store;d=snapshot(hf.root);payload=b'm'*(8*1024**2+1)
     (d/'model.safetensors').write_bytes(payload);hub.missing_lfs='checkpoint/model.safetensors'
-    monkeypatch.setattr(hf,'_head_remote',lambda path,revision:SimpleNamespace(etag=hashlib.sha256(payload).hexdigest(),size=len(payload)),raising=False)
+    monkeypatch.setattr(hf,'_head_remote',lambda path,revision,prefix=PREFIX:SimpleNamespace(etag=hashlib.sha256(payload).hexdigest(),size=len(payload)),raising=False)
     def forbidden_download(*args):raise AssertionError('LFS content must be verified by HEAD, not downloaded')
     monkeypatch.setattr(hf,'_stream_remote_sha256',forbidden_download,raising=False)
     assert hf.commit(d)['verified']
@@ -277,7 +281,9 @@ def test_real_cpu_optimizer_snapshots_retry_then_purge_and_can_save_again(store,
     cold=object.__new__(ColdStore);cold.root=hf.root;cold.binding=BOUND;cold.hf=hf
     cold.small_file=lambda *a,**kw:{'commit_file_id':'test-index','commit_sha256':'d'*64}
     config={**hf.c,'initial_checkpoint_reservation_bytes':64*1024**2}
+    monkeypatch.setattr('colab.final.engine.disk_guard',lambda *a,**kw:None)
     state={'stage':'unit-training','updates':0,'completed_stages':[]}
+    write(hf.root/'compute-budget.json',{'used_cu':0.0,'active_seconds':0.0})
     def update():
         optimizer.zero_grad();model(torch.ones(1,3)).square().mean().backward()
         optimizer.step();scheduler.step();state['updates']+=1
@@ -311,7 +317,6 @@ def test_upload_only_cli_is_cpu_and_refuses_a_concurrent_campaign(store,monkeypa
     monkeypatch.setattr(run,'doctor',forbidden)
     monkeypatch.setattr(run.os,'environ',{})
     write(hf.root/'asset-receipt.json',{'paths':{}})
-    write(hf.root/'PREFLIGHT.json',{'passed':True,'source_archive_sha256':'a'*64})
     path=hf.root/'config.json';write(path,hf.c)
     monkeypatch.setattr(sys,'argv',['run','upload-checkpoint','--config',str(path),'--source-sha','a'*64,'--checkpoint-directory',str(directory)])
     with (hf.root/'.campaign.lock').open('a') as lock:
@@ -321,3 +326,41 @@ def test_upload_only_cli_is_cpu_and_refuses_a_concurrent_campaign(store,monkeypa
     run.main({'HF_TOKEN':'test-only-secret'})
     assert acknowledged(directory,BOUND)
     assert 'checkpoint_upload_recovered' in capsys.readouterr().out
+
+
+def _fetch_hub_bytes(hub,url,path,entry,token):
+    revision,filename=url.split('/resolve/')[1].split('/',1)
+    data=hub.history[revision][filename]
+    assert hashlib.sha256(data).hexdigest()==entry['sha256']
+    path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(data)
+
+
+def test_hf_durable_artifact_roundtrip_discovery_and_lost_response(store,monkeypatch):
+    hf,hub=store;directory=hf.root/'durable-ledgers'/'qualification-profile-test';directory.mkdir(parents=True)
+    hf.ensure_repository()
+    write(directory/'QUALIFICATION.json',{'binding':BOUND,'passed':True,'continuation':{'ids':['image-1']}})
+    hub.lose_response=True
+    with pytest.raises(RuntimeError,match='lost commit'):hf.commit_artifact(directory,'qualification-profile')
+    revision=hub.head;calls=hub.calls
+    receipt=hf.commit_artifact(directory,'qualification-profile')
+    assert receipt['revision']==revision and hub.calls==calls and receipt['verified']
+    found=hf.discover_artifacts()
+    assert len(found)==1 and found[0]['commit']['binding']==BOUND
+    monkeypatch.setattr('colab.final.hf_checkpoints.fetch',lambda url,path,entry,token:_fetch_hub_bytes(hub,url,path,entry,token))
+    monkeypatch.setattr('colab.final.hf_checkpoints.disk_guard',lambda *a,**kw:None)
+    restored=hf.root/'recovered-profile';value=hf.restore_artifact(receipt,restored)
+    assert value['kind']=='qualification-profile'
+    assert read(restored/'QUALIFICATION.json')['continuation']['ids']==['image-1']
+
+
+def test_public_durable_artifact_sanitizes_instructor_rationale(store):
+    hf,hub=store;hf.c['checkpoint_repo_private']=False;hf.c['allow_public_artifacts']=True
+    directory=hf.root/'durable-ledgers'/'instructor-intent-test';directory.mkdir(parents=True)
+    write(directory/'LEDGER.json',{'observed_compute_balance':'private-account','requests':[{'id':'request-1','status':'reserved_ambiguous','decision':{'priority':1,'rationale':'protected-rationale'}}]})
+    receipt=hf.commit_artifact(directory,'instructor-intent')
+    history=hub.history[receipt['revision']]
+    text=json.dumps(history,default=lambda value:value.decode(errors='ignore') if isinstance(value,bytes) else value)
+    assert 'private-account' not in text and 'protected-rationale' not in text
+    payload=json.loads(history['ledger/instructor-intent-test/LEDGER.json'])
+    assert payload['requests'][0]['id']=='request-1' and payload['observed_compute_balance'] is None
+    assert 'rationale' not in payload['requests'][0]['decision']

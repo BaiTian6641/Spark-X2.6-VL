@@ -2,7 +2,14 @@
 from __future__ import annotations
 import argparse,json,os,re,sys,fcntl
 from pathlib import Path
-from .common import HERE,read,write,emit,validate_config
+from .common import HERE,read,write,emit,validate_config,identity
+
+def failure_stack(exc,secrets):
+    import traceback
+    from .launcher import sanitize
+    return [{'file':sanitize(frame.filename,secrets.values()),'line':frame.lineno,'function':frame.name}
+            for frame in traceback.extract_tb(exc.__traceback__)[-16:]]
+
 
 def doctor(root):
     import importlib.metadata,subprocess
@@ -67,12 +74,44 @@ def directory_bytes(root):
     return total
 
 def storage_envelope(root,config,slot_bytes):
-    """Conservative 230-GB envelope, including two slots and the 44-GB floor."""
-    pending=2*slot_bytes+10*config['cache_bytes_per_component']+4_000_000_000+44_000_000_000
-    used=directory_bytes(root); free=__import__('shutil').disk_usage(root).free
-    if used+pending>230_000_000_000 or free<pending:
-        raise RuntimeError(f'230-GB local envelope failed: used={used/1e9:.1f} GB, required={pending/1e9:.1f} GB, free={free/1e9:.1f} GB')
-    emit('local_storage_envelope',used_gb=round(used/1e9,2),reserved_gb=round(pending/1e9,2),checkpoint_slot_gb=round(slot_bytes/1e9,2),capacity_gb=230)
+    """Conservative 230-GB envelope; existing reservations are not charged twice."""
+    root=Path(root);other=directory_bytes(root)
+    checkpoints=directory_bytes(root/'checkpoints') if (root/'checkpoints').exists() else 0
+    cache=directory_bytes(root/'media-cache') if (root/'media-cache').exists() else 0
+    cache_cap=10*config['cache_bytes_per_component'];fixed=4_000_000_000+44_000_000_000
+    additional=max(0,2*slot_bytes-checkpoints)+max(0,cache_cap-cache)+fixed
+    reserved=2*slot_bytes+cache_cap+fixed;used=other+checkpoints+cache
+    free=__import__('shutil').disk_usage(root).free
+    if used+additional>230_000_000_000 or free<additional:
+        raise RuntimeError(f'230-GB local envelope failed: used={used/1e9:.1f} GB, additional={additional/1e9:.1f} GB, free={free/1e9:.1f} GB')
+    emit('local_storage_envelope',used_gb=round(used/1e9,2),reserved_gb=round(reserved/1e9,2),additional_required_gb=round(additional/1e9,2),checkpoint_allocated_gb=round(checkpoints/1e9,2),cache_allocated_gb=round(cache/1e9,2),checkpoint_slot_gb=round(slot_bytes/1e9,2),capacity_gb=230)
+
+def _latest_artifact(items,kind,bound):
+    candidates=[item for item in items if item.get('backend')=='huggingface_artifact'
+                and item.get('kind')==kind and item.get('commit',{}).get('binding')==bound]
+    return max(candidates,key=lambda item:item['created_unix']) if candidates else None
+
+def _restore_artifact(campaign,receipt,filename):
+    destination=campaign.root/'remote-recovery'/(receipt['kind']+'-'+receipt['commit_sha256'][:12])
+    value=campaign.store.restore(receipt,destination)
+    source=destination/filename
+    if not source.is_file(): raise RuntimeError('Durable recovery artifact is missing '+filename)
+    target=campaign.root/filename;__import__('shutil').copy2(source,target)
+    return read(target),value
+
+def _valid_recovery_proof(proof,profile):
+    if not proof: return False
+    state=proof.get('initial_reset_state',{});initial=profile['qualification_initial_receipt']
+    return (proof.get('binding')==profile['binding'] and proof.get('passed') is True
+            and proof.get('fresh_process') is True and proof.get('complete_optimizer_recovery') is True
+            and proof.get('native_updates')==2 and proof.get('initial_reset_complete') is True
+            and proof.get('initial_reset_receipt')==initial
+            and proof.get('initial_reset_state_sha256')==identity(state)
+            and state.get('stage')=='initial' and state.get('updates')==0
+            and state.get('completed_stages')==[] and state.get('rsi_rounds')==[]
+            and state.get('cursor') is None
+            and state.get('last_checkpoint',{}).get('commit_sha256')==initial['commit_sha256'])
+
 
 def direct(config,token,key,source_sha):
     if not key: raise ValueError('OPENCODE_API_KEY is required: the campaign includes two instructor RSI rounds')
@@ -94,22 +133,48 @@ def direct(config,token,key,source_sha):
     emit('direct_data_ready',instructions=report.get('instructions'),original_instructions=report.get('original_instructions'),split_membership_sha256=report.get('split_membership_sha256'))
     storage_envelope(root,config,config['initial_checkpoint_reservation_bytes'])
     campaign=Campaign(config,paths,source_sha,token,key); campaign.budget=early
-    profile_path=root/'QUALIFICATION.json'
+    profile_path=root/'QUALIFICATION.json';proof_path=root/'FULL_RECOVERY_PROOF.json';state_path=root/'CAMPAIGN.json'
+    items=[];latest=None
+    if not profile_path.exists() or not proof_path.exists() or not state_path.exists():
+        items=campaign.store.discover()
+        latest=next((item for item in items if item.get('backend')=='huggingface' and item.get('kind')=='checkpoint'),None)
     if not profile_path.exists():
-        profile=qualify(campaign)
-        storage_envelope(root,config,__import__('math').ceil(profile['complete_checkpoint_bytes']*1.10))
-        write(root/'compute-budget.json',early.state)
-        emit('direct_qualification_complete',projected_hours=profile['projected_hours'],next_process='checkpoint recovery',exit_code=DIRECT_QUALIFICATION_EXIT)
-        return DIRECT_QUALIFICATION_EXIT
+        receipt=_latest_artifact(items,'qualification-profile',campaign.bound)
+        if receipt:
+            profile,_=_restore_artifact(campaign,receipt,'QUALIFICATION.json')
+            write(root/'QUALIFICATION_RECEIPT.json',receipt)
+            emit('direct_profile_restored',revision=receipt['revision'])
+        elif latest:
+            raise RuntimeError('A remote checkpoint exists without a bound qualification profile; refusing to restart qualification over trained history')
+        else:
+            profile=qualify(campaign)
+            storage_envelope(root,config,__import__('math').ceil(profile['complete_checkpoint_bytes']*1.10))
+            write(root/'compute-budget.json',early.state)
+            emit('direct_qualification_complete',projected_hours=profile['projected_hours'],next_process='checkpoint recovery',exit_code=DIRECT_QUALIFICATION_EXIT)
+            return DIRECT_QUALIFICATION_EXIT
     profile=read(profile_path)
     if not profile.get('passed') or profile.get('binding')!=campaign.bound:
         raise RuntimeError('Qualification belongs to a different source/data/policy; run a new campaign identity')
     storage_envelope(root,config,__import__('math').ceil(profile['complete_checkpoint_bytes']*1.10))
-    if not (root/'FULL_RECOVERY_PROOF.json').exists():
-        result=recovery_check(campaign,profile); emit('direct_recovery_complete',**result)
-    state=read(root/'CAMPAIGN.json') if (root/'CAMPAIGN.json').exists() else {}
-    selected=state.get('last_checkpoint') or profile['qualification_initial_receipt']
-    optimizer,scheduler,_=campaign.restore(selected); del optimizer,scheduler
+    proof=read(proof_path) if proof_path.exists() else None
+    if not _valid_recovery_proof(proof,profile):
+        receipt=_latest_artifact(items,'full-recovery-proof',campaign.bound)
+        if receipt:
+            proof,_=_restore_artifact(campaign,receipt,'FULL_RECOVERY_PROOF.json')
+            write(root/'FULL_RECOVERY_RECEIPT.json',receipt)
+            emit('direct_recovery_proof_restored',revision=receipt['revision'])
+    if not _valid_recovery_proof(proof,profile):
+        result=recovery_check(campaign,profile);emit('direct_recovery_complete',**result)
+        proof=read(proof_path)
+    if not _valid_recovery_proof(proof,profile):
+        raise RuntimeError('Recovery proof does not include a verified initial-lineage reset')
+    state=read(state_path) if state_path.exists() else {}
+    selected=state.get('last_checkpoint');complete_hash=profile['qualification_complete_receipt']['commit_sha256']
+    if selected and selected.get('commit_sha256')==complete_hash:
+        selected=profile['qualification_initial_receipt']
+    if not selected:
+        selected=(profile['qualification_initial_receipt'] if latest and latest['commit_sha256']==complete_hash else latest) or profile['qualification_initial_receipt']
+    optimizer,scheduler,_=campaign.restore(selected);del optimizer,scheduler
     emit('direct_campaign_starting',campaign=config['campaign_id'],stages=[s['name'] for s in config['stages']],instructor_rounds=config['instructor_rounds'],max_wall_hours=config['max_wall_hours'],curriculum_will_not_be_shortened=True)
     result=campaign.run_formal(profile)
     write(root/'compute-budget.json',early.state)
@@ -140,11 +205,12 @@ def dispatch(a,config,secrets):
         run(config,token,a.source_sha); return
     if a.mode=='doctor': doctor(root);return
     if a.mode=='direct':
-        direct(config,token,key,a.source_sha); return
+        return direct(config,token,key,a.source_sha)
     from .engine import Campaign
     receipt=read(root/'asset-receipt.json') if (root/'asset-receipt.json').exists() else None
     preflight=read(root/'PREFLIGHT.json') if (root/'PREFLIGHT.json').exists() else {}
-    if not receipt or not preflight.get('passed') or preflight.get('source_archive_sha256')!=a.source_sha:
+    if not receipt: raise RuntimeError('Prepare the bound component assets before checkpoint operations')
+    if a.mode not in ('discover','upload-checkpoint') and (not preflight.get('passed') or preflight.get('source_archive_sha256')!=a.source_sha):
         raise RuntimeError('Run a successful CPU preflight for this source release on this VM before GPU work')
     paths={k:Path(v) for k,v in receipt['paths'].items()}
     if a.mode=='qualify':
@@ -198,5 +264,5 @@ if __name__=='__main__':
         # No traceback containing response bodies, credentials or signed URLs.
         from .launcher import sanitize
         message=sanitize(str(exc),secrets.values())
-        emit('stopped',error_type=type(exc).__name__,reason=message[:1500],training_completion_claimed=False)
+        emit('stopped',error_type=type(exc).__name__,reason=message[:1500],stack=failure_stack(exc,secrets),training_completion_claimed=False)
         raise SystemExit(2)

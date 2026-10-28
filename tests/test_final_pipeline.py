@@ -15,6 +15,52 @@ def test_optimizer_commit_rewinds_prefetched_examples():
     with pytest.raises(ValueError): CommittedCursor(list('bcdea'),saved)
 
 
+
+def test_cursor_dataset_supports_unsloth_probe_and_dataloader_resume():
+    from torch.utils.data import DataLoader
+    from colab.final.data import cursor_dataset
+    cursor=CommittedCursor(list('abcde'));cursor.record_computed(0);cursor.record_computed(1);cursor.commit(2)
+    stream=cursor_dataset(cursor.order,cursor)
+    assert len(stream)==3 and stream[0]=={'rid':'c','_index':2}
+    with pytest.raises(IndexError): stream[3]
+    batches=list(DataLoader(stream,batch_size=2,num_workers=0))
+    assert [batch['rid'] for batch in batches]==[['c','d'],['e']]
+    assert [batch['_index'].tolist() for batch in batches]==[[2,3],[4]]
+
+
+def test_video_decoder_uses_decoded_frame_presentation_clock():
+    import av,io,numpy as np
+    from colab.final.data import decode_video
+    buffer=io.BytesIO()
+    with av.open(buffer,'w',format='mp4') as output:
+        stream=output.add_stream('mpeg4',rate=4);stream.width=32;stream.height=24;stream.pix_fmt='yuv420p'
+        for index in range(8):
+            frame=av.VideoFrame.from_ndarray(np.full((24,32,3),index*30,dtype=np.uint8),format='rgb24')
+            for packet in stream.encode(frame): output.mux(packet)
+        for packet in stream.encode(): output.mux(packet)
+    frames,times=decode_video(buffer.getvalue(),4)
+    assert len(frames)==4 and all(frame.size==(32,24) for frame in frames)
+    assert times==pytest.approx([0.0,0.5,1.25,1.75])
+
+
+def test_media_collator_has_tensor_batch_size_anchor(tmp_path):
+    from accelerate.utils.operations import find_batch_size
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+    from colab.final.engine import MediaCollator
+    row={'_family':'text','language':'en','task':'text_replay','prompt':'Answer','answer':'One'}
+    class Rows:
+        def row(self,rid): return row,{'transport':None}
+    class Reader:
+        @contextmanager
+        def packet(self,value):
+            yield lambda name: (_ for _ in ()).throw(ValueError('Text has no media'))
+    campaign=SimpleNamespace(root=tmp_path,c=CONFIG,_hf_token=None,reader=SimpleNamespace(checkpoint_slot_bytes=1))
+    collator=MediaCollator(campaign);collator.worker=(Rows(),Reader())
+    batch=collator([{'rid':'row','_index':4}])
+    assert find_batch_size(batch)==1 and batch['source_indices'].tolist()==[4]
+    assert batch['examples'][0][0]['_family']=='text'
+
 def test_output_targets_never_condition_recognition_or_generation():
     row={'task':'speech_synthesis','audio':['voice.flac'],'audio_direction':'text_to_audio','media_role':'target','target':{'kind':'waveform','path':'voice.flac'}}
     assert family(row)=='speech_out'; assert conditioning_members(row)==[]
@@ -131,3 +177,155 @@ def test_dataset_format_peeks_and_prefetch_do_not_skip_training_records():
     for item in prefetched[:2]:cursor.record_computed(item['_index'])
     cursor.commit(2);restored=CommittedCursor(cursor.order,cursor.state())
     assert next(cursor_rows(restored.order,restored))=={'rid':'c','_index':2}
+
+
+def test_qualification_requires_each_named_gradient_and_records_writeback():
+    import torch
+    from colab.final.qualify import audit_parameter_coverage
+    class Tiny(torch.nn.Linear):
+        def named_groups(self):
+            for name,p in self.named_parameters(): yield 'spark',name,p
+    model=Tiny(2,1)
+    before={'weight':[0.0],'bias':[0.0]}; after={'weight':[1.0],'bias':[0.0]}
+    with pytest.raises(RuntimeError,match='only zero gradients'):
+        audit_parameter_coverage(model,before,after,{'weight'})
+    changed,writeback=audit_parameter_coverage(model,before,after,{'weight','bias'})
+    assert changed=={'spark':1}
+    assert writeback=={'weight':True,'bias':False}
+
+
+def test_recovery_proof_is_published_only_after_initial_reset(tmp_path,monkeypatch):
+    import torch
+    from contextlib import nullcontext
+    from colab.final.common import write
+    from colab.final.qualify import recovery_check
+    monkeypatch.setattr('colab.final.qualify.require_new_process',lambda profile:{'pid':123})
+    monkeypatch.setattr(torch,'autocast',lambda *args,**kwargs:nullcontext())
+    monkeypatch.setattr(torch.cuda,'empty_cache',lambda:None)
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__(); self.weight=torch.nn.Parameter(torch.zeros(1))
+        def loss(self,row,media): return self.weight.sum(),None
+    initial={'commit_sha256':'a'*64}; complete={'commit_sha256':'b'*64}
+    class Store:
+        def __init__(self): self.uploads=[]
+        def small_file(self,path,kind):
+            self.uploads.append(kind); return {'kind':kind}
+    class FakeCampaign:
+        def __init__(self,fail_initial):
+            self.root=tmp_path; self.c={'clip_norm':1.0}; self.bound={'source':'test'}
+            self.model=Model(); self.optimizer=torch.optim.SGD(self.model.parameters(),lr=0.0)
+            self.scheduler=torch.optim.lr_scheduler.LambdaLR(self.optimizer,lambda step:1.0)
+            self.store=Store(); self.fail_initial=fail_initial; self.calls=[]; self.state={}
+        def media(self,rid): return None,None
+        def restore(self,receipt):
+            self.calls.append(receipt)
+            if receipt==initial and self.fail_initial: raise RuntimeError('simulated initial restore failure')
+            self.state={'stage':'restored','updates':9,'completed_stages':['stale'],'rsi_rounds':[{'round':9}],'cursor':{'stale':True},'last_checkpoint':receipt}
+            return self.optimizer,self.scheduler,{'fresh_vm':False,'receipt':receipt}
+    write(tmp_path/'metadata/corpus.report.json',{'split_membership_sha256':'dataset'})
+    profile={'qualification_initial_receipt':initial,'qualification_complete_receipt':complete,
+             'continuation':{'ids':['one','two'],'losses':[0.0,0.0],
+                             'parameter_samples':{'weight':[0.0]},'tolerance':1e-4}}
+    failed=FakeCampaign(True)
+    with pytest.raises(RuntimeError,match='simulated initial restore failure'):
+        recovery_check(failed,profile)
+    assert failed.calls==[complete,initial]
+    assert not (tmp_path/'FULL_RECOVERY_PROOF.json').exists() and failed.store.uploads==[]
+    campaign=FakeCampaign(False); result=recovery_check(campaign,profile)
+    proof=read(tmp_path/'FULL_RECOVERY_PROOF.json'); reset=read(tmp_path/'CAMPAIGN.json')
+    assert campaign.calls==[complete,initial] and campaign.store.uploads==['full-recovery-proof']
+    assert result['proof']==proof and proof['initial_reset_complete'] is True
+    assert proof['initial_reset_receipt']==initial and proof['initial_restore_proof']['receipt']==initial
+    assert proof['initial_reset_state']==reset and proof['initial_reset_state_sha256']==identity(reset)
+    assert reset['stage']=='initial' and reset['updates']==0 and reset['cursor'] is None
+    assert reset['completed_stages']==reset['rsi_rounds']==[]
+
+
+@pytest.mark.parametrize('phase',['candidate','control'])
+def test_rsi_stop_skips_evaluation_and_phase_completion(tmp_path,phase):
+    from colab.final.engine import Campaign
+    campaign=object.__new__(Campaign); campaign.root=tmp_path; campaign.stop_reason='direct_wall_hours'
+    session={'round':1,'master':{'completed_stages':[],'rsi_rounds':[]},
+             'candidate_order':['a'],'control_order':['b'],'loss_weights':{}}
+    if phase=='control': session.update(candidate_receipt={'commit_sha256':'c'*64},candidate_eval={})
+    campaign.state={'stage':f'rsi-1-{phase}','cursor':{'committed':0},'orchestration':session,
+                    'last_checkpoint':{'commit_sha256':'d'*64}}
+    campaign.sync_instructor_ledger=lambda:None
+    trained=[]; campaign.train_order=lambda stage,order,resume:trained.append((stage['name'],resume))
+    campaign.evaluate=lambda *args,**kwargs:pytest.fail('a stopped RSI phase must not be evaluated')
+    result=campaign.instructed_rsi(1)
+    assert result['stopped'] is True and result['reason']=='direct_wall_hours' and result['stage']==f'rsi-1-{phase}'
+    assert trained==[(f'rsi-1-{phase}',True)]
+    assert phase+'_receipt' not in session and phase+'_eval' not in session
+    assert read(tmp_path/'CAMPAIGN.json')['stopped_reason']=='direct_wall_hours'
+
+
+def test_existing_checkpoint_retry_enforces_measured_reservation(tmp_path,monkeypatch):
+    from types import SimpleNamespace
+    from colab.final import engine
+    from colab.final.common import write
+    class Model:
+        def named_parameters(self): return []
+    model=Model(); bound={'source':'test'}
+    write(tmp_path/'compute-budget.json',{'used_cu':0,'active_seconds':0})
+    directory=tmp_path/'checkpoints/unit-00000000'; directory.mkdir(parents=True)
+    for name in ('model.safetensors','optimizer.pt','scheduler.pt','rng.pt','STATE.json','config.json','CLOSED.json','COMPUTE_BUDGET.json'):
+        (directory/name).write_bytes(b'x')
+    write(directory/'BINDING.json',bound); write(directory/'PARAMETERS.json',{'sample_sha256':engine.sample_hash(model)})
+    monkeypatch.setattr(engine,'acknowledged',lambda *args:False)
+    store=SimpleNamespace(commit=lambda path:pytest.fail('an oversized retry must not be committed'))
+    state={'stage':'unit','updates':0,'qualified_checkpoint_reservation_bytes':1,'checkpoint_bytes':0}
+    with pytest.raises(RuntimeError,match='exceeds its reservation'):
+        engine.checkpoint(model,None,None,state,tmp_path,{'initial_checkpoint_reservation_bytes':1},bound,store)
+    assert directory.exists()
+
+
+def test_checkpoint_requires_persistent_compute_budget(tmp_path):
+    from colab.final.engine import checkpoint
+    state={'stage':'unit','updates':0,'checkpoint_bytes':0}
+    with pytest.raises(RuntimeError,match='Missing compute-budget.json'):
+        checkpoint(object(),None,None,state,tmp_path,{'initial_checkpoint_reservation_bytes':1},{},object())
+    assert not (tmp_path/'checkpoints').exists()
+
+
+def test_runtime_snapshot_includes_flash_attention_requirements(tmp_path):
+    from types import SimpleNamespace
+    from colab.final.engine import copy_reload_assets
+    assets=tmp_path/'assets'; assets.mkdir(); (assets/'tokenizer.json').write_text('{}')
+    copy_reload_assets(SimpleNamespace(paths={'spark':assets}),tmp_path/'snapshot')
+    for suffix in ('in','lock'):
+        assert (tmp_path/'snapshot/runtime/colab/final'/f'requirements-flash-attn.{suffix}').is_file()
+
+
+def test_instructor_ledger_merge_never_rewinds_current_requests():
+    from colab.final.engine import merge_instructor_ledgers
+    accounted={'id':'a','status':'accounted','decision':{'priority':3}}
+    current={'ceiling_usd':10,'requests':[accounted,{'id':'b','status':'reserved_ambiguous'}]}
+    restored={'ceiling_usd':1,'requests':[{'id':'a','status':'reserved_ambiguous'},
+              {'id':'b','status':'accounted','decision':{'priority':2}}, {'id':'c','status':'accounted'}]}
+    merged=merge_instructor_ledgers(current,restored)
+    assert merged['ceiling_usd']==10 and [r['id'] for r in merged['requests']]==['a','b','c']
+    assert merged['requests'][0]==accounted
+    assert merged['requests'][1]['status']=='accounted' and merged['requests'][1]['decision']=={'priority':2}
+    assert current['requests'][1]['status']=='reserved_ambiguous'
+
+
+def test_hf_instructor_sync_uses_embedded_commit_without_drive(tmp_path):
+    from colab.final.common import write
+    from colab.final.engine import Campaign
+    bound={'source':'test'}
+    current={'requests':[{'id':'local','status':'accounted','decision':{'priority':3}}]}
+    restored={'requests':[{'id':'local','status':'reserved_ambiguous'}, {'id':'remote','status':'accounted'}]}
+    class Store:
+        def discover(self):
+            return [{'name':'instructor-receipt-remote','commit_sha256':'f'*64,'kind':'instructor-receipt',
+                     'backend':'huggingface_artifact','commit':{'binding':bound,'created_unix':10}}]
+        def restore(self,receipt,destination):
+            write(destination/'LEDGER.json',restored)
+    campaign=object.__new__(Campaign); campaign.root=tmp_path; campaign.bound=bound; campaign.store=Store()
+    write(tmp_path/'instructor/LEDGER.json',current)
+    campaign.sync_instructor_ledger()
+    merged=read(tmp_path/'instructor/LEDGER.json')
+    assert [entry['id'] for entry in merged['requests']]==['local','remote']
+    assert merged['requests'][0]['status']=='accounted' and merged['requests'][0]['decision']=={'priority':3}

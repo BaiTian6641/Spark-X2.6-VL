@@ -55,10 +55,11 @@ def _run(config,token,source_sha):
     # engine imports no torch until a training/recovery method executes.
     from .storage import ColdStore
     emit('cpu_preflight_stage',stage='drive_cold_storage')
-    store=ColdStore(root,config,binding(config,source_sha),token); drive=store.service.about().get(fields='storageQuota').execute()['storageQuota']
-    emit('cpu_preflight_stage',stage='private_hf_checkpoint_destination')
+    store=ColdStore(root,config,binding(config,source_sha),token)
+    drive=store.service.about().get(fields='storageQuota').execute()['storageQuota'] if store.service is not None else None
+    emit('cpu_preflight_stage',stage='hf_checkpoint_destination')
     head=store.hf.ensure_repository()
-    emit('hf_checkpoint_destination_ready',repo_id=config['checkpoint_repo'],private=True,commit=head,weights_uploaded=False)
+    emit('hf_checkpoint_destination_ready',repo_id=config['checkpoint_repo'],private=bool(config['checkpoint_repo_private']),commit=head,weights_uploaded=False)
     free=shutil.disk_usage(root).free
     report={'schema_version':1,'passed':True,'source_archive_sha256':source_sha,'dataset_split_sha256':data['split_membership_sha256'],'context':audit,'local_free_bytes':free,'drive_quota':drive,'gated_audio_model_access':True,'teacher_api_calls':0,'gpu_training_performed':False,'training_ready':False,'remaining_gates':['whole-model CUDA profile and two real native continuation updates after new-process checkpoint recovery','provider/account eligibility for OpenCode Go dataset review','observed Colab CU balance/rate and complete-curriculum budget fit'],'created_unix':time.time()}
     write(root/'PREFLIGHT.json',report); receipt=store.small_file(root/'PREFLIGHT.json','formal-preflight'); emit('cpu_preflight_complete',receipt=receipt,**{k:v for k,v in report.items() if k not in ('context','drive_quota')})

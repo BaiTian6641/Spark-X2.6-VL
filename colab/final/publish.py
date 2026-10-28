@@ -1,5 +1,5 @@
-"""Private inference-model publication; optimizer stays in the checkpoint repo."""
-import gc,os,shutil
+"""Sanitized inference-model publication; optimizer stays in the checkpoint repo."""
+import gc,os,shutil,hashlib,json
 from pathlib import Path
 from .common import HERE,read,write,sha,emit,identity
 from .storage import manifest
@@ -34,7 +34,7 @@ All configured formal stages completed: {state.get('completed_stages',[])}. Inst
 
 Stable Audio Open 1.0 has separate Stability Community License terms. The composite is not relicensed wholesale under Apache-2.0. Original component cards/notices and V-JEPA source license are retained under `reload-assets`. Training sources have their own licenses; the [dataset card and attribution](https://huggingface.co/datasets/{dataset['repo_id']}/tree/{dataset['media_revision']}) remain authoritative. Internal source-held-out evaluations do not establish public-benchmark independence; pretraining overlap is unknown. Sound labels are weak, music is predominantly classical, AV acting and NASA time-lapse coverage are narrow.
 
-To load after downloading this private repository with your own HF token:
+To load after downloading the configured repository with your own HF token:
 
 ```python
 import sys
@@ -55,7 +55,6 @@ Source release: `{bound['source_archive_sha256']}`. Dataset media revision: `{da
 '''
 
 def export_and_upload(campaign,config):
-    from huggingface_hub import HfApi
     state=campaign.state
     if not state.get('training_complete') or not state.get('final_audit_complete'): raise RuntimeError('Incomplete campaigns cannot be published as the final model')
     if set(s['name'] for s in config['stages'])-set(state['completed_stages']): raise ValueError('Missing full-parameter stage')
@@ -104,12 +103,67 @@ def export_and_upload(campaign,config):
     files=manifest(out); write(out/'MODEL_RELEASE.json',{'schema_version':1,'campaign_id':config['campaign_id'],'binding':campaign.bound,'training_complete':True,**files})
     return upload_closed_export(campaign,config,out)
 
+def _remote_bytes(repo,path,revision,token,limit):
+    """Read a bounded small object at an immutable revision."""
+    import requests
+    from huggingface_hub import hf_hub_url
+    session=requests.Session();session.trust_env=False
+    try:
+        with session.get(hf_hub_url(repo,path,revision=revision),
+                         headers={'Authorization':'Bearer '+token,'Accept-Encoding':'identity'},
+                         stream=True,timeout=(30,120)) as response:
+            if response.status_code!=200: raise RuntimeError(f'Final remote content read failed (HTTP {response.status_code}): '+path)
+            payload=bytearray()
+            for chunk in response.iter_content(65536):
+                if not chunk: continue
+                payload.extend(chunk)
+                if len(payload)>limit: raise ValueError('Remote file exceeds verification bound: '+path)
+            return bytes(payload)
+    except requests.RequestException:
+        raise RuntimeError('Final remote content transport failed: '+path) from None
+    finally: session.close()
+
+
+def _verify_remote_release(api,campaign,config,out,release,revision):
+    """Verify the complete immutable release, downloading only small Git blobs."""
+    repo=config['model_repo']
+    try: previous=json.loads(_remote_bytes(repo,'MODEL_RELEASE.json',revision,campaign._hf_token,2*1024**2))
+    except (UnicodeDecodeError,json.JSONDecodeError): raise RuntimeError('Remote MODEL_RELEASE.json is invalid') from None
+    if previous!=release: raise RuntimeError('Remote MODEL_RELEASE.json differs from the closed export')
+    info=api.model_info(repo,revision=revision,files_metadata=True)
+    remote={f.rfilename:f for f in info.siblings}
+    expected={f['path'] for f in release['files']}
+    if set(remote)-{'.gitattributes'}!=expected|{'MODEL_RELEASE.json'}:
+        raise RuntimeError('Final remote inventory verification failed')
+    model_lfs=False
+    for f in release['files']:
+        path=f['path'];obj=remote[path]
+        if getattr(obj,'size',None)!=f['bytes']:
+            raise RuntimeError('Final remote file size verification failed: '+path)
+        lfs=getattr(obj,'lfs',None);actual=getattr(lfs,'sha256',None) if lfs is not None else None
+        if actual:
+            if actual!=f['sha256']: raise RuntimeError('Final remote LFS SHA256 verification failed: '+path)
+            if path=='model.safetensors': model_lfs=True
+            continue
+        # A regular Git blob has only a Git SHA1 in files_metadata. Hash its
+        # actual bytes, but never fetch an accidentally non-LFS multi-GB weight.
+        if f['bytes']>8*1024**2:
+            raise RuntimeError('Large remote file lacks verifiable LFS SHA256 metadata: '+path)
+        payload=_remote_bytes(repo,path,revision,campaign._hf_token,f['bytes'])
+        if len(payload)!=f['bytes'] or hashlib.sha256(payload).hexdigest()!=f['sha256']:
+            raise RuntimeError('Final remote Git blob SHA256 verification failed: '+path)
+    return {'model_lfs':model_lfs}
+
+
 def upload_closed_export(campaign,config,out):
+    from huggingface_hub import HfApi
     if not config['model_repo_private']:
         out = public_artifact(out, campaign.root/'public-model', 'model')
         write(out/'MODEL_RELEASE.json', {'schema_version':1,'campaign_id':config['campaign_id'],
               'binding':campaign.bound,'training_complete':True,**manifest(out)})
     release=read(out/'MODEL_RELEASE.json')
+    if release.get('campaign_id')!=config['campaign_id'] or release.get('binding')!=campaign.bound:
+        raise ValueError('Closed export belongs to another campaign/source release')
     allowed=[f['path'] for f in release['files']]+['MODEL_RELEASE.json']
     # Verify a genuinely new object graph using only exported configs/weights.
     import torch
@@ -120,6 +174,7 @@ def upload_closed_export(campaign,config,out):
     api=HfApi(token=campaign._hf_token)
     if api.whoami().get('name')!='TassP0lar': raise ValueError('Unexpected HF publishing account')
     exists=api.repo_exists(config['model_repo'],repo_type='model')
+    revision=None;reconciled=False
     if exists:
         info=api.model_info(config['model_repo'])
         if bool(info.private) != bool(config['model_repo_private']):
@@ -128,21 +183,18 @@ def upload_closed_export(campaign,config,out):
         if names and not set(names)<={'.gitattributes'} and 'MODEL_RELEASE.json' not in names: raise RuntimeError('Existing model repository is unrelated; choose a new explicit destination')
         if set(names)-set(allowed)-{'.gitattributes'}: raise RuntimeError('Existing model repository contains unrelated files; use a clean model destination')
         if 'MODEL_RELEASE.json' in names:
-            import requests
-            session=requests.Session();session.trust_env=False
-            try:
-                response=session.get(f'https://huggingface.co/{config["model_repo"]}/resolve/{info.sha}/MODEL_RELEASE.json',headers={'Authorization':'Bearer '+campaign._hf_token},timeout=60)
-                if response.status_code!=200 or len(response.content)>2*1024**2: raise RuntimeError('Could not verify existing model ownership binding')
-                previous=response.json()
-                if previous.get('campaign_id')!=config['campaign_id'] or previous.get('binding')!=campaign.bound: raise RuntimeError('Existing model belongs to another campaign/source release')
-            finally: session.close()
+            previous=json.loads(_remote_bytes(config['model_repo'],'MODEL_RELEASE.json',info.sha,campaign._hf_token,2*1024**2))
+            if previous.get('campaign_id')!=config['campaign_id'] or previous.get('binding')!=campaign.bound: raise RuntimeError('Existing model belongs to another campaign/source release')
+            # A lost upload response is resolved only by exact campaign/source
+            # ownership and the complete immutable manifest, never by repo name.
+            if previous==release:
+                revision=info.sha;reconciled=True
     else: api.create_repo(config['model_repo'],repo_type='model',private=bool(config['model_repo_private']))
-    result=api.upload_folder(repo_id=config['model_repo'],repo_type='model',folder_path=out,allow_patterns=allowed,ignore_patterns=['.cache/**'],commit_message='Publish completed formal native multimodal Spark prototype')
-    info=api.model_info(config['model_repo'],revision=result.oid,files_metadata=True)
-    remote={f.rfilename:f for f in info.siblings}
-    expected=sha(out/'model.safetensors'); obj=remote.get('model.safetensors'); lfs=getattr(obj,'lfs',None)
-    actual=getattr(lfs,'sha256',None) if lfs is not None else None
-    if actual!=expected: raise RuntimeError('Final remote model SHA256 verification failed')
-    receipt={'repo_id':config['model_repo'],'repo_type':'model','private':bool(config['model_repo_private']),'commit':result.oid,'url':f'https://huggingface.co/{config["model_repo"]}/tree/{result.oid}','model_sha256':expected,'model_lfs_sha256_verified':True,'training_complete':True,'broad_capability_passed':False}
+    if revision is None:
+        result=api.upload_folder(repo_id=config['model_repo'],repo_type='model',folder_path=out,allow_patterns=allowed,ignore_patterns=['.cache/**'],commit_message='Publish completed formal native multimodal Spark prototype')
+        revision=result.oid
+    verification=_verify_remote_release(api,campaign,config,out,release,revision)
+    expected=next(f['sha256'] for f in release['files'] if f['path']=='model.safetensors')
+    receipt={'repo_id':config['model_repo'],'repo_type':'model','private':bool(config['model_repo_private']),'commit':revision,'url':f'https://huggingface.co/{config["model_repo"]}/tree/{revision}','model_sha256':expected,'model_lfs_sha256_verified':verification['model_lfs'],'model_content_sha256_verified':True,'remote_inventory_verified':True,'remote_manifest_verified':True,'files_verified':len(release['files']),'already_committed':reconciled,'training_complete':True,'broad_capability_passed':False}
     write(campaign.root/'MODEL_UPLOAD_RECEIPT.json',receipt); campaign.store.small_file(campaign.root/'MODEL_UPLOAD_RECEIPT.json','model-publication'); emit('final_model_uploaded',**receipt)
     return receipt

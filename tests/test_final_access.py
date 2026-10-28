@@ -48,3 +48,43 @@ def test_failed_preflight_invalidates_old_success_even_after_partial_write(tmp_p
     receipt=read(tmp_path/'PREFLIGHT.json')
     assert not receipt['passed'] and receipt['status']=='stopped'
     assert 'HF_TOKEN check' in receipt['reason'] and 'test-secret' not in receipt['reason']
+
+
+def test_repeat_asset_preparation_reserves_only_missing_bytes(tmp_path,monkeypatch):
+    from colab.final import assets
+    from colab.final.common import sha
+    payload=b'test';(tmp_path/'missing').write_bytes(payload);digest=sha(tmp_path/'missing')
+    (tmp_path/'assets/sound_out').mkdir(parents=True);(tmp_path/'assets/sound_out/model.safetensors').write_bytes(payload)
+    (tmp_path/'assets/motion.pt').write_bytes(payload);(tmp_path/'checkpoints').mkdir();(tmp_path/'checkpoints/existing').write_bytes(b'0123456789')
+    real=read('colab/final/components.lock.json')
+    lock={'sound_out':{'repository':'owner/model','revision':'a'*40,'files':[{'path':'model.safetensors','bytes':len(payload),'sha256':digest}]},
+          'motion':{**real['motion'],'checkpoint':{'url':'https://example.invalid/motion.pt','bytes':len(payload),'sha256':digest}}}
+    monkeypatch.setattr(assets,'read',lambda path:lock)
+    class Api:
+        def __init__(self,token): pass
+        def whoami(self): return {'name':'TassP0lar','auth':{'accessToken':{'role':'write'}}}
+    monkeypatch.setattr(hub,'HfApi',Api);monkeypatch.setattr(assets,'check_gated_access',lambda *args:None)
+    guards=[];fetches=[]
+    monkeypatch.setattr(assets,'disk_guard',lambda root,pending=0,reserve=0:guards.append((pending,reserve)))
+    def fetch(url,path,entry,token=None,reserve=0,verified_existing=False):
+        fetches.append((path,reserve,verified_existing));return path
+    monkeypatch.setattr(assets,'fetch',fetch)
+    paths=assets.prepare_assets(tmp_path,'test-secret',{'initial_checkpoint_reservation_bytes':10},download_weights=True)
+    assert guards==[(0,10)] and all(valid for _,_,valid in fetches)
+    assert paths['motion']==tmp_path/'assets/motion.pt'
+
+
+def test_cpu_preflight_allows_no_drive_and_reports_actual_visibility(tmp_path,monkeypatch,capsys):
+    from colab.final import preflight
+    monkeypatch.setattr(preflight,'prepare_assets',lambda *args,**kwargs:{})
+    monkeypatch.setattr(preflight,'prepare_data',lambda *args,**kwargs:{'split_membership_sha256':'s'*64})
+    monkeypatch.setattr(preflight,'context_audit',lambda *args,**kwargs:{})
+    monkeypatch.setattr('colab.final.engine.binding',lambda config,source:'bound')
+    class Store:
+        def __init__(self,*args):
+            self.service=None;self.hf=SimpleNamespace(ensure_repository=lambda:'h'*40)
+        def small_file(self,path,kind): return {'backend':'huggingface_artifact'}
+    monkeypatch.setattr('colab.final.storage.ColdStore',Store)
+    report=preflight._run({'work_root':str(tmp_path),'checkpoint_repo':'TassP0lar/test','checkpoint_repo_private':False},'test-secret','a'*64)
+    assert report['drive_quota'] is None and report['passed']
+    assert '"private": false' in capsys.readouterr().out

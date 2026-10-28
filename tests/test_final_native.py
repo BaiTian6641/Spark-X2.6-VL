@@ -36,6 +36,18 @@ def test_clap_pretrained_loader_uses_audio_model_subtree(monkeypatch):
         audio_model=types.SimpleNamespace(audio_encoder=marker)))
     assert SparkNative.load_sound_in('clap-checkpoint',True) is marker
 
+def test_clap_loader_branches_have_matching_audio_encoder_keys(monkeypatch,tmp_path):
+    from colab.final.model import SparkNative
+    from transformers import ClapAudioConfig,ClapAudioModel,ClapModel
+    config=ClapAudioConfig(hidden_size=8,projection_dim=4,depths=[1],num_attention_heads=[1],
+        num_hidden_layers=1,patch_embeds_hidden_size=8,window_size=2,spec_size=64,mlp_ratio=1.0)
+    config.save_pretrained(tmp_path)
+    monkeypatch.setattr(ClapModel,'from_pretrained',lambda *args,**kwargs: types.SimpleNamespace(
+        audio_model=ClapAudioModel(config)))
+    pretrained=SparkNative.load_sound_in(tmp_path,True)
+    from_config=SparkNative.load_sound_in(tmp_path,False)
+    assert pretrained.state_dict().keys()==from_config.state_dict().keys()
+
 
 def tiny_talker():
     from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSTalkerConfig

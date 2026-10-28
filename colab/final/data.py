@@ -223,6 +223,23 @@ def cursor_rows(order,cursor):
     for index in range(start+offset,len(order),step):
         yield {'rid':order[index],'_index':index}
 
+def cursor_dataset(order,cursor):
+    from torch.utils.data import IterableDataset
+    start=cursor.committed;remaining=len(order)-start
+    class Stream(IterableDataset):
+        # Unsloth's zero-loss probe treats every non-HF iterable as map-style.
+        # These read-only methods satisfy that probe; DataLoader still uses __iter__.
+        def __len__(self): return remaining
+        def __getitem__(self,index):
+            if not isinstance(index,int): raise TypeError('Cursor dataset indices must be integers')
+            if not 0<=index<remaining: raise IndexError(index)
+            absolute=start+index
+            return {'rid':order[absolute],'_index':absolute}
+        def __iter__(self):
+            yield from cursor_rows(order,cursor)
+    return Stream()
+
+
 class MediaReader:
     def __init__(self,root,handoff,config,token=None,reserve=0):
         self.root=Path(root); self.config=config; self.checkpoint_slot_bytes=config['initial_checkpoint_reservation_bytes']; self.caches={}; self.contracts={}
@@ -257,22 +274,13 @@ def decode_audio(payload):
     return wav.T.copy(),int(sr)
 
 def decode_video(payload,count,origin_seconds=None):
-    """Demux timestamps cheaply, then decode only the required frame pass."""
+    """Read decoded presentation timestamps, then decode only selected images."""
     import av, numpy as np
-    pts=[]; complete=True
+    pts=[]
     with av.open(io.BytesIO(payload)) as source:
-        base=source.streams.video[0].time_base
-        for packet in source.demux(video=0):
-            if packet.pts is None or base is None: complete=False; break
-            pts.append(float(packet.pts*base))
-    if not complete:
-        pts=[]
-        with av.open(io.BytesIO(payload)) as source:
-            for frame in source.decode(video=0):
-                if frame.pts is None or frame.time_base is None: raise ValueError('Unknown video PTS')
-                pts.append(float(frame.pts*frame.time_base))
-    else:
-        pts.sort()
+        for frame in source.decode(video=0):
+            if frame.pts is None or frame.time_base is None: raise ValueError('Unknown video PTS')
+            pts.append(float(frame.pts*frame.time_base))
     if not pts or any(b<=a for a,b in zip(pts,pts[1:])): raise ValueError('Unusable presentation clock')
     ids=np.linspace(0,len(pts)-1,count).round().astype(int).tolist(); wanted=set(ids); frames={}
     with av.open(io.BytesIO(payload)) as source:

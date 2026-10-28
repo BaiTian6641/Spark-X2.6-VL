@@ -29,7 +29,7 @@ The replacement `colab/oneshot` WSD schedule, 20-source expansion, 12 GB reserve
 
 Open the notebook on branch `codex/formal-colab`, select the G4 runtime, and click **Run all**. The notebook records the actual Git `HEAD` and hashes every tracked file. Set `REPO_COMMIT` to a full 40-character commit when an immutable launch is required.
 
-If an existing checkpoint repository contains an incompatible trained payload, choose a new empty repository. The runner will not overwrite or rebind that history. The current default is a new sanitized public `TassP0lar/SparkX2.6-MM-checkpoints-g4-v4` repository because the BF16 qualification repair changes the exact source binding.
+If an existing checkpoint repository contains an incompatible trained payload, choose a new empty repository. The runner will not overwrite or rebind that history. The current default is a new sanitized public `TassP0lar/SparkX2.6-MM-checkpoints-g4-v5` repository because the audited full-chain runtime repair changes the exact source binding.
 
 | Exit | Meaning | Action |
 | ---: | --- | --- |
@@ -46,7 +46,7 @@ The cumulative budget is **110 GPU-hours**, including setup, qualification, trai
 - Local active files stay under `/content/spark-formal`.
 - Two measured checkpoint slots, initially 44 GB each, plus a 10% post-qualification margin.
 - Ten bounded 2.3 GB TAR caches; no full dataset clone or second HF payload cache.
-- Full checkpoints go to public sanitized `TassP0lar/SparkX2.6-MM-checkpoints-g4-v4`; HF history is preserved for recovery and RSI parent/control snapshots. Protected evaluation rows and account metadata are excluded.
+- Full checkpoints go to public sanitized `TassP0lar/SparkX2.6-MM-checkpoints-g4-v5`; HF history is preserved for recovery and RSI parent/control snapshots. Protected evaluation rows and account metadata are excluded.
 - Final inference weights go to public `TassP0lar/SparkX2.6-MM-g4-v2` after offline reload and remote hash verification; protected evaluation reports are excluded.
 
 ## Evidence limits

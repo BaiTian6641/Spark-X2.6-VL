@@ -14,6 +14,7 @@ from colab.stage1.common import safe_relative
 PREFIX = 'checkpoint/'
 MARKER = PREFIX + 'COMMITTED.json'
 OWNER = 'CHECKPOINT_REPOSITORY.json'
+LEDGER_PREFIX = 'ledger/'
 
 
 def receipt_path(directory):
@@ -56,17 +57,17 @@ class HFCheckpointStore:
         finally:
             session.close()
 
-    def _head_remote(self,path,revision):
+    def _head_remote(self,path,revision,prefix=PREFIX):
         from huggingface_hub import get_hf_file_metadata,hf_hub_url
-        return get_hf_file_metadata(hf_hub_url(self.repo,PREFIX+path,revision=revision),token=self.token,timeout=30)
+        return get_hf_file_metadata(hf_hub_url(self.repo,prefix+path,revision=revision),token=self.token,timeout=30)
 
-    def _stream_remote_sha256(self,path,revision,expected_bytes):
+    def _stream_remote_sha256(self,path,revision,expected_bytes,prefix=PREFIX):
         import requests
         from huggingface_hub import hf_hub_url
         session=requests.Session();session.trust_env=False
         digest=hashlib.sha256();total=0
         try:
-            with session.get(hf_hub_url(self.repo,PREFIX+path,revision=revision),
+            with session.get(hf_hub_url(self.repo,prefix+path,revision=revision),
                              headers={'Authorization':'Bearer '+self.token,'Accept-Encoding':'identity'},
                              stream=True,timeout=(30,120)) as response:
                 if response.status_code!=200:
@@ -97,7 +98,7 @@ class HFCheckpointStore:
             raise RuntimeError(f'Checkpoint repository visibility must be {"private" if private else "public"}')
         names = set(self.api.list_repo_files(self.repo, repo_type='model', revision=info.sha)) if info.sha else set()
         if OWNER in names:
-            if any(n not in {'.gitattributes', 'README.md', OWNER} and not n.startswith(PREFIX) for n in names):
+            if any(n not in {'.gitattributes', 'README.md', OWNER} and not n.startswith((PREFIX,LEDGER_PREFIX)) for n in names):
                 raise RuntimeError('Unrelated files in checkpoint repository; no overwrite performed')
             previous = json.loads(self._read_remote(OWNER, info.sha))
             if previous != self.owner:
@@ -154,6 +155,32 @@ class HFCheckpointStore:
         if any(f['bytes'] < 0 or not re.fullmatch('[0-9a-f]{64}', f['sha256']) for f in files):
             raise ValueError('Invalid checkpoint file identity')
 
+    def _verify_remote_file(self,item,f,revision,prefix=PREFIX):
+        if item.size!=f['bytes']:
+            raise ValueError('Remote HF checkpoint size differs: '+f['path'])
+        lfs_sha=getattr(item.lfs,'sha256',None) if item.lfs else None
+        if lfs_sha:
+            if lfs_sha!=f['sha256']:
+                raise ValueError('Remote HF checkpoint LFS hash differs: '+f['path'])
+            return
+        if f['bytes']<=8*1024**2:
+            payload=self._read_remote(prefix+f['path'],revision,limit=8*1024**2)
+            if len(payload)!=f['bytes'] or hashlib.sha256(payload).hexdigest()!=f['sha256']:
+                raise ValueError('Remote HF checkpoint Git blob differs: '+f['path'])
+            return
+        metadata=self._head_remote(f['path'],revision,prefix=prefix)
+        etag=(metadata.etag or '').lower()
+        if metadata.size is not None and metadata.size!=f['bytes']:
+            raise ValueError('Remote HF checkpoint HEAD size differs: '+f['path'])
+        if re.fullmatch('[0-9a-f]{64}',etag):
+            if etag!=f['sha256']:
+                raise ValueError('Remote HF checkpoint HEAD LFS hash differs: '+f['path'])
+            return
+        if not re.fullmatch('[0-9a-f]{40}',etag):
+            raise RuntimeError('Large checkpoint file lacks verifiable Hub content metadata: '+f['path'])
+        if self._stream_remote_sha256(f['path'],revision,f['bytes'],prefix=prefix)!=f['sha256']:
+            raise ValueError('Remote HF checkpoint streamed Git blob differs: '+f['path'])
+
     def _verify_remote(self, revision, marker_bytes, directory=None):
         """Verify LFS hashes from tree/HEAD and stream-hash ordinary Git blobs."""
         from huggingface_hub.hf_api import RepoFile
@@ -165,31 +192,7 @@ class HFCheckpointStore:
         if set(remote) != {PREFIX + f['path'] for f in value['files']} | {MARKER}:
             raise ValueError('Remote HF checkpoint inventory differs')
         for f in value['files']:
-            item = remote[PREFIX + f['path']]
-            if item.size != f['bytes']:
-                raise ValueError('Remote HF checkpoint size differs: ' + f['path'])
-            lfs_sha=getattr(item.lfs,'sha256',None) if item.lfs else None
-            if lfs_sha:
-                if lfs_sha!=f['sha256']:
-                    raise ValueError('Remote HF checkpoint LFS hash differs: '+f['path'])
-                continue
-            if f['bytes']<=8*1024**2:
-                payload=self._read_remote(PREFIX+f['path'],revision,limit=8*1024**2)
-                if len(payload)!=f['bytes'] or hashlib.sha256(payload).hexdigest()!=f['sha256']:
-                    raise ValueError('Remote HF checkpoint Git blob differs: '+f['path'])
-                continue
-            metadata=self._head_remote(f['path'],revision)
-            etag=(metadata.etag or '').lower()
-            if metadata.size is not None and metadata.size!=f['bytes']:
-                raise ValueError('Remote HF checkpoint HEAD size differs: '+f['path'])
-            if re.fullmatch('[0-9a-f]{64}',etag):
-                if etag!=f['sha256']:
-                    raise ValueError('Remote HF checkpoint HEAD LFS hash differs: '+f['path'])
-                continue
-            if not re.fullmatch('[0-9a-f]{40}',etag):
-                raise RuntimeError('Large checkpoint file lacks verifiable Hub content metadata: '+f['path'])
-            if self._stream_remote_sha256(f['path'],revision,f['bytes'])!=f['sha256']:
-                raise ValueError('Remote HF checkpoint streamed Git blob differs: '+f['path'])
+            self._verify_remote_file(remote[PREFIX+f['path']],f,revision)
         return value
 
     def _receipt(self, revision, payload, seconds=0):
@@ -200,6 +203,133 @@ class HFCheckpointStore:
                 'total_bytes': value['total_bytes'], 'seconds': seconds,
                 'verified': True, 'binding': self.binding,
                 'url': f'https://huggingface.co/{self.repo}/tree/{revision}/checkpoint'}
+    def _validate_artifact(self,value):
+        if (value.get('status')!='COMMITTED' or not re.fullmatch('[a-z0-9-]{2,64}',value.get('kind',''))
+                or value.get('campaign_id')!=self.c['campaign_id'] or value.get('binding')!=self.binding
+                or not re.fullmatch('[a-zA-Z0-9_.-]{2,128}',value.get('transaction',''))):
+            raise ValueError('HF durable artifact belongs to another campaign/source or is incomplete')
+        files=value['files'];names=[str(safe_relative(f['path'])) for f in files]
+        if not names or len(names)!=len(set(names)) or 'COMMITTED.json' in names:
+            raise ValueError('Incomplete or ambiguous HF durable artifact inventory')
+        if sum(f['bytes'] for f in files)!=value['total_bytes']:
+            raise ValueError('HF durable artifact byte accounting differs')
+        if any(f['bytes']<0 or not re.fullmatch('[0-9a-f]{64}',f['sha256']) for f in files):
+            raise ValueError('Invalid HF durable artifact file identity')
+        return value
+
+    def _artifact_receipt(self,revision,payload,value=None):
+        value=value or json.loads(payload)
+        transaction=value['transaction']
+        return {'backend':'huggingface_artifact','repo_id':self.repo,'repo_type':'model',
+                'private':bool(self.c['checkpoint_repo_private']),'revision':revision,
+                'marker_path':LEDGER_PREFIX+transaction+'/COMMITTED.json',
+                'commit_sha256':hashlib.sha256(payload).hexdigest(),'kind':value['kind'],
+                'name':transaction,'total_bytes':value['total_bytes'],'verified':True,
+                'binding':self.binding,'created_unix':value['created_unix'],
+                'url':f'https://huggingface.co/{self.repo}/tree/{revision}/ledger/{transaction}'}
+
+    def _verify_artifact(self,revision,marker_bytes):
+        from huggingface_hub.hf_api import RepoFile
+        value=json.loads(marker_bytes);self._validate_artifact(value)
+        transaction=value['transaction'];marker=LEDGER_PREFIX+transaction+'/COMMITTED.json'
+        if self._read_remote(marker,revision)!=marker_bytes:
+            raise ValueError('Remote HF durable artifact marker differs')
+        prefix=LEDGER_PREFIX+transaction+'/'
+        remote={f.path:f for f in self.api.list_repo_tree(self.repo,path_in_repo=prefix.rstrip('/'),
+                repo_type='model',revision=revision,recursive=True,expand=True) if isinstance(f,RepoFile)}
+        if set(remote)!={prefix+f['path'] for f in value['files']}|{marker}:
+            raise ValueError('Remote HF durable artifact inventory differs')
+        for f in value['files']:
+            self._verify_remote_file(remote[prefix+f['path']],f,revision,prefix=prefix)
+        return value
+
+    def commit_artifact(self,directory,kind):
+        from huggingface_hub import CommitOperationAdd
+        from .storage import manifest
+        if kind=='checkpoint' or not re.fullmatch('[a-z0-9-]{2,64}',kind):
+            raise ValueError('Invalid durable artifact kind')
+        directory=Path(directory).resolve()
+        if not directory.is_relative_to((self.root/'durable-ledgers').resolve()):
+            raise ValueError('Only campaign-owned durable ledgers may be uploaded')
+        upload_directory=directory if self.c['checkpoint_repo_private'] else public_artifact(directory,self.root/'public-artifacts'/directory.name,'checkpoint')
+        snapshot=manifest(upload_directory)
+        if not snapshot['files']: raise ValueError('Empty durable artifact')
+        head=self.ensure_repository();transaction=directory.name
+        state=self.private/'artifacts'/transaction;state.mkdir(parents=True,exist_ok=True,mode=0o700)
+        intent=state/'INTENT.json'
+        if intent.exists():
+            saved=read(intent)
+            if saved['snapshot']!=snapshot: raise ValueError('Closed HF durable artifact changed during upload')
+        else:
+            marker={'schema_version':1,'status':'COMMITTED','kind':kind,'transaction':transaction,
+                    'campaign_id':self.c['campaign_id'],'binding':self.binding,**snapshot,
+                    'created_unix':time.time(),'runtime_boot_id':Path('/proc/sys/kernel/random/boot_id').read_text().strip()}
+            saved={'snapshot':snapshot,'parent':head,'marker':marker}
+            write(intent,saved);intent.chmod(0o600)
+        payload=canonical(saved['marker'])+b'\n';marker_path=LEDGER_PREFIX+transaction+'/COMMITTED.json'
+        names=set(self.api.list_repo_files(self.repo,repo_type='model',revision=head));previous=state/'RESULT.json'
+        if previous.exists(): revision=read(previous)['revision']
+        elif marker_path in names and self._read_remote(marker_path,head)==payload: revision=head
+        else:
+            if head!=saved['parent']:
+                raise RuntimeError('HF branch changed during durable artifact transaction; reconcile before retrying')
+            prefix=LEDGER_PREFIX+transaction+'/'
+            operations=[CommitOperationAdd(prefix+f['path'],upload_directory/f['path']) for f in snapshot['files']]
+            operations.append(CommitOperationAdd(marker_path,payload))
+            emit('hf_artifact_upload_start',repo_id=self.repo,kind=kind,bytes=snapshot['total_bytes'],files=len(snapshot['files']))
+            result=self.api.create_commit(self.repo,repo_type='model',parent_commit=head,operations=operations,
+                                          commit_message='Commit durable campaign artifact: '+transaction)
+            revision=result.oid
+        write(previous,{'revision':revision})
+        value=self._verify_artifact(revision,payload)
+        receipt=self._artifact_receipt(revision,payload,value)
+        emit('hf_artifact_verified',**receipt)
+        if upload_directory!=directory: shutil.rmtree(upload_directory,ignore_errors=True)
+        return receipt
+
+    def restore_artifact(self,receipt,destination):
+        if (receipt.get('backend')!='huggingface_artifact' or receipt.get('repo_id')!=self.repo
+                or not str(receipt.get('marker_path','')).startswith(LEDGER_PREFIX)
+                or not re.fullmatch('[0-9a-f]{40}',receipt.get('revision',''))):
+            raise ValueError('Use an exact durable artifact receipt for the configured repository')
+        revision=receipt['revision'];marker=receipt['marker_path'];payload=self._read_remote(marker,revision)
+        if hashlib.sha256(payload).hexdigest()!=receipt['commit_sha256']:
+            raise ValueError('HF durable artifact receipt hash differs')
+        value=self._verify_artifact(revision,payload);transaction=value['transaction']
+        if marker!=LEDGER_PREFIX+transaction+'/COMMITTED.json': raise ValueError('HF durable artifact path differs')
+        destination=Path(destination)
+        if not destination.resolve().is_relative_to(self.root.resolve()):
+            raise ValueError('Durable artifact restore escapes the campaign work root')
+        destination.mkdir(parents=True,exist_ok=True)
+        pending=sum(f['bytes'] for f in value['files'] if not (destination/f['path']).exists())
+        disk_guard(self.root,pending=pending)
+        from huggingface_hub import hf_hub_url
+        for f in value['files']:
+            target=destination/f['path']
+            if not target.resolve().is_relative_to(destination.resolve()) or target.is_symlink():
+                raise ValueError('Unsafe durable artifact restore path')
+            fetch(hf_hub_url(self.repo,LEDGER_PREFIX+transaction+'/'+f['path'],revision=revision),target,f,self.token)
+        write(destination.with_name(destination.name+'.hf-artifact-receipt.json'),receipt)
+        return value
+
+    def discover_artifacts(self):
+        from huggingface_hub.errors import EntryNotFoundError
+        from huggingface_hub.hf_api import RepoFile
+        head=self.ensure_repository()
+        try:
+            remote=list(self.api.list_repo_tree(self.repo,path_in_repo=LEDGER_PREFIX.rstrip('/'),repo_type='model',
+                                                revision=head,recursive=True,expand=False))
+        except EntryNotFoundError:
+            return []
+        items=[]
+        for item in remote:
+            if not isinstance(item,RepoFile) or not item.path.endswith('/COMMITTED.json'): continue
+            payload=self._read_remote(item.path,head);value=self._validate_artifact(json.loads(payload))
+            if LEDGER_PREFIX+value['transaction']+'/COMMITTED.json'!=item.path:
+                raise ValueError('HF durable artifact transaction path differs')
+            items.append({**self._artifact_receipt(head,payload,value),'commit':value})
+        return items
+
 
     def commit(self, directory):
         from huggingface_hub import CommitOperationAdd, CommitOperationDelete

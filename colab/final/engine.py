@@ -4,7 +4,7 @@ import contextlib, gc, importlib.metadata, math, os, random, shutil, signal, tim
 from collections import Counter,defaultdict
 from pathlib import Path
 from .common import HERE,canonical,identity,read,write,sha,disk_guard,emit,ComputeBudget
-from .data import Catalogue,CommittedCursor,MediaReader,prepare_media,FAMILIES,cursor_rows
+from .data import Catalogue,CommittedCursor,MediaReader,prepare_media,FAMILIES,cursor_dataset
 from .checkpoint_cache import acknowledged,prune,rebind_assets
 from .hf_checkpoints import receipt_path
 
@@ -64,22 +64,42 @@ def copy_reload_assets(model,destination):
     runtime=destination/'runtime'
     release=HERE.parents[1]
     include=[p for p in (release/'colab').rglob('*.py') if '__pycache__' not in p.parts and (p.parent==HERE or p.name=='__init__.py' or p.relative_to(release).as_posix() in ('colab/preflight.py','colab/stage1/common.py','colab/stage1/drive_checkpoint.py','colab/stage1/requirements.in','colab/formal/rolling_cache.py','colab/formal/shard_dataset.py','colab/formal/local_storage.py','colab/formal/teacher_readiness.py'))]
-    include += [HERE/'components.lock.json',HERE/'dataset.lock.json',HERE/'bootstrap.lock.json',HERE/'requirements.lock',HERE/'requirements-preflight.lock',HERE/'requirements.in',HERE/'requirements-preflight.in',HERE.parent/'stage1/requirements.in',HERE.parent/'formal/HF_FULL_DATASET_HANDOFF.json']
+    include += [HERE/'components.lock.json',HERE/'dataset.lock.json',HERE/'bootstrap.lock.json',HERE/'requirements.lock',HERE/'requirements-preflight.lock',HERE/'requirements.in',HERE/'requirements-preflight.in',HERE/'requirements-flash-attn.in',HERE/'requirements-flash-attn.lock',HERE.parent/'stage1/requirements.in',HERE.parent/'formal/HF_FULL_DATASET_HANDOFF.json']
     for src in include:
         dest=runtime/src.relative_to(release); dest.parent.mkdir(parents=True,exist_ok=True); shutil.copy2(src,dest)
+
+
+def merge_instructor_ledgers(current,restored):
+    """Union request IDs while allowing only intent -> outcome progression."""
+    merged=dict(restored); merged.update(current)
+    requests=[dict(entry) for entry in current.get('requests',[])]
+    positions={entry['id']:i for i,entry in enumerate(requests)}
+    for entry in restored.get('requests',[]):
+        if entry['id'] not in positions:
+            positions[entry['id']]=len(requests); requests.append(dict(entry))
+            continue
+        local=requests[positions[entry['id']]]
+        if local.get('status')=='reserved_ambiguous' and entry.get('status') not in (None,'reserved_ambiguous'):
+            requests[positions[entry['id']]]=dict(entry)
+    merged['requests']=requests
+    return merged
 
 def checkpoint(model,optimizer,scheduler,state,root,config,bound,store):
     import torch
     from safetensors.torch import save_model
     root=Path(root); name=f"{state['stage']}-{state.get('updates',0):08d}"; directory=root/'checkpoints'/name
+    if not (root/'compute-budget.json').is_file(): raise RuntimeError('Missing compute-budget.json; persist campaign compute accounting before checkpointing')
+    estimate=max(state.get('qualified_checkpoint_reservation_bytes',config['initial_checkpoint_reservation_bytes']),int(state.get('checkpoint_bytes',0)))
     if directory.exists():
         names={p.relative_to(directory).as_posix() for p in directory.rglob('*') if p.is_file()}
-        required={'model.safetensors','optimizer.pt','scheduler.pt','rng.pt','STATE.json','config.json','BINDING.json','PARAMETERS.json','CLOSED.json'}
+        required={'model.safetensors','optimizer.pt','scheduler.pt','rng.pt','STATE.json','config.json','BINDING.json','PARAMETERS.json','CLOSED.json','COMPUTE_BUDGET.json'}
         if required<=names:
             if read(directory/'BINDING.json')!=bound or read(directory/'PARAMETERS.json')['sample_sha256']!=sample_hash(model): raise ValueError('Checkpoint name collides with a changed model/source')
             receipt_file=receipt_path(directory)
+            local_bytes=sum(p.stat().st_size for p in directory.rglob('*') if p.is_file())
+            if local_bytes>estimate: raise RuntimeError('Measured checkpoint exceeds its reservation; preserve it and revise the disk profile before further writes')
             result=read(receipt_file) if acknowledged(directory,bound) else store.commit(directory)
-            state.update(last_checkpoint=result,last_checkpoint_local=str(directory),checkpoint_bytes=sum(p.stat().st_size for p in directory.rglob('*') if p.is_file()))
+            state.update(last_checkpoint=result,last_checkpoint_local=str(directory),checkpoint_bytes=local_bytes)
             rebind_assets(model,directory); prune(root,bound,[directory])
             return result
         intent=directory/'INTENT.json'
@@ -88,7 +108,6 @@ def checkpoint(model,optimizer,scheduler,state,root,config,bound,store):
         # be resumed. The current in-memory optimizer state is still authoritative.
         shutil.rmtree(directory)
     # Reserve the second complete slot before writing a new closed snapshot.
-    estimate=max(state.get('qualified_checkpoint_reservation_bytes',config['initial_checkpoint_reservation_bytes']),int(state.get('checkpoint_bytes',0)))
     prune(root,bound,[state.get('last_checkpoint_local')],incoming=directory)
     existing=[p for p in (root/'checkpoints').glob('*') if p.is_dir()]
     disk_guard(root,pending=estimate,reserve=estimate if not existing else 0)
@@ -104,7 +123,7 @@ def checkpoint(model,optimizer,scheduler,state,root,config,bound,store):
         if (root/name).exists():
             dest=directory/'provenance'/name; dest.parent.mkdir(exist_ok=True); shutil.copy2(root/name,dest)
     if (root/'instructor/LEDGER.json').exists(): shutil.copy2(root/'instructor/LEDGER.json',directory/'INSTRUCTOR_LEDGER.json')
-    if (root/'compute-budget.json').exists(): shutil.copy2(root/'compute-budget.json',directory/'COMPUTE_BUDGET.json')
+    shutil.copy2(root/'compute-budget.json',directory/'COMPUTE_BUDGET.json')
     write(directory/'CLOSED.json',{'binding':bound,'parameter_samples_sha256':sample_hash(model),'complete':True})
     local_bytes=sum(p.stat().st_size for p in directory.rglob('*') if p.is_file())
     if local_bytes>estimate: raise RuntimeError('Measured checkpoint exceeds its reservation; preserve it and revise the disk profile before further writes')
@@ -156,6 +175,7 @@ class MediaCollator:
         self.handoff=read(HERE.parent/'formal/HF_FULL_DATASET_HANDOFF.json')
         self.slot=campaign.reader.checkpoint_slot_bytes; self.worker=None
     def __call__(self,rows):
+        import torch
         if self.worker is None:
             catalogue=Catalogue(self.root/'metadata/corpus.sqlite')
             reader=MediaReader(self.root,self.handoff,self.config,self.token,reserve=2*self.config['initial_checkpoint_reservation_bytes'])
@@ -166,7 +186,9 @@ class MediaCollator:
             row,packet=catalogue.row(item['rid'])
             with reader.packet(packet) as get: media=prepare_media(row,get,self.config)
             examples.append((row,media))
-        return {'examples':examples,'source_indices':[item['_index'] for item in rows]}
+        # Accelerate inspects only the first mapping value for batch size.
+        # Keep native PIL/array examples behind a tensor batch-size anchor.
+        return {'source_indices':torch.tensor([item['_index'] for item in rows],dtype=torch.long),'examples':examples}
 
 
 class Campaign:
@@ -213,7 +235,9 @@ class Campaign:
             if p.name not in ('QUALIFICATION.json','FULL_RECOVERY_PROOF.json','BASELINE.json','INSTRUCTOR_FORMAT_PROBE.json'): raise ValueError('Unexpected restored provenance')
             shutil.copy2(p,self.root/p.name)
         if (directory/'INSTRUCTOR_LEDGER.json').exists():
-            p=self.root/'instructor/LEDGER.json'; p.parent.mkdir(exist_ok=True); shutil.copy2(directory/'INSTRUCTOR_LEDGER.json',p)
+            p=self.root/'instructor/LEDGER.json'; p.parent.mkdir(exist_ok=True)
+            current=read(p) if p.exists() else {}
+            write(p,merge_instructor_ledgers(current,read(directory/'INSTRUCTOR_LEDGER.json')))
         if (directory/'COMPUTE_BUDGET.json').exists():
             # Replaying an older RSI parent must not rewind campaign spending.
             self.budget.merge_checkpoint(read(directory/'COMPUTE_BUDGET.json'))
@@ -226,7 +250,6 @@ class Campaign:
     def train_order(self,stage,order,resume=False):
         import torch,unsloth
         import studio.backend.core.training.trainer as backend
-        from torch.utils.data import IterableDataset
         from transformers import TrainerCallback,get_cosine_schedule_with_warmup
         campaign=self; self.model.set_stage(stage.get('alignment_only',False)); self.model.train()
         microbatch=self.c['microbatch_size']; accumulation=self.c['gradient_accumulation']//microbatch
@@ -252,16 +275,14 @@ class Campaign:
         weights=stage.get('fixed_loss_weights') or loss_weights(self.catalogue,order,self.c)
         self.state['loss_weights']=weights
         training_optim=(optimizer,scheduler)
-        class Stream(IterableDataset):
-            def __iter__(self):
-                yield from cursor_rows(order,cursor)
         collate=MediaCollator(self)
         class NativeSFT(backend.SFTTrainer):
             def compute_loss(self,model,inputs,return_outputs=False,num_items_in_batch=None):
                 result=model(examples=inputs['examples']); per=result.get('per_example_loss')
                 if per is None or len(per)!=len(inputs['examples']): raise ValueError('Per-record loss count differs from the source microbatch')
                 weighted=[]
-                for index,(row,_),loss in zip(inputs['source_indices'],inputs['examples'],per):
+                for raw_index,(row,_),loss in zip(inputs['source_indices'],inputs['examples'],per):
+                    index=int(raw_index)
                     cursor.record_computed(index)
                     processed['count']+=1; processed['families'][row['_family']]+=1
                     key=row['_family']+':'+row['language']; bucket=processed['losses'][key]
@@ -302,7 +323,7 @@ class Campaign:
         class FormalStudio(backend.UnslothTrainer):
             def run_formal(self):
                 self.model=campaign.model; self.tokenizer=campaign.model.tokenizer; self.load_in_4bit=False; self.is_vlm=False; self.is_audio=False
-                self.trainer=NativeSFT(model=self.model,args=args,train_dataset=Stream(),data_collator=collate,processing_class=self.tokenizer,optimizers=training_optim,callbacks=[Audit()])
+                self.trainer=NativeSFT(model=self.model,args=args,train_dataset=cursor_dataset(order,cursor),data_collator=collate,processing_class=self.tokenizer,optimizers=training_optim,callbacks=[Audit()])
                 self.trainer.model_accepts_loss_kwargs=False
                 if self.trainer.accelerator.mixed_precision!='bf16' or any(p.dtype!=torch.float32 for p in self.model.parameters()): raise RuntimeError('Studio altered the reviewed FP32-parameter/BF16-compute precision policy')
                 self.is_training=True
@@ -332,15 +353,20 @@ class Campaign:
         from colab.preflight import download_verified
         entries=self.store.discover(); latest=None; folder=self.root/'ledger-reconciliation'; folder.mkdir(exist_ok=True)
         for item in entries:
-            if not any('-'+kind+'-' in item['name'] for kind in ('instructor-intent','instructor-receipt')): continue
-            target=folder/(item['commit_sha256']+'.json')
-            if not target.exists(): download_verified(self.store.service,item['commit_file_id'],target,item['commit_sha256'])
-            commit=read(target)
+            name=item.get('name',''); kinds=('instructor-intent','instructor-receipt')
+            if item.get('kind') not in kinds and not any(name.startswith(kind+'-') or '-'+kind+'-' in name for kind in kinds): continue
+            commit=item.get('commit')
+            if commit is None:
+                target=folder/(item['commit_sha256']+'.json')
+                if not target.exists(): download_verified(self.store.service,item['commit_file_id'],target,item['commit_sha256'])
+                commit=read(target)
             if commit['binding']!=self.bound: continue
             if latest is None or commit['created_unix']>latest[0]: latest=(commit['created_unix'],item)
         if latest:
             destination=folder/('latest-'+latest[1]['commit_sha256'][:12]); self.store.restore(latest[1],destination)
-            p=self.root/'instructor/LEDGER.json'; p.parent.mkdir(exist_ok=True); shutil.copy2(destination/'LEDGER.json',p)
+            p=self.root/'instructor/LEDGER.json'; p.parent.mkdir(exist_ok=True)
+            current=read(p) if p.exists() else {}
+            write(p,merge_instructor_ledgers(current,read(destination/'LEDGER.json')))
     def instructed_rsi(self,round_no):
         import copy,torch
         from .teacher import Instructor,replay_orders
@@ -387,6 +413,12 @@ class Campaign:
                 parent_local=self.state['last_checkpoint_local']
                 self.state=copy.deepcopy(session['master']); self.state['last_checkpoint_local']=parent_local; self.state['orchestration']=session
             self.train_order(stage,session[phase+'_order'],resume=resume)
+            if self.stop_reason:
+                self.state['orchestration']=session
+                self.state.update(training_complete=False,stopped_reason=self.stop_reason)
+                write(self.root/'CAMPAIGN.json',self.state); write(self.root/'RSI_ORCHESTRATION.json',session)
+                return {'stopped':True,'reason':self.stop_reason,'stage':stage['name'],'round':round_no,
+                        'last_checkpoint':self.state.get('last_checkpoint')}
             session[phase+'_receipt']=self.state['last_checkpoint']; session[phase+'_eval']=self.evaluate('promotion',f'rsi-{round_no}-{phase}')
             self.state['orchestration']=session
             write(self.root/'RSI_ORCHESTRATION.json',session); self.store.small_file(self.root/'RSI_ORCHESTRATION.json','rsi-orchestration')
@@ -420,7 +452,9 @@ class Campaign:
         if require_recovery:
             proof=read(self.root/'FULL_RECOVERY_PROOF.json') if (self.root/'FULL_RECOVERY_PROOF.json').exists() else {}
             if (proof.get('binding')!=self.bound or not proof.get('passed') or not proof.get('fresh_process')
-                    or not proof.get('complete_optimizer_recovery') or proof.get('native_updates')!=2):
+                    or not proof.get('complete_optimizer_recovery') or proof.get('native_updates')!=2
+                    or not proof.get('initial_reset_complete') or not proof.get('initial_reset_state_sha256')
+                    or proof.get('initial_reset_receipt')!=profile['qualification_initial_receipt']):
                 raise RuntimeError('Actual new-process checkpoint continuation gate has not passed')
         if self.model is None: raise RuntimeError('Restore the reviewed initial or resumable campaign checkpoint first')
         slot=math.ceil(profile['complete_checkpoint_bytes']*1.10)
@@ -455,7 +489,11 @@ class Campaign:
             self.evaluate('dev',stage['name'],generate=False)
         for round_no in range(1,self.c['instructor_rounds']+1):
             if any(r['round']==round_no for r in self.state.get('rsi_rounds',[])): continue
-            self.instructed_rsi(round_no)
+            result=self.instructed_rsi(round_no)
+            if isinstance(result,dict) and result.get('stopped'):
+                emit('campaign_stopped',reason=self.stop_reason,stage=result['stage'],
+                     curriculum_complete=False,capability_promoted=False)
+                return result
         if len(self.state.get('rsi_rounds',[]))!=self.c['instructor_rounds']: raise RuntimeError('Required instructed-RSI comparisons are incomplete')
         self.evaluate('audit','final-protected-audit',generate=True)
         self.state.update(training_complete=True,final_audit_complete=True,human_audio_review='pending',capability_claims_verified=False)
