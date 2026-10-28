@@ -1,8 +1,8 @@
 # Spark Colab handoff
 
-## One-shot image/frame full fine-tune
+## Direct full multimodal fine-tune
 
-For a fresh Colab GPU that must not depend on any previous runtime, use [`Spark_Formal_Full_Finetune.ipynb`](Spark_Formal_Full_Finetune.ipynb) and read [`ONESHOT_IMAGE_FRAME.md`](ONESHOT_IMAGE_FRAME.md). It bypasses the all-modality CPU preflight/qualification path, builds a pinned public image/frame corpus, and runs the proven 4.201B-parameter SigLIP2 + Spark full fine-tune.
+For a fresh Colab GPU that must not depend on any previous runtime, use [`Spark_Formal_Full_Finetune.ipynb`](Spark_Formal_Full_Finetune.ipynb) and read [`DIRECT_FULL_MULTIMODAL.md`](DIRECT_FULL_MULTIMODAL.md). It removes CPU preflight, qualification, Drive and prior-VM gates while retaining the full image/video/audio/spatial/temporal curriculum and both instructor RSI rounds. The old gated launcher is archived as [`Spark_Formal_Omni_Gated.ipynb`](Spark_Formal_Omni_Gated.ipynb).
 
 ## Current formal preparation, 27 October 2026
 

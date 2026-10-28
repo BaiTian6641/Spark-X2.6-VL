@@ -25,7 +25,10 @@ def census(model):
     return dict(groups)
 
 def binding(config,source_sha):
-    stable={k:v for k,v in config.items() if k not in ('observed_compute_balance','observed_cu_per_hour','instructor_route_eligibility_receipt')}
+    operational=('observed_compute_balance','observed_cu_per_hour','instructor_route_eligibility_receipt',
+                 'drive_project_folder','direct_wall_hours','direct_projected_hours',
+                 'enforce_compute_budget','instructor_enabled')
+    stable={k:v for k,v in config.items() if k not in operational}
     return {'source_archive_sha256':source_sha,'component_lock_sha256':sha(HERE/'components.lock.json'),'dataset_lock_sha256':sha(HERE/'dataset.lock.json'),'policy_sha256':identity(stable)}
 
 def loss_weights(catalogue,order,config):
@@ -157,6 +160,8 @@ class Campaign:
         self.budget=ComputeBudget(config,read(self.root/'compute-budget.json') if (self.root/'compute-budget.json').exists() else None)
         if config['observed_compute_balance'] and config['observed_cu_per_hour']: self.budget.observe(config['observed_compute_balance'],config['observed_cu_per_hour'])
         self.stop_reason=None; self.last_checkpoint=time.monotonic(); self.effective_checkpoint_minutes=config['checkpoint_minutes']
+        self.direct_deadline=(time.monotonic()+float(config['direct_wall_hours'])*3600
+                              if config.get('direct_wall_hours') else None)
         signal.signal(signal.SIGTERM,lambda *a:setattr(self,'stop_reason','SIGTERM'))
         signal.signal(signal.SIGINT,lambda *a:setattr(self,'stop_reason','operator interrupt'))
     def media(self,rid):
@@ -248,6 +253,8 @@ class Campaign:
                 cursor.commit(processed['count']); processed['count']=0
                 campaign.state.update(updates=offset+state.global_step,cursor=cursor.state(),exposure=dict(processed['families']))
                 campaign.budget_check()
+                if campaign.direct_deadline and time.monotonic()>campaign.direct_deadline:
+                    campaign.stop_reason='direct_wall_hours'
                 if campaign.stop_reason or time.monotonic()-campaign.last_checkpoint>campaign.effective_checkpoint_minutes*60:
                     campaign.save(training_optim[0],training_optim[1],cursor)
                 if campaign.stop_reason: control.should_training_stop=True
@@ -273,7 +280,9 @@ class Campaign:
         bench=FormalStudio()
         write(self.root/'studio-backend.json',{'module':str(Path(backend.__file__).resolve()),'sha256':sha(backend.__file__),'sft_class':backend.SFTTrainer.__module__+'.'+backend.SFTTrainer.__name__,'unsloth':importlib.metadata.version('unsloth'),'integration':'actual headless UnslothTrainer owner and Studio-imported SFTTrainer; no UI submission claim'})
         bench.run_formal(); self.save(optimizer,scheduler,cursor)
-        if cursor.committed!=len(order): raise RuntimeError('Resumable stop: '+str(self.stop_reason or 'incomplete curriculum'))
+        if cursor.committed!=len(order):
+            if self.stop_reason: return
+            raise RuntimeError('Resumable stop: '+str(self.stop_reason or 'incomplete curriculum'))
         self.state['cursor']=None; self.state.setdefault('completed_stages',[]).append(stage['name']); write(self.root/'CAMPAIGN.json',self.state)
         del bench,optimizer,scheduler; training_optim=None; gc.collect(); torch.cuda.empty_cache()
 
@@ -368,18 +377,19 @@ class Campaign:
         self.model.eval(); reviewed=[]
         for fam,lang in [('image','en'),('speech_in','zh')]:
             rowid=self.catalogue.select('train',[fam],lang)[0][0]
-            row,media=self.media(rowid); row['_parent_checkpoint']=self.state['last_checkpoint']['commit_sha256']
+            row,media=self.media(rowid); row['_parent_checkpoint']=self.state.get('last_checkpoint',{}).get('commit_sha256','direct-initial')
             with torch.no_grad(),torch.autocast('cuda',dtype=torch.bfloat16): student=self.model.answer(row,media,32)
             decision=teacher.review(row,media,student,0); reviewed.append({'id':rowid,'family':fam,'language':lang,'decision':decision})
         result={'passed':True,'requests':2,'scope':'Current provider key/model and actual image/audio request schema/accounting only; teacher competence and route eligibility remain separate','reviewed_training_records':reviewed}
         write(self.root/'INSTRUCTOR_FORMAT_PROBE.json',result); self.store.small_file(self.root/'INSTRUCTOR_FORMAT_PROBE.json','instructor-format-probe')
-    def run_formal(self,profile):
+    def run_formal(self,profile,require_recovery=True):
         from .teacher import eligibility
         eligibility(self.c)
-        proof=read(self.root/'FULL_RECOVERY_PROOF.json') if (self.root/'FULL_RECOVERY_PROOF.json').exists() else {}
-        if (proof.get('binding')!=self.bound or not proof.get('passed') or not proof.get('fresh_process')
-                or not proof.get('complete_optimizer_recovery') or proof.get('native_updates')!=2):
-            raise RuntimeError('Actual new-process checkpoint continuation gate has not passed')
+        if require_recovery:
+            proof=read(self.root/'FULL_RECOVERY_PROOF.json') if (self.root/'FULL_RECOVERY_PROOF.json').exists() else {}
+            if (proof.get('binding')!=self.bound or not proof.get('passed') or not proof.get('fresh_process')
+                    or not proof.get('complete_optimizer_recovery') or proof.get('native_updates')!=2):
+                raise RuntimeError('Actual new-process checkpoint continuation gate has not passed')
         if self.model is None: raise RuntimeError('Restore the reviewed initial or resumable campaign checkpoint first')
         slot=math.ceil(profile['complete_checkpoint_bytes']*1.10)
         self.reader.checkpoint_slot_bytes=slot; self.state['qualified_checkpoint_reservation_bytes']=slot
@@ -402,6 +412,13 @@ class Campaign:
             order=self.catalogue.plan(stage,self.c['seed']+i)
             resume=self.state.get('stage')==stage['name'] and self.state.get('cursor') is not None
             self.train_order(stage,order,resume=resume)
+            if self.stop_reason:
+                self.state.update(training_complete=False,stopped_reason=self.stop_reason)
+                write(self.root/'CAMPAIGN.json',self.state)
+                emit('campaign_stopped',reason=self.stop_reason,stage=stage['name'],
+                     curriculum_complete=False,capability_promoted=False)
+                return {'stopped':True,'reason':self.stop_reason,'stage':stage['name'],
+                        'last_checkpoint':self.state.get('last_checkpoint')}
             self.evaluate('dev',stage['name'],generate=False)
         for round_no in range(1,self.c['instructor_rounds']+1):
             if any(r['round']==round_no for r in self.state.get('rsi_rounds',[])): continue

@@ -70,6 +70,7 @@ class ComputeBudget:
         return self.state
     def check(self,needed_seconds=0):
         self.tick(); s=self.state
+        if self.c.get('enforce_compute_budget') is False: return None
         if s['rate'] is None or s['observed_at'] is None: raise RuntimeError('A fresh Colab usage observation is required')
         elapsed=(time.time()-s['observed_at'])/3600
         if elapsed>self.c['balance_refresh_hours']: raise RuntimeError('Refresh the Colab CU balance/rate observation before continuing')

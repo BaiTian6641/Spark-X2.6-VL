@@ -21,8 +21,57 @@ def doctor(root):
     report={'python':sys.version.split()[0],'torch':torch.__version__,'cuda':torch.version.cuda,'gpu':torch.cuda.get_device_name(),'capability':list(torch.cuda.get_device_capability()),'bf16':True,'studio_backend_file':str(Path(backend.__file__).resolve()),'studio_backend_sha256':sha(backend.__file__),'versions':{k:importlib.metadata.version(k) for k in ('unsloth','unsloth-zoo','transformers','trl','accelerate','bitsandbytes','diffusers','qwen-tts')},'actual_cuda_sdpa_backward':True,'full_native_model_qualified':False}
     write(Path(root)/'ENVIRONMENT.json',report); emit('environment_ready',**report); return report
 
+def direct_doctor(root):
+    import importlib.metadata,subprocess
+    import unsloth  # Must precede Transformers/Studio imports.
+    import torch
+    import studio.backend.core.training.trainer as backend
+    from .common import sha
+    if sys.version_info[:2]!=(3,13) or torch.version.hip or not torch.cuda.is_available():
+        raise RuntimeError('Direct mode requires CPython3.13 and a CUDA GPU')
+    if not torch.cuda.is_bf16_supported(): raise RuntimeError('Native BF16 support is required')
+    prop=torch.cuda.get_device_properties(0)
+    if prop.total_memory < 90_000_000_000:
+        raise RuntimeError(f'Full native multimodal training needs at least 90 GB GPU memory; found {prop.total_memory/2**30:.1f} GiB')
+    subprocess.run([sys.executable,'-m','pip','check'],check=True)
+    q=torch.randn(1,4,32,128,device='cuda',dtype=torch.bfloat16,requires_grad=True)
+    result=torch.nn.functional.scaled_dot_product_attention(q,q,q); result.float().square().mean().backward()
+    if not torch.isfinite(q.grad).all() or not q.grad.abs().sum(): raise RuntimeError('CUDA attention gradient check failed')
+    report={'python':sys.version.split()[0],'torch':torch.__version__,'cuda':torch.version.cuda,
+            'gpu':prop.name,'gpu_bytes':prop.total_memory,'capability':list(torch.cuda.get_device_capability()),
+            'bf16':True,'studio_backend_file':str(Path(backend.__file__).resolve()),
+            'studio_backend_sha256':sha(backend.__file__),'direct_mode':True}
+    write(Path(root)/'ENVIRONMENT.json',report); emit('environment_ready',**report); return report
+
+def direct(config,token,key,source_sha):
+    if not key: raise ValueError('OPENCODE_API_KEY is required: direct mode includes the instructor RSI rounds')
+    from .assets import prepare_assets,prepare_data
+    from .engine import Campaign
+    from .model import SparkNative
+    root=Path(config['work_root']); root.mkdir(parents=True,exist_ok=True)
+    direct_doctor(root)
+    emit('direct_assets_start',download_weights=True,full_dataset=True)
+    paths=prepare_assets(root,token,config,download_weights=True)
+    report=prepare_data(root,token,config)
+    emit('direct_data_ready',instructions=report.get('instructions'),original_instructions=report.get('original_instructions'),split_membership_sha256=report.get('split_membership_sha256'))
+    campaign=Campaign(config,paths,source_sha,token,key)
+    campaign.model=SparkNative(paths,config)
+    campaign.model.set_stage(False)
+    profile={'schema_version':1,'passed':True,
+             'scope':'direct one-shot full multimodal; no CPU preflight, qualification profile, Drive or prior-VM recovery',
+             'complete_checkpoint_bytes':max(int(config['initial_checkpoint_reservation_bytes']),66_000_000_000),
+             'qualification_complete_receipt':{'seconds':0},
+             'projected_hours':float(config.get('direct_projected_hours',72)),
+             'direct':True}
+    campaign.state['qualified_checkpoint_reservation_bytes']=profile['complete_checkpoint_bytes']
+    write(root/'DIRECT_PROFILE.json',profile)
+    emit('direct_campaign_starting',campaign=config['campaign_id'],stages=[s['name'] for s in config['stages']],
+         instructor_rounds=config['instructor_rounds'],direct_wall_hours=config.get('direct_wall_hours'),
+         curriculum_will_not_be_shortened=True)
+    return campaign.run_formal(profile,require_recovery=False)
+
 def main(secrets=None):
-    p=argparse.ArgumentParser(description=__doc__); p.add_argument('mode',choices=('cpu','doctor','qualify','discover','upload-checkpoint','recover','train','resume')); p.add_argument('--config',required=True);p.add_argument('--source-sha',required=True); p.add_argument('--profile-receipt');p.add_argument('--resume-receipt');p.add_argument('--checkpoint-directory');a=p.parse_args()
+    p=argparse.ArgumentParser(description=__doc__); p.add_argument('mode',choices=('cpu','doctor','direct','qualify','discover','upload-checkpoint','recover','train','resume')); p.add_argument('--config',required=True);p.add_argument('--source-sha',required=True); p.add_argument('--profile-receipt');p.add_argument('--resume-receipt');p.add_argument('--checkpoint-directory');a=p.parse_args()
     if not re.fullmatch('[0-9a-f]{64}',a.source_sha): raise ValueError('Source archive SHA256 is required')
     config=validate_config(read(a.config)); root=Path(config['work_root']); root.mkdir(parents=True,exist_ok=True)
     # Training, restore, retry-upload and cleanup share the same local slots.
@@ -42,6 +91,8 @@ def dispatch(a,config,secrets):
         from .preflight import run
         run(config,token,a.source_sha); return
     if a.mode=='doctor': doctor(root);return
+    if a.mode=='direct':
+        direct(config,token,key,a.source_sha); return
     from .engine import Campaign
     receipt=read(root/'asset-receipt.json') if (root/'asset-receipt.json').exists() else None
     preflight=read(root/'PREFLIGHT.json') if (root/'PREFLIGHT.json').exists() else {}

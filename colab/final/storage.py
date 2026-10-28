@@ -28,10 +28,13 @@ def drive_service():
 
 class ColdStore:
     def __init__(self,root,config,binding,token=None):
-        self.root=Path(root); self.c=config; self.binding=binding; self.service=drive_service(); self.parent=validate_drive_id(config['drive_project_folder'])
+        self.root=Path(root); self.c=config; self.binding=binding
         self.private=self.root/'private-upload-state'; self.private.mkdir(exist_ok=True,mode=0o700)
-        item=drive_metadata(self.service,self.parent)
-        if item.get('mimeType')!='application/vnd.google-apps.folder' or item.get('trashed'): raise ValueError('Invalid Drive project folder')
+        self.service=None; self.parent=None
+        if config.get('drive_project_folder'):
+            self.service=drive_service(); self.parent=validate_drive_id(config['drive_project_folder'])
+            item=drive_metadata(self.service,self.parent)
+            if item.get('mimeType')!='application/vnd.google-apps.folder' or item.get('trashed'): raise ValueError('Invalid Drive project folder')
         self.hf=None
         if config.get('checkpoint_backend')=='huggingface':
             from .hf_checkpoints import HFCheckpointStore
@@ -39,6 +42,13 @@ class ColdStore:
     def commit(self,directory,kind='checkpoint'):
         directory=Path(directory).resolve()
         if not directory.is_relative_to(self.root.resolve()): raise ValueError('Only campaign-owned local artifacts may be uploaded')
+        if kind!='checkpoint' and self.service is None:
+            receipt={'schema_version':1,'status':'LOCAL','backend':'local','kind':kind,
+                     'directory':str(directory),'created_unix':time.time(),
+                     'runtime_boot_id':Path('/proc/sys/kernel/random/boot_id').read_text().strip()}
+            write(directory.with_name(directory.name+'.local-receipt.json'),receipt)
+            emit('local_artifact_closed',**receipt)
+            return receipt
         if kind=='checkpoint' and self.hf is not None:
             from .hf_checkpoints import receipt_path
             receipt=self.hf.commit(directory)
@@ -87,6 +97,7 @@ class ColdStore:
         if receipt.get('backend')=='huggingface':
             if self.hf is None: raise ValueError('HF checkpoint restore is not configured')
             return self.hf.restore(receipt,destination)
+        if self.service is None: raise ValueError('This artifact receipt is a Drive receipt, but direct mode has no Drive backend')
         destination=Path(destination); destination.mkdir(parents=True,exist_ok=True)
         marker=destination.parent/(destination.name+'.COMMITTED.json')
         if not marker.exists(): download_verified(self.service,receipt['commit_file_id'],marker,receipt['commit_sha256'])
@@ -117,7 +128,13 @@ class ColdStore:
         return self.commit(directory,kind=kind)
     def discover(self):
         """List campaign commits; no unauthenticated mutable 'latest' pointer."""
-        items=[]; token=None
+        items=[]
+        if self.service is None:
+            if self.hf is not None:
+                latest=self.hf.latest()
+                if latest: items.append({**latest,'name':'HF latest verified resumable checkpoint'})
+            return items
+        token=None
         while True:
             page=self.service.files().list(q=f"'{self.parent}' in parents and trashed=false and mimeType='application/vnd.google-apps.folder'",fields='nextPageToken,files(id,name,appProperties)',pageSize=1000,pageToken=token).execute()
             for folder in page.get('files',[]):

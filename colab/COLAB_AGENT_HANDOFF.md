@@ -1,3 +1,7 @@
+# Direct full multimodal one-shot — current
+
+Use [`Spark_Formal_Full_Finetune.ipynb`](https://colab.research.google.com/github/BaiTian6641/Spark-X2.6-VL/blob/codex/formal-colab/colab/Spark_Formal_Full_Finetune.ipynb) and [`DIRECT_FULL_MULTIMODAL.md`](DIRECT_FULL_MULTIMODAL.md). It runs `python -m colab.final.run direct`: full HF dataset and native components, all eight families, both instructor RSI rounds, HF checkpoints. It does not require CPU preflight, qualification/profile, Drive, or a prior-VM recovery proof. The former gated launcher is archived as [`Spark_Formal_Omni_Gated.ipynb`](Spark_Formal_Omni_Gated.ipynb). Historical notes below describe the gated path.
+
 # Current direct-G4 repair — 27 October 2026
 
 Notebook `97c90b4e95bb39e1a330367567d230a6f99a0b7b` pins runtime `4e90988168355a8a2de7025ed3dbf3bae5804cca`, ZIP `7df35726d7a16d8fb032b517aa1231efc9b168433712c57af93ede7bb7381148`. Start directly on G4, reuse one CUDA environment; do not replace a working VM after qualification. New-process full checkpoint continuation retains actual optimizer/RNG checks and records `fresh_vm` honestly. PROFILE_RECEIPT auto-loads after qualification; receipt fields require complete JSON objects, never folder IDs.
