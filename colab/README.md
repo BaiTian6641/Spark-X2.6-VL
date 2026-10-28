@@ -1,8 +1,15 @@
 # Spark Colab handoff
 
-## Direct full multimodal fine-tune
+## Full-Git multimodal fine-tune (`colab/final`)
 
-For a fresh Colab GPU that must not depend on any previous runtime, use [`Spark_Formal_Full_Finetune.ipynb`](Spark_Formal_Full_Finetune.ipynb) and read [`DIRECT_FULL_MULTIMODAL.md`](DIRECT_FULL_MULTIMODAL.md). It removes CPU preflight, qualification, Drive and prior-VM gates while retaining the full image/video/audio/spatial/temporal curriculum and both instructor RSI rounds. The old gated launcher is archived as [`Spark_Formal_Omni_Gated.ipynb`](Spark_Formal_Omni_Gated.ipynb).
+For the corrected one-click G4 campaign, open [`Spark_Formal_Full_Finetune.ipynb`](Spark_Formal_Full_Finetune.ipynb). The notebook clones the **full Git repository** and runs the original staged curriculum; it does not use the replacement `colab/oneshot` WSD schedule or its unreviewed data expansion.
+
+- [`ONESHOT_HANDOFF_AND_NEXT_STEPS.md`](ONESHOT_HANDOFF_AND_NEXT_STEPS.md) — corrected architecture, restored contracts, corpus boundaries, 230 GB / 110-hour enforcement, verification scope, and operator steps.
+- [`DIRECT_FULL_MULTIMODAL.md`](DIRECT_FULL_MULTIMODAL.md) — concise launch, resume, storage, and exit-code guide.
+
+The flow is full Git checkout → locked environment → original corpus → whole-model qualification → fresh-process recovery → six staged curricula → two controlled instructor RSI rounds → protected audit → offline reload → verified private HF upload. No Drive mount or API is used. Complete epochs and matched RSI controls are never silently shortened.
+
+The older gated launcher remains archived as [`Spark_Formal_Omni_Gated.ipynb`](Spark_Formal_Omni_Gated.ipynb).
 
 ## Current formal preparation, 27 October 2026
 

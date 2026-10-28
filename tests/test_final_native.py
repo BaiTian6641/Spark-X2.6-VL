@@ -32,30 +32,54 @@ def test_real_naflex_patch_interface_backward():
 def tiny_talker():
     from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSTalkerConfig
     from qwen_tts.core.models.modeling_qwen3_tts import Qwen3TTSTalkerForConditionalGeneration
-    from tokenizers import Tokenizer,models,pre_tokenizers
-    from transformers import PreTrainedTokenizerFast
     cfg=Qwen3TTSTalkerConfig(vocab_size=2200,hidden_size=64,intermediate_size=128,num_hidden_layers=2,num_attention_heads=4,num_key_value_heads=2,head_dim=16,text_vocab_size=128,text_hidden_size=64,num_code_groups=16,rope_scaling={'rope_type':'default','mrope_section':[2,2,4],'interleaved':True},codec_eos_token_id=2150,codec_think_id=2154,codec_think_bos_id=2156,codec_think_eos_id=2157,codec_pad_id=2148,codec_bos_id=2149,codec_language_id={'english':2050,'chinese':2055},code_predictor_config={'vocab_size':2048,'hidden_size':64,'intermediate_size':128,'num_hidden_layers':2,'num_attention_heads':4,'num_key_value_heads':2,'head_dim':16,'num_code_groups':16})
     cfg._attn_implementation='sdpa'
     wrapper=NativeSpeechOutput.__new__(NativeSpeechOutput); nn.Module.__init__(wrapper)
     wrapper.talker=Qwen3TTSTalkerForConditionalGeneration(cfg)
     wrapper.qconfig=types.SimpleNamespace(tts_pad_token_id=10,tts_bos_token_id=11,tts_eos_token_id=12)
-    raw=Tokenizer(models.WordLevel({'[UNK]':0,'hi':1},unk_token='[UNK]'));raw.pre_tokenizer=pre_tokenizers.Whitespace()
-    wrapper.tokenizer=PreTrainedTokenizerFast(tokenizer_object=raw,unk_token='[UNK]')
+    class TinyTokenizer:
+        def __call__(self,text,add_special_tokens=False,return_tensors='pt'):
+            assert text=='<|im_start|>assistant\nhi<|im_end|>\n<|im_start|>assistant\n'
+            return types.SimpleNamespace(input_ids=torch.tensor([[1,2,3,4,5,6,7,8,9,10,11]]))
+    wrapper.tokenizer=TinyTokenizer()
     wrapper.bridge=Resampler(48,64,4);wrapper.default_voice=nn.Parameter(torch.zeros(1,1,64))
     return wrapper
 
 
-def test_native_talker_and_subtalker_objectives_reach_conditioning():
-    model=tiny_talker(); hidden=torch.randn(1,7,48,requires_grad=True)
+def test_native_talker_official_layout_subtalker_alignment_and_gradients():
+    model=tiny_talker(); model.talker.eval(); hidden=torch.randn(1,7,48,requires_grad=True)
     prefix,pad=model.conditioning(hidden,{'language':'en','prompt':'Say hi','utterance':'hi'})
-    codes=torch.randint(0,32,(3,16));embeds=torch.cat([prefix,model.frame_embeddings(codes,pad)],dim=1)
-    output=model.talker.model(inputs_embeds=embeds,use_cache=False,return_dict=True).last_hidden_state[:,prefix.shape[1]-1:]
-    labels=torch.cat([codes[:,0],torch.tensor([2150])])
-    first=torch.nn.functional.cross_entropy(model.talker.codec_head(output).float().flatten(0,1),labels)
-    _,rest=model.talker.forward_sub_talker_finetune(codes,output[0,:3]);(first+.3*rest).backward()
+    codes=torch.randint(0,32,(3,16))
+    assert prefix.shape[1]==18  # bridge 4 + role 3 + control 6 + text/eos 4 + codec BOS 1
+    temb=model.talker.get_text_embeddings(); projected=model.talker.text_projection(temb(torch.tensor([[1,2,3]])))
+    torch.testing.assert_close(prefix[0,4:7],projected[0])
+    embeds=torch.cat([prefix,model.frame_embeddings(codes,pad)],dim=1)
+    expected=model.talker.model(inputs_embeds=embeds,use_cache=False,return_dict=True).last_hidden_state[:,prefix.shape[1]-1:]
+    original=model.talker.forward_sub_talker_finetune; seen={}
+    def probe(codec_ids,talker_hidden_states):
+        seen['hidden']=talker_hidden_states.detach().clone()
+        return original(codec_ids,talker_hidden_states)
+    model.talker.forward_sub_talker_finetune=probe
+    loss,_=model.codec_loss(hidden,codes,{'language':'en','prompt':'Say hi','utterance':'hi'})
+    torch.testing.assert_close(seen['hidden'],expected[0,1:4])
+    loss.backward()
     assert torch.isfinite(hidden.grad).all() and hidden.grad.abs().sum()>0
     assert model.talker.code_predictor.lm_head[0].weight.grad.abs().sum()>0
     assert model.talker.model.layers[0].self_attn.q_proj.weight.grad.abs().sum()>0
+
+def test_native_talker_cached_frames_match_full_prefill():
+    model=tiny_talker(); model.talker.eval(); hidden=torch.randn(1,7,48)
+    prefix,pad=model.conditioning(hidden,{'language':'en','prompt':'Say hi','utterance':'hi'})
+    codes=torch.randint(0,32,(3,16))
+    with torch.no_grad():
+        embeds=torch.cat([prefix,model.frame_embeddings(codes,pad)],dim=1)
+        expected=model.talker.model(inputs_embeds=embeds,use_cache=False,return_dict=True).last_hidden_state
+        output=model.talker.model(inputs_embeds=prefix,use_cache=True,return_dict=True)
+        past=output.past_key_values; actual=[output.last_hidden_state]
+        for frame in codes:
+            output=model.talker.model(inputs_embeds=model.frame_embeddings(frame[None],pad),past_key_values=past,use_cache=True,return_dict=True)
+            past=output.past_key_values; actual.append(output.last_hidden_state)
+        torch.testing.assert_close(torch.cat(actual,dim=1),expected,atol=1e-5,rtol=1e-5)
 
 
 def test_native_dit_v_prediction_reaches_spark_conditioning():
@@ -65,11 +89,17 @@ def test_native_dit_v_prediction_reaches_spark_conditioning():
     model.dit=StableAudioDiTModel(sample_size=16,in_channels=8,out_channels=8,num_layers=2,attention_head_dim=16,num_attention_heads=4,num_key_value_attention_heads=2,cross_attention_dim=32,cross_attention_input_dim=32,time_proj_dim=16,global_states_input_dim=64)
     model.projection=StableAudioProjectionModel(text_encoder_dim=32,conditioning_dim=32,min_value=0,max_value=512)
     model.bridge=Resampler(48,32,4)
-    hidden=torch.randn(1,7,48,requires_grad=True);z=torch.randn(1,8,16);noise=torch.randn_like(z);t=torch.tensor([.5]);a=torch.cos(t*torch.pi/2)[:,None,None];s=torch.sin(t*torch.pi/2)[:,None,None]
-    cross,glob=model.conditioning(hidden,15);out=model.velocity(a*z+s*noise,t,cross,glob)
-    torch.nn.functional.mse_loss(out,a*noise-s*z).backward()
+    model.scheduler_config={'sigma_min':.3,'sigma_max':500.,'sigma_data':1.0}
+    hidden=torch.randn(1,7,48,requires_grad=True);z=torch.randn(1,8,16);noise=torch.randn_like(z)
+    scaled,timestep,target=model.diffusion(z,noise,torch.tensor([2.0]))
+    torch.testing.assert_close(timestep,torch.tensor([.25*__import__('math').log(2.)]))
+    torch.testing.assert_close(scaled,(z+2*noise)/__import__('math').sqrt(5))
+    torch.testing.assert_close(target,(noise-2*z)/__import__('math').sqrt(5))
+    cross,glob=model.conditioning(hidden,15);out=model.velocity(scaled,timestep,cross,glob)
+    torch.nn.functional.mse_loss(out,target).backward()
     assert torch.isfinite(hidden.grad).all() and hidden.grad.abs().sum()>0
     assert model.dit.proj_out.weight.grad.abs().sum()>0
+    assert type(model.scheduler()).__name__=='EDMDPMSolverMultistepScheduler'
 
 def tiny_original_spark(adapt=True):
     """The pinned custom decoder source, dimension-reduced for CPU graph tests."""
@@ -79,7 +109,7 @@ def tiny_original_spark(adapt=True):
         payload=(root/name).read_bytes(); expected=next(f for f in lock['spark']['files'] if f['path']==name)
         assert hashlib.sha1(f'blob {len(payload)}\0'.encode()+payload).hexdigest()==expected['git_blob_sha1']
     package=types.ModuleType('spark_formal_tiny');package.__path__=[str(root)];sys.modules['spark_formal_tiny']=package
-    config=importlib.import_module('spark_formal_tiny.configuration_spark').Spark2_5Config(vocab_size=128,hidden_size=48,intermediate_size=96,num_hidden_layers=2,num_attention_heads=4,num_key_value_heads=2,head_dim=12,max_position_embeddings=128,pad_token_id=0,tie_word_embeddings=True,headwise_attn_output_gate=True,sliding_window=8,layer_types=['sliding_attention','full_attention'],rope_parameters={'sliding_attention':{'rope_theta':10000,'partial_rotary_factor':1.0},'full_attention':{'rope_theta':10000,'partial_rotary_factor':1.0}})
+    config=importlib.import_module('spark_formal_tiny.configuration_spark').Spark2_5Config(vocab_size=131072,hidden_size=48,intermediate_size=96,num_hidden_layers=2,num_attention_heads=4,num_key_value_heads=2,head_dim=12,max_position_embeddings=128,pad_token_id=0,tie_word_embeddings=True,headwise_attn_output_gate=True,sliding_window=8,layer_types=['sliding_attention','full_attention'],rope_parameters={'sliding_attention':{'rope_theta':10000,'partial_rotary_factor':1.0},'full_attention':{'rope_theta':10000,'partial_rotary_factor':1.0}})
     config._attn_implementation='eager'
     module=importlib.import_module('spark_formal_tiny.modeling_spark')
     module.eager_attention_forward=getattr(module.eager_attention_forward,'_spark_reference',module.eager_attention_forward)
@@ -93,11 +123,8 @@ def tiny_original_spark(adapt=True):
 def test_native_audio_objective_updates_the_actual_custom_spark_decoder():
     spark=tiny_original_spark(); talker=tiny_talker();opt=torch.optim.AdamW(spark.parameters(),lr=1e-3)
     ids=torch.tensor([[1,4,5,6,2]]); h=spark.model(input_ids=ids,attention_mask=torch.ones_like(ids),use_cache=False,return_dict=True).last_hidden_state
-    prefix,pad=talker.conditioning(h,{'language':'en','prompt':'Say hi','utterance':'hi'});codes=torch.randint(0,32,(3,16))
-    embeds=torch.cat([prefix,talker.frame_embeddings(codes,pad)],dim=1)
-    out=talker.talker.model(inputs_embeds=embeds,use_cache=False,return_dict=True).last_hidden_state[:,prefix.shape[1]-1:]
-    first=torch.nn.functional.cross_entropy(talker.talker.codec_head(out).flatten(0,1),torch.cat([codes[:,0],torch.tensor([2150])]))
-    _,sub=talker.talker.forward_sub_talker_finetune(codes,out[0,:3]);(first+.3*sub).backward()
+    codes=torch.randint(0,32,(3,16))
+    loss,_=talker.codec_loss(h,codes,{'language':'en','prompt':'Say hi','utterance':'hi'}); loss.backward()
     assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in spark.parameters())
     assert all(p.grad.abs().sum()>0 for p in spark.parameters())
     weight=spark.model.layers[0].self_attn.q_k_v_proj.weight;before=weight.detach().clone();opt.step()
@@ -113,6 +140,33 @@ def test_spark_kernel_adapter_matches_reference_masks_forward_and_backward():
     b.float().square().mean().backward()
     torch.testing.assert_close(a,b,atol=2e-6,rtol=2e-5)
     for n,p in model.named_parameters(): torch.testing.assert_close(expected[n],p.grad,atol=2e-6,rtol=2e-4)
+
+def test_spark_text_microbatch_matches_single_record_losses():
+    from transformers import AutoTokenizer
+    from colab.final.model import SparkNative,ChatFormat
+    from colab.final.inference import empty_media
+    model=SparkNative.__new__(SparkNative); nn.Module.__init__(model)
+    model.spark=tiny_original_spark(); model.config=model.spark.config
+    model.tokenizer=AutoTokenizer.from_pretrained('models/Spark-X2.6-4B',trust_remote_code=True,local_files_only=True)
+    model.chat=ChatFormat(model.tokenizer); model.hidden=model.config.hidden_size
+    model.policy={'max_sequence':128,'max_answer_tokens':64,'microbatch_size':2}
+    model.image_tokens=lambda *args: None; model.motion_tokens=lambda *args: None; model.audio_tokens=lambda *args: None
+    rows=[{'_family':'text','language':'en','task':'text_replay','prompt':'Answer briefly.','answer':'One.'},
+          {'_family':'text','language':'en','task':'text_replay','prompt':'Give a number.','answer':'Two.'}]
+    singles=[model.text_loss(row,empty_media())[0] for row in rows]
+    result=model(examples=[(row,empty_media()) for row in rows])
+    torch.testing.assert_close(result['per_example_loss'],torch.stack(singles),atol=1e-5,rtol=1e-5)
+    result['loss'].backward()
+    assert all(p.grad is None or torch.isfinite(p.grad).all() for p in model.spark.parameters())
+    with torch.no_grad():
+        cached=model.answer(rows[0],empty_media(),max_new_tokens=3)
+        embeds=model.prefix(rows[0],empty_media()); expected=[]
+        for _ in range(3):
+            hidden=model.hidden_states(embeds)
+            token=model.get_output_embeddings()(hidden[:,-1:]).argmax(-1)
+            if token.item()==model.tokenizer.eos_token_id: break
+            expected.append(token.item()); embeds=torch.cat([embeds,model.get_input_embeddings()(token)],dim=1)
+        assert cached==model.tokenizer.decode(expected,skip_special_tokens=True)
 
 def test_temporal_resampler_keeps_event_order_when_absolute_clock_is_fixed():
     torch.manual_seed(99)

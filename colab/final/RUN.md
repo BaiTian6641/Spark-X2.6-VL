@@ -1,10 +1,14 @@
 # Formal Spark multimodal Colab campaign
 
-## Direct one-shot mode
+## Full-Git one-click mode
 
-The canonical notebook now uses `python -m colab.final.run direct`. It downloads assets and the full `TassP0lar/SparkX2.6-MM` dataset on the GPU VM, builds the native model, and runs all eight families plus both instructor RSI rounds. It does **not** require `PREFLIGHT.json`, `QUALIFICATION.json`, `FULL_RECOVERY_PROOF.json`, a qualification profile, Google Drive authentication or a prior-VM checkpoint. Set `drive_project_folder` to null, `instructor_enabled` true and `enforce_compute_budget` false. HF checkpoints are still verified and atomic. The legacy sections below describe the gated campaign and remain historical.
+The canonical notebook clones the **full Git repository** and invokes `python -m colab.final.run direct` from that checkout. It uses the original staged corpus and campaign, not `colab/oneshot`. Direct mode prepares assets/data, runs the complete native CUDA qualification when no bound profile exists, returns exit `10`, then requires a fresh process for the two-update recovery proof before formal training. Later invocations restore the latest verified checkpoint. Exit `3` marks a resumable session stop; exit `0` requires all stages, both RSI rounds, protected audit, offline export reload, and verified model upload.
 
-Use `colab/Spark_Formal_Full_Finetune.ipynb` from [BaiTian6641/Spark-X2.6-VL](https://github.com/BaiTian6641/Spark-X2.6-VL). The small notebook downloads a source-only runtime ZIP from an immutable GitHub commit and verifies its SHA256 and exact file inventory before execution. Sources, dependency locks, the upstream vision-source archive and the runtime ZIP are in that repository. There is no embedded base64 payload. It does not depend on this workstation or upload its old checkpoints. The pipeline is implemented; the complete native CUDA campaign has **not** been run or certified by the CPU tests shipped with it.
+The required wall budget is 110 cumulative GPU-hours. Optional actual CU observations add a second budget check. The 230-GB envelope uses two measured checkpoint slots, a 23-GB media cache, and a 44-GB free floor. No CPU-preflight notebook, Drive mount/API, or prior-VM user artifact is required; whole-model qualification and fresh-process recovery remain mandatory and are automated, not skipped. The complete 603,668-exposure curriculum and both matched RSI arms are never silently shortened.
+
+`INSTRUCTOR_ROUTE_EVIDENCE` remains a required provider/account receipt under `colab/final/teacher.py`. The earlier `instructor_enabled` shortcut is removed: an API key alone does not prove batch-review eligibility.
+
+Historical sections below describe the earlier source-ZIP launcher and gated workflow. They remain implementation/evidence history, not the current one-click instructions.
 
 ## Current formal script and storage policy
 

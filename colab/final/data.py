@@ -193,28 +193,34 @@ class Catalogue:
         return order
 
 class CommittedCursor:
-    """Issued microbatches are speculative until their optimizer update commits."""
+    """Worker-issued media may finish out of order; commits stay contiguous."""
     def __init__(self,order,state=None):
-        self.order=order; self.order_sha256=identity(order); self.committed=0; self.issued=0
+        self.order=order; self.order_sha256=identity(order); self.committed=0; self.issued=0; self.pending=set()
         if state:
             if state['order_sha256']!=self.order_sha256: raise ValueError('Training order changed across resume')
             self.committed=int(state['committed']); self.issued=self.committed
+    def _computed(self,index):
+        if not self.committed<=index<len(self.order) or index in self.pending: raise ValueError('Model consumed a skipped or repeated source position')
+        self.pending.add(index); self.issued=max(self.issued,index+1)
     def issue(self):
         if self.issued>=len(self.order): raise StopIteration
-        rid=self.order[self.issued]; self.issued+=1; return rid
-    def record_computed(self,index):
-        if index!=self.issued: raise ValueError('Model consumed a skipped or repeated source position')
-        self.issued+=1
+        index=self.issued; self._computed(index); return self.order[index]
+    def record_computed(self,index): self._computed(index)
     def commit(self,count=None):
-        target=self.issued if count is None else self.committed+count
-        if not self.committed<=target<=self.issued: raise ValueError('Invalid optimizer commitment')
-        self.committed=target
+        if count is not None and not 0<=count<=len(self.pending): raise ValueError('Optimizer acknowledgement does not cover the computed microbatches')
+        advanced=0
+        while self.committed in self.pending and (count is None or advanced<count):
+            self.pending.remove(self.committed); self.committed+=1; advanced+=1
+        if count is not None and advanced!=count: raise ValueError('Cannot commit across an uncomputed source position')
+        self.issued=max(self.issued,self.committed)
     def state(self): return {'order_sha256':self.order_sha256,'committed':self.committed,'records':len(self.order)}
 
 def cursor_rows(order,cursor):
-    """A metadata peek/iterator construction must not consume training state."""
-    start=cursor.committed
-    for index in range(start,len(order)):
+    """Shard metadata by worker while retaining a contiguous committed prefix."""
+    from torch.utils.data import get_worker_info
+    worker=get_worker_info(); start=cursor.committed
+    step=worker.num_workers if worker else 1; offset=worker.id if worker else 0
+    for index in range(start+offset,len(order),step):
         yield {'rid':order[index],'_index':index}
 
 class MediaReader:
@@ -251,19 +257,29 @@ def decode_audio(payload):
     return wav.T.copy(),int(sr)
 
 def decode_video(payload,count,origin_seconds=None):
-    """Bounded sequential two-pass decode using actual PTS, not guessed FPS."""
+    """Demux timestamps cheaply, then decode only the required frame pass."""
     import av, numpy as np
-    pts=[]
+    pts=[]; complete=True
     with av.open(io.BytesIO(payload)) as source:
-        for frame in source.decode(video=0):
-            if frame.pts is None or frame.time_base is None: raise ValueError('Unknown video PTS')
-            pts.append(float(frame.pts*frame.time_base))
+        base=source.streams.video[0].time_base
+        for packet in source.demux(video=0):
+            if packet.pts is None or base is None: complete=False; break
+            pts.append(float(packet.pts*base))
+    if not complete:
+        pts=[]
+        with av.open(io.BytesIO(payload)) as source:
+            for frame in source.decode(video=0):
+                if frame.pts is None or frame.time_base is None: raise ValueError('Unknown video PTS')
+                pts.append(float(frame.pts*frame.time_base))
+    else:
+        pts.sort()
     if not pts or any(b<=a for a,b in zip(pts,pts[1:])): raise ValueError('Unusable presentation clock')
     ids=np.linspace(0,len(pts)-1,count).round().astype(int).tolist(); wanted=set(ids); frames={}
     with av.open(io.BytesIO(payload)) as source:
         for i,frame in enumerate(source.decode(video=0)):
             if i in wanted: frames[i]=frame.to_image().convert('RGB')
             if i>=max(ids): break
+    if len(frames)!=len(wanted): raise ValueError('Video decode did not produce the selected frames')
     origin=pts[0] if origin_seconds is None else float(origin_seconds)
     return [frames[i] for i in ids],[pts[i]-origin for i in ids]
 

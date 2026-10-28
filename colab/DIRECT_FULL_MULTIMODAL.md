@@ -1,58 +1,53 @@
-# Full native multimodal Spark fine-tune — direct one-shot Colab
+# Full native multimodal Spark fine-tune — full-Git one-click Colab
 
-Use [`Spark_Formal_Full_Finetune.ipynb`](https://colab.research.google.com/github/BaiTian6641/Spark-X2.6-VL/blob/codex/formal-colab/colab/Spark_Formal_Full_Finetune.ipynb). It replaces the former CPU-preflight/qualification launcher, archived as [`Spark_Formal_Omni_Gated.ipynb`](Spark_Formal_Omni_Gated.ipynb).
+Use [`Spark_Formal_Full_Finetune.ipynb`](Spark_Formal_Full_Finetune.ipynb). Read [`ONESHOT_HANDOFF_AND_NEXT_STEPS.md`](ONESHOT_HANDOFF_AND_NEXT_STEPS.md) for the corrected audit, exact architecture, corpus boundaries, and evidence requirements.
 
-## Scope
+## What this runs
 
-The `colab/final` native runtime is retained in full:
+`colab/final` executes the original staged campaign from a **full Git repository checkout**:
 
-| Stage | Families |
-|---|---|
-| Bridge alignment | every modality bridge; pretrained towers frozen |
-| Image full | image + text |
-| Temporal full | video + audiovisual |
-| Audio understanding full | speech input + general sound |
-| Audio generation full | native speech + native sound/music output |
-| Joint full | all eight families |
-| Instructor RSI | two 32-example rounds with matched uniform replay controls |
-| Final | protected audit, offline export reload, private model upload |
+1. Locked CUDA environment and revision-pinned components.
+2. Original `TassP0lar/SparkX2.6-MM` corpus: 304,861 instructions / 315,359 bounded views.
+3. Whole-model CUDA qualification and fresh-process optimizer/RNG recovery.
+4. Bridge alignment → vision → temporal/AV → audio understanding → native speech/sound generation → joint full tuning.
+5. Two instructor-controlled candidate-versus-uniform-control RSI rounds.
+6. Protected audit, offline export reload, and verified private HF upload.
 
-All Spark parameters train in the principal stages. Codecs/autoencoders remain frozen infrastructure. No LoRA or quantized fallback is introduced. The dataset is the full pinned `TassP0lar/SparkX2.6-MM` corpus: **304,861 instructions, 315,359 views, 290,685 training views**, with image, video, audiovisual, speech, sound, music, OCR/text and text replay.
-
-## Removed gates
-
-The direct path specifically removes:
-
-- CPU runtime preflight (`run_campaign('cpu')` / `PREFLIGHT.json`).
-- Complete-model qualification (`QUALIFICATION.json`, profile receipt).
-- New-process/prior-VM recovery (`FULL_RECOVERY_PROOF.json`).
-- Drive authentication and Drive artifact storage.
-- Colab CU balance/rate observation.
-- Instructor route-eligibility receipt.
-
-It retains the HF token, gated-model access, instructor key, $50 instructor ledger, checkpoint binding, disk floor, source/asset hashes, checkpoint verification and final private model publication.
-
-## One-shot flow
-
-1. Clone the reviewed GitHub branch.
-2. Install one isolated hash-pinned CUDA environment.
-3. Download native components and the full HF dataset catalogue.
-4. Build the native model and run bridge + all full stages + two instructor RSI rounds.
-5. Upload complete checkpoints to `TassP0lar/SparkX2.6-MM-checkpoints` and, only after a complete curriculum/final audit, the private model package to `TassP0lar/SparkX2.6-MM`.
-
-No file from a previous Colab VM is read. The notebook starts a new timestamped run and a new local `/content/spark-mm-direct` tree.
+The replacement `colab/oneshot` WSD schedule, 20-source expansion, 12 GB reserve, history squashing, and single optional replay round are **not** used.
 
 ## Requirements
 
-- One CUDA GPU with **≥90 GB** and BF16; G4 / RTX PRO 6000 Blackwell is the target.
-- Colab Secrets `HF_TOKEN` and `OPENCODE_API_KEY`.
-- HF account `TassP0lar` with Stable Audio Open 1.0 access and write access to both private model repositories.
-- Local `/content` disk sufficient for the bounded 23 GB media cache, assets, one or two complete checkpoints, and the 44 GB free floor.
+- G4 / RTX PRO 6000 Blackwell with at least 90,000,000,000 GPU bytes and BF16.
+- `INSTRUCTOR_ROUTE_EVIDENCE`: actual provider/account eligibility receipt for the bounded OpenCode Go dataset-review route; an API key alone is not sufficient.
+- Conservative 230 GB local-disk envelope; 44 GB non-borrowable free floor.
+- `HF_TOKEN`: component read access plus private model/checkpoint write access for `TassP0lar`.
+- `OPENCODE_API_KEY`: required for both instructor rounds; $50 cumulative ledger and uncertain-outcome stop remain enforced.
+- Stable Audio Open 1.0 access accepted on the same HF account before launch.
 
-`DIRECT_WALL_HOURS` is the internal graceful-stop budget. `0` disables it. HF checkpoints are written at the configured checkpoint interval and at stage boundaries. A curriculum that does not finish in one session leaves the latest complete checkpoint in the private HF repository; the next notebook run does not depend on the prior VM.
+## Launch and resume
 
-The full curriculum is large (603,668 configured exposures before RSI). A single Colab session is not guaranteed to finish it; completion is not inferred from a stop or from checkpoint availability.
+Open the notebook on branch `codex/formal-colab`, select the G4 runtime, and click **Run all**. The notebook records the actual Git `HEAD` and hashes every tracked file. Set `REPO_COMMIT` to a full 40-character commit when an immutable launch is required.
 
-## Local validation
+If an existing checkpoint repository contains an incompatible trained payload, choose a new empty private checkpoint repository. The runner will not overwrite or rebind that history.
 
-Static notebook/schema checks, direct-config validation, disabled budget behavior, instructor eligibility behavior, full runtime compilation and focused tests pass. This workstation did not execute the full native CUDA campaign or upload checkpoints. The first G4 run remains the environment/model gate.
+| Exit | Meaning | Action |
+| ---: | --- | --- |
+| `10` | Whole-model qualification completed | The notebook automatically starts fresh-process recovery; if stopped after this phase, run all again. |
+| `3` | Session deadline reached after a complete checkpoint | Start a new G4 session and click Run all to resume. |
+| `0` | Stages, both RSI rounds, audit, offline reload, and upload completed | Inspect `ONESHOT_RECEIPT.json` and `MODEL_UPLOAD_RECEIPT.json`. |
+| Other | Failure or explicitly incomplete campaign | Inspect logs/receipts; do not call the model complete. |
+
+The cumulative budget is **110 GPU-hours**, including setup, qualification, training, RSI, evaluation, and export. Qualification projects the complete 603,668-exposure curriculum from measured per-family p90 timings plus a 25% reserve. An over-budget projection stops rather than shortening any epoch or RSI arm.
+
+## Storage
+
+- No Drive mount or Drive API.
+- Local active files stay under `/content/spark-formal`.
+- Two measured checkpoint slots, initially 44 GB each, plus a 10% post-qualification margin.
+- Ten bounded 2.3 GB TAR caches; no full dataset clone or second HF payload cache.
+- Full checkpoints go to private `TassP0lar/SparkX2.6-MM-checkpoints`; HF history is preserved for recovery and RSI parent/control snapshots.
+- Final inference weights go to private `TassP0lar/SparkX2.6-MM` after offline reload and remote hash verification.
+
+## Evidence limits
+
+Repository tests do not establish full-GPU throughput, model quality, or broad capability. The first G4 run is the real hardware gate. Human speech intelligibility/tone review, sound/music listening, external spatial/temporal/3D benchmarks, and final acceptance remain separate. Narrow AV, time-lapse, music, natural-document, and calibrated-depth coverage is documented in the handoff rather than silently patched with unreviewed data.

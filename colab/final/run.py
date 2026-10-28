@@ -43,32 +43,69 @@ def direct_doctor(root):
             'studio_backend_sha256':sha(backend.__file__),'direct_mode':True}
     write(Path(root)/'ENVIRONMENT.json',report); emit('environment_ready',**report); return report
 
+DIRECT_QUALIFICATION_EXIT=10
+DIRECT_SESSION_EXIT=3
+
+def directory_bytes(root):
+    seen=set(); total=0
+    for path in Path(root).rglob('*'):
+        if not path.is_file() or {'checkpoints','media-cache'} & set(path.relative_to(root).parts): continue
+        stat=path.stat(); identity=(stat.st_dev,stat.st_ino)
+        if identity not in seen:
+            seen.add(identity); total+=stat.st_size
+    return total
+
+def storage_envelope(root,config,slot_bytes):
+    """Conservative 230-GB envelope, including two slots and the 44-GB floor."""
+    pending=2*slot_bytes+10*config['cache_bytes_per_component']+4_000_000_000+44_000_000_000
+    used=directory_bytes(root); free=__import__('shutil').disk_usage(root).free
+    if used+pending>230_000_000_000 or free<pending:
+        raise RuntimeError(f'230-GB local envelope failed: used={used/1e9:.1f} GB, required={pending/1e9:.1f} GB, free={free/1e9:.1f} GB')
+    emit('local_storage_envelope',used_gb=round(used/1e9,2),reserved_gb=round(pending/1e9,2),checkpoint_slot_gb=round(slot_bytes/1e9,2),capacity_gb=230)
+
 def direct(config,token,key,source_sha):
-    if not key: raise ValueError('OPENCODE_API_KEY is required: direct mode includes the instructor RSI rounds')
+    if not key: raise ValueError('OPENCODE_API_KEY is required: the campaign includes two instructor RSI rounds')
+    from .teacher import eligibility
+    eligibility(config)
     from .assets import prepare_assets,prepare_data
+    from .common import ComputeBudget
     from .engine import Campaign
-    from .model import SparkNative
+    from .qualify import qualify,recovery_check
     root=Path(config['work_root']); root.mkdir(parents=True,exist_ok=True)
+    early=ComputeBudget(config,read(root/'compute-budget.json') if (root/'compute-budget.json').exists() else None)
+    if config['observed_compute_balance'] and config['observed_cu_per_hour']:
+        early.observe(config['observed_compute_balance'],config['observed_cu_per_hour'])
+    write(root/'compute-budget.json',early.state)
     direct_doctor(root)
     emit('direct_assets_start',download_weights=True,full_dataset=True)
     paths=prepare_assets(root,token,config,download_weights=True)
     report=prepare_data(root,token,config)
     emit('direct_data_ready',instructions=report.get('instructions'),original_instructions=report.get('original_instructions'),split_membership_sha256=report.get('split_membership_sha256'))
-    campaign=Campaign(config,paths,source_sha,token,key)
-    campaign.model=SparkNative(paths,config)
-    campaign.model.set_stage(False)
-    profile={'schema_version':1,'passed':True,
-             'scope':'direct one-shot full multimodal; no CPU preflight, qualification profile, Drive or prior-VM recovery',
-             'complete_checkpoint_bytes':max(int(config['initial_checkpoint_reservation_bytes']),66_000_000_000),
-             'qualification_complete_receipt':{'seconds':0},
-             'projected_hours':float(config.get('direct_projected_hours',72)),
-             'direct':True}
-    campaign.state['qualified_checkpoint_reservation_bytes']=profile['complete_checkpoint_bytes']
-    write(root/'DIRECT_PROFILE.json',profile)
-    emit('direct_campaign_starting',campaign=config['campaign_id'],stages=[s['name'] for s in config['stages']],
-         instructor_rounds=config['instructor_rounds'],direct_wall_hours=config.get('direct_wall_hours'),
-         curriculum_will_not_be_shortened=True)
-    return campaign.run_formal(profile,require_recovery=False)
+    storage_envelope(root,config,config['initial_checkpoint_reservation_bytes'])
+    campaign=Campaign(config,paths,source_sha,token,key); campaign.budget=early
+    profile_path=root/'QUALIFICATION.json'
+    if not profile_path.exists():
+        profile=qualify(campaign)
+        storage_envelope(root,config,__import__('math').ceil(profile['complete_checkpoint_bytes']*1.10))
+        write(root/'compute-budget.json',early.state)
+        emit('direct_qualification_complete',projected_hours=profile['projected_hours'],next_process='checkpoint recovery',exit_code=DIRECT_QUALIFICATION_EXIT)
+        return DIRECT_QUALIFICATION_EXIT
+    profile=read(profile_path)
+    if not profile.get('passed') or profile.get('binding')!=campaign.bound:
+        raise RuntimeError('Qualification belongs to a different source/data/policy; run a new campaign identity')
+    storage_envelope(root,config,__import__('math').ceil(profile['complete_checkpoint_bytes']*1.10))
+    if not (root/'FULL_RECOVERY_PROOF.json').exists():
+        result=recovery_check(campaign,profile); emit('direct_recovery_complete',**result)
+    state=read(root/'CAMPAIGN.json') if (root/'CAMPAIGN.json').exists() else {}
+    selected=state.get('last_checkpoint') or profile['qualification_initial_receipt']
+    optimizer,scheduler,_=campaign.restore(selected); del optimizer,scheduler
+    emit('direct_campaign_starting',campaign=config['campaign_id'],stages=[s['name'] for s in config['stages']],instructor_rounds=config['instructor_rounds'],max_wall_hours=config['max_wall_hours'],curriculum_will_not_be_shortened=True)
+    result=campaign.run_formal(profile)
+    write(root/'compute-budget.json',early.state)
+    if isinstance(result,dict) and result.get('stopped'):
+        if result.get('reason')=='direct_wall_hours': return DIRECT_SESSION_EXIT
+        raise RuntimeError('Campaign stopped before completion: '+str(result.get('reason')))
+    return 0
 
 def main(secrets=None):
     p=argparse.ArgumentParser(description=__doc__); p.add_argument('mode',choices=('cpu','doctor','direct','qualify','discover','upload-checkpoint','recover','train','resume')); p.add_argument('--config',required=True);p.add_argument('--source-sha',required=True); p.add_argument('--profile-receipt');p.add_argument('--resume-receipt');p.add_argument('--checkpoint-directory');a=p.parse_args()
@@ -144,7 +181,8 @@ if __name__=='__main__':
     secrets={}
     try:
         secrets=json.loads(sys.stdin.readline())
-        main(secrets)
+        result=main(secrets)
+        if isinstance(result,int) and result: raise SystemExit(result)
     except (Exception,KeyboardInterrupt) as exc:
         # No traceback containing response bodies, credentials or signed URLs.
         from .launcher import sanitize

@@ -25,7 +25,7 @@ def sanitize(text, secrets=()):
     return text
 
 
-def run_process(args, *, cwd, env, secrets, log_path, output=print, label='Campaign'):
+def run_process(args, *, cwd, env, secrets, log_path, output=print, label='Campaign', allow_codes=()):
     """Stream both file descriptors through Python so Jupyter captures them.
 
     Only stdin carries credentials. A bounded queue decouples reads from notebook
@@ -107,7 +107,7 @@ def run_process(args, *, cwd, env, secrets, log_path, output=print, label='Campa
         show(f'{label} subprocess exit code: {process.returncode}. Sanitized log: {log_path}')
     if interrupted:
         raise KeyboardInterrupt('Runner exited after interrupt; inspect its checkpoint receipt above.')
-    if process.returncode:
+    if process.returncode and process.returncode not in set(allow_codes):
         detail = (f"{stopped.get('error_type', 'Error')}: {stopped.get('reason', '')}" if stopped else
                   last_line or 'No diagnostic output; inspect runtime resource availability.')
         raise RuntimeError(f'{label} {args[3] if len(args)>3 else "process"} stopped '

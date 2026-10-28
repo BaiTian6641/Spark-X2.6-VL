@@ -26,8 +26,7 @@ def census(model):
 
 def binding(config,source_sha):
     operational=('observed_compute_balance','observed_cu_per_hour','instructor_route_eligibility_receipt',
-                 'drive_project_folder','direct_wall_hours','direct_projected_hours',
-                 'enforce_compute_budget','instructor_enabled')
+                 'drive_project_folder','direct_wall_hours','enforce_compute_budget')
     stable={k:v for k,v in config.items() if k not in operational}
     return {'source_archive_sha256':source_sha,'component_lock_sha256':sha(HERE/'components.lock.json'),'dataset_lock_sha256':sha(HERE/'dataset.lock.json'),'policy_sha256':identity(stable)}
 
@@ -150,6 +149,26 @@ def load_checkpoint(directory,config,bound,model=None,load_optimizer=True):
     set_rng(torch.load(directory/'rng.pt',map_location='cpu',weights_only=True))
     return model,optimizer,scheduler,state
 
+class MediaCollator:
+    """Open independent catalogue/cache handles in each DataLoader process."""
+    def __init__(self,campaign):
+        self.root=campaign.root; self.config=campaign.c; self.token=campaign._hf_token
+        self.handoff=read(HERE.parent/'formal/HF_FULL_DATASET_HANDOFF.json')
+        self.slot=campaign.reader.checkpoint_slot_bytes; self.worker=None
+    def __call__(self,rows):
+        if self.worker is None:
+            catalogue=Catalogue(self.root/'metadata/corpus.sqlite')
+            reader=MediaReader(self.root,self.handoff,self.config,self.token,reserve=2*self.config['initial_checkpoint_reservation_bytes'])
+            reader.checkpoint_slot_bytes=self.slot
+            self.worker=(catalogue,reader)
+        catalogue,reader=self.worker; examples=[]
+        for item in rows:
+            row,packet=catalogue.row(item['rid'])
+            with reader.packet(packet) as get: media=prepare_media(row,get,self.config)
+            examples.append((row,media))
+        return {'examples':examples,'source_indices':[item['_index'] for item in rows]}
+
+
 class Campaign:
     def __init__(self,config,paths,source_sha,token=None,key=None):
         self.c=config; self.root=Path(config['work_root']); self.paths=paths; self.bound=binding(config,source_sha)
@@ -168,8 +187,15 @@ class Campaign:
         row,x=self.catalogue.row(rid)
         with self.reader.packet(x) as get: media=prepare_media(row,get,self.c)
         return row,media
+    def check_wall_budget(self,seconds=0):
+        self.budget.tick(); limit=self.c.get('max_wall_hours',110)*3600
+        remaining=limit-self.budget.state['active_seconds']
+        if seconds>remaining:
+            raise RuntimeError(f'The measured curriculum needs {seconds/3600:.2f} h but only {max(0,remaining)/3600:.2f} h remains of the 110 h wall budget; no stage or epoch will be shortened')
+        return remaining
     def budget_check(self,seconds=0):
-        try: self.budget.check(seconds)
+        try:
+            self.budget.check(seconds); self.check_wall_budget(seconds)
         except RuntimeError as exc: self.stop_reason=str(exc)
         write(self.root/'compute-budget.json',self.budget.state)
     def save(self,optimizer,scheduler,cursor=None):
@@ -203,8 +229,9 @@ class Campaign:
         from torch.utils.data import IterableDataset
         from transformers import TrainerCallback,get_cosine_schedule_with_warmup
         campaign=self; self.model.set_stage(stage.get('alignment_only',False)); self.model.train()
+        microbatch=self.c['microbatch_size']; accumulation=self.c['gradient_accumulation']//microbatch
         cursor=CommittedCursor(order,self.state.get('cursor') if resume else None)
-        planned=math.ceil(len(order)/self.c['gradient_accumulation']); remaining=math.ceil((len(order)-cursor.committed)/self.c['gradient_accumulation'])
+        planned=math.ceil(len(order)/(microbatch*accumulation)); remaining=math.ceil((len(order)-cursor.committed)/(microbatch*accumulation))
         if remaining==0:
             self.state['cursor']=None
             if stage['name'] not in self.state['completed_stages']: self.state['completed_stages'].append(stage['name'])
@@ -228,18 +255,20 @@ class Campaign:
         class Stream(IterableDataset):
             def __iter__(self):
                 yield from cursor_rows(order,cursor)
-        def collate(rows): return {'examples':[campaign.media(r['rid']) for r in rows],'source_indices':[r['_index'] for r in rows]}
+        collate=MediaCollator(self)
         class NativeSFT(backend.SFTTrainer):
             def compute_loss(self,model,inputs,return_outputs=False,num_items_in_batch=None):
-                result=model(examples=inputs['examples'])
-                for index in inputs['source_indices']: cursor.record_computed(index)
-                processed['count']+=len(inputs['examples'])
-                for row,_ in inputs['examples']:
-                    processed['families'][row['_family']]+=1
+                result=model(examples=inputs['examples']); per=result.get('per_example_loss')
+                if per is None or len(per)!=len(inputs['examples']): raise ValueError('Per-record loss count differs from the source microbatch')
+                weighted=[]
+                for index,(row,_),loss in zip(inputs['source_indices'],inputs['examples'],per):
+                    cursor.record_computed(index)
+                    processed['count']+=1; processed['families'][row['_family']]+=1
                     key=row['_family']+':'+row['language']; bucket=processed['losses'][key]
-                    bucket[0]+=float(result['loss'].detach());bucket[1]+=1
-                weighted=result['loss']*weights[key]
-                return (weighted,result) if return_outputs else weighted
+                    bucket[0]+=float(loss.detach()); bucket[1]+=1
+                    weighted.append(loss*weights[key])
+                value=torch.stack(weighted).mean()
+                return (value,{**result,'loss':value}) if return_outputs else value
             def _prepare_inputs(self,inputs): return inputs  # PIL/arrays are intentionally CPU until the native router.
         class Audit(TrainerCallback):
             def on_pre_optimizer_step(self,args,state,control,model=None,**kwargs):
@@ -267,7 +296,9 @@ class Campaign:
         self.model._unsloth_full_finetuning=True
         self.model._unsloth_forced_float32=False; self.model._unsloth_user_float32=False
         self.model.config.torch_dtype=torch.float32
-        args=backend.SFTConfig(output_dir=str(self.root/'trainer-scratch'),per_device_train_batch_size=1,gradient_accumulation_steps=self.c['gradient_accumulation'],max_steps=remaining,bf16=True,fp16=False,gradient_checkpointing=False,remove_unused_columns=False,max_length=self.c['max_sequence'],packing=False,dataset_kwargs={'skip_prepare_dataset':True},dataloader_num_workers=0,dataloader_pin_memory=False,save_strategy='no',logging_steps=10,report_to='none',max_grad_norm=self.c['clip_norm'],warmup_ratio=0,seed=self.c['seed'],ignore_data_skip=True,lr_scheduler_type='cosine')
+        workers=self.c['dataloader_workers']
+        loader_options={'dataloader_prefetch_factor':self.c['dataloader_prefetch'],'dataloader_persistent_workers':True} if workers else {}
+        args=backend.SFTConfig(output_dir=str(self.root/'trainer-scratch'),per_device_train_batch_size=microbatch,gradient_accumulation_steps=accumulation,max_steps=remaining,bf16=True,fp16=False,gradient_checkpointing=False,remove_unused_columns=False,max_length=self.c['max_sequence'],packing=False,dataset_kwargs={'skip_prepare_dataset':True},dataloader_num_workers=workers,dataloader_pin_memory=False,save_strategy='no',logging_steps=10,report_to='none',max_grad_norm=self.c['clip_norm'],warmup_ratio=0,seed=self.c['seed'],ignore_data_skip=True,lr_scheduler_type='cosine',**loader_options)
         class FormalStudio(backend.UnslothTrainer):
             def run_formal(self):
                 self.model=campaign.model; self.tokenizer=campaign.model.tokenizer; self.load_in_4bit=False; self.is_vlm=False; self.is_audio=False
@@ -384,6 +415,7 @@ class Campaign:
         write(self.root/'INSTRUCTOR_FORMAT_PROBE.json',result); self.store.small_file(self.root/'INSTRUCTOR_FORMAT_PROBE.json','instructor-format-probe')
     def run_formal(self,profile,require_recovery=True):
         from .teacher import eligibility
+        if profile.get('binding')!=self.bound: raise ValueError('Qualification source/data/policy binding differs')
         eligibility(self.c)
         if require_recovery:
             proof=read(self.root/'FULL_RECOVERY_PROOF.json') if (self.root/'FULL_RECOVERY_PROOF.json').exists() else {}
@@ -404,6 +436,7 @@ class Campaign:
         emit('storage_profile',**read(self.root/'STORAGE_PROFILE.json'))
         if not self.state.get('completed_stages') and self.state['stage']=='initial':
             self.budget.check(profile['projected_hours']*3600)
+            self.check_wall_budget(profile['projected_hours']*3600)
         self.qualify_instructor_format()
         if not (self.root/'BASELINE.json').exists():
             base=self.evaluate('dev','pretrained-native-baseline',generate=True); write(self.root/'BASELINE.json',base); self.store.small_file(self.root/'BASELINE.json','baseline')

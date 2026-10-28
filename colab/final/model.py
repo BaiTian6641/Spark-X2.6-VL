@@ -32,6 +32,49 @@ def install_spark_sdpa(spark):
     sdpa._spark_native_sdpa=True; sdpa._spark_reference=reference
     module.eager_attention_forward=sdpa
 
+SYSTEM_PROMPT = ('You are Spark, an English and Chinese multimodal assistant. Use the supplied media and clocks. '
+                 'Report uncertainty when capture time or evidence is unknown.')
+
+
+class ChatFormat:
+    """Exact non-thinking Spark layout with media inside the first user turn."""
+
+    def __init__(self, tokenizer, system=SYSTEM_PROMPT):
+        self.tok = tokenizer
+        marks = ['\x01S\x01', '\x01U1\x01', '\x01A1\x01', '\x01U2\x01', '\x01A2\x01']
+        messages = [{'role': 'system', 'content': marks[0]}, {'role': 'user', 'content': marks[1]},
+                    {'role': 'assistant', 'content': marks[2]}, {'role': 'user', 'content': marks[3]},
+                    {'role': 'assistant', 'content': marks[4]}]
+        text = tokenizer.apply_chat_template(messages, tokenize=False, enable_thinking=False)
+        positions = [text.index(mark) for mark in marks]
+        if positions != sorted(positions):
+            raise ValueError('Unexpected Spark chat-template ordering')
+        self.system_block = text[:positions[0]] + system + text[positions[0] + len(marks[0]):positions[1]]
+        self.user_to_bot = text[positions[1] + len(marks[1]):positions[2]]
+        self.bot_to_user = text[positions[2] + len(marks[2]):positions[3]]
+        self.bot_close = text[positions[4] + len(marks[4]):]
+        if not self.bot_to_user.startswith(self.bot_close):
+            raise ValueError('Assistant close marker is inconsistent')
+        self.user_open = self.bot_to_user[len(self.bot_close):]
+        generated = tokenizer.apply_chat_template(messages[:2], tokenize=False,
+                                                  add_generation_prompt=True, enable_thinking=False)
+        expected = self.system_block.replace(system, marks[0]) + marks[1] + self.user_to_bot
+        if generated != expected:
+            raise ValueError('Generation prompt differs from the training layout')
+        self.cache = {}
+
+    def ids(self, text):
+        if text not in self.cache:
+            self.cache[text] = self.tok(text, add_special_tokens=False).input_ids
+        return list(self.cache[text])
+
+    def encode(self, prompt):
+        """Return system/user-open ids and user-content/non-thinking-bot-open ids."""
+        pre = self.ids(self.system_block)
+        # Tokenize content separately so no special tokens are synthesized.
+        post = self.tok(prompt, add_special_tokens=False).input_ids + self.ids(self.user_to_bot)
+        return pre, post
+
 class Resampler(nn.Module):
     def __init__(self,dim,hidden,n,heads=8):
         super().__init__(); self.input=nn.Linear(dim,hidden); self.queries=nn.Parameter(torch.randn(n,hidden)*.02)
@@ -69,6 +112,7 @@ class SparkNative(nn.Module):
         install_spark_sdpa(self.spark)
         self.tokenizer=AutoTokenizer.from_pretrained(paths['spark'],trust_remote_code=True,local_files_only=True)
         if self.tokenizer.pad_token_id is None: self.tokenizer.pad_token=self.tokenizer.eos_token
+        self.chat = ChatFormat(self.tokenizer)
         self.config=self.spark.config; self.config.use_cache=False; self.generation_config=self.spark.generation_config
         self.vision=(Siglip2VisionModel.from_pretrained(paths['vision'],local_files_only=True,torch_dtype=torch.float32) if pretrained else Siglip2VisionModel(Siglip2VisionConfig.from_pretrained(paths['vision'],local_files_only=True)))
         # Pooling heads are not part of the dense patch interface.
@@ -163,23 +207,26 @@ class SparkNative(nn.Module):
             if not candidates: raise ValueError('Actual visual grids cannot fit the qualified token budget')
             u=max(candidates,key=count); u['patches']=max(64,u['patches']//2)
             u['batch']=self.image_processor(images=u['image'],return_tensors='pt',max_num_patches=u['patches'])
-        for unit in units:
-            fi,vi,box=unit['frame'],unit['view'],unit['box']
-            batch={k:v.to(self.device) for k,v in unit['batch'].items()}
+        outputs=[None]*len(units); groups={}
+        for index,unit in enumerate(units): groups.setdefault(unit['patches'],[]).append((index,unit))
+        for _,items in sorted(groups.items()):
+            batch={k:torch.cat([u['batch'][k] for _,u in items],dim=0).to(self.device) for k in ('pixel_values','pixel_attention_mask','spatial_shapes')}
             features=self.vision(**batch).last_hidden_state
-            hh,ww=(int(x) for x in batch['spatial_shapes'][0])
-            tokens,_=spatial_downshuffle(features,hh,ww); tokens=self.vision_projector(tokens)
-            gh,gw=(hh+1)//2,(ww+1)//2
-            yy,xx=torch.meshgrid(torch.arange(gh,device=self.device),torch.arange(gw,device=self.device),indexing='ij')
-            xx,yy=xx.flatten().float(),yy.flatten().float(); xmin,ymin,xmax,ymax=box
-            x0=2*xx/ww; x1=torch.clamp(2*xx+2,max=ww)/ww
-            y0=2*yy/hh; y1=torch.clamp(2*yy+2,max=hh)/hh
-            x=xmin+(x0+x1)/2*(xmax-xmin); y=ymin+(y0+y1)/2*(ymax-ymin)
-            bw=(x1-x0)*(xmax-xmin); bh=(y1-y0)*(ymax-ymin)
-            time=float(times[fi]); cap=capture[fi] if capture is not None and fi<len(capture) else None
-            clock=[time/60,math.sin(time),math.cos(time),0. if cap is None else float(cap)/3600,0. if cap is None else 1.]
-            coord=torch.stack([x,y,bw,bh,torch.full_like(x,float(fi)),*([torch.full_like(x,v) for v in clock]),torch.full_like(x,float(vi)),torch.full_like(x,float(vi==0))],dim=-1)
-            outputs.append(tokens+self.spatial_clock(coord[None])+self.modality.weight[0])
+            for position,(index,unit) in enumerate(items):
+                fi,vi,box=unit['frame'],unit['view'],unit['box']
+                hh,ww=(int(x) for x in batch['spatial_shapes'][position])
+                tokens,_=spatial_downshuffle(features[position:position+1],hh,ww); tokens=self.vision_projector(tokens)
+                gh,gw=(hh+1)//2,(ww+1)//2
+                yy,xx=torch.meshgrid(torch.arange(gh,device=self.device),torch.arange(gw,device=self.device),indexing='ij')
+                xx,yy=xx.flatten().float(),yy.flatten().float(); xmin,ymin,xmax,ymax=box
+                x0=2*xx/ww; x1=torch.clamp(2*xx+2,max=ww)/ww
+                y0=2*yy/hh; y1=torch.clamp(2*yy+2,max=hh)/hh
+                x=xmin+(x0+x1)/2*(xmax-xmin); y=ymin+(y0+y1)/2*(ymax-ymin)
+                bw=(x1-x0)*(xmax-xmin); bh=(y1-y0)*(ymax-ymin)
+                time=float(times[fi]); cap=capture[fi] if capture is not None and fi<len(capture) else None
+                clock=[time/60,math.sin(time),math.cos(time),0. if cap is None else float(cap)/3600,0. if cap is None else 1.]
+                coord=torch.stack([x,y,bw,bh,torch.full_like(x,float(fi)),*([torch.full_like(x,v) for v in clock]),torch.full_like(x,float(vi)),torch.full_like(x,float(vi==0))],dim=-1)
+                outputs[index]=tokens+self.spatial_clock(coord[None])+self.modality.weight[0]
         return torch.cat(outputs,dim=1) if outputs else None
     def motion_tokens(self,frames):
         if not frames: return None
@@ -218,21 +265,25 @@ class SparkNative(nn.Module):
         times=torch.cat(clocks)
         position=self.audio_clock(torch.stack([times/30,torch.sin(times),torch.cos(times),torch.ones_like(times)],dim=-1))[None]
         return self.sound_projector(torch.cat(parts,dim=1),position=position)+self.modality.weight[3]
-    def prompt_ids(self,prompt):
-        messages=[{'role':'system','content':'You are Spark, an English and Chinese multimodal assistant. Use the supplied media and clocks. Report uncertainty when capture time or evidence is unknown.'},{'role':'user','content':prompt}]
-        return self.tokenizer.apply_chat_template(messages,tokenize=True,add_generation_prompt=True,return_tensors='pt').to(self.device)
+    def prompt_parts(self,prompt):
+        pre,post=self.chat.encode(prompt)
+        return (torch.tensor(pre,device=self.device,dtype=torch.long)[None],
+                torch.tensor(post,device=self.device,dtype=torch.long)[None])
     def prefix(self,row,media):
         if row['_family'].endswith('_out') and any(media[k] is not None for k in ('audio','motion')): raise ValueError('Output target leaked into input encoder')
-        parts=[]
+        pre,post=self.prompt_parts(row['prompt'])
+        parts=[self.get_input_embeddings()(pre)]
         for x in (self.image_tokens(media['images'],media['times'],media['capture_times']),self.motion_tokens(media['motion']),self.audio_tokens(media['audio'],row['_family'])):
             if x is not None: parts.append(x)
-        ids=self.prompt_ids(row['prompt']); parts.append(self.get_input_embeddings()(ids)); return torch.cat(parts,dim=1)
+        parts.append(self.get_input_embeddings()(post)); return torch.cat(parts,dim=1)
     def hidden_states(self,embeds):
+        return self.hidden_batch(embeds,torch.ones(embeds.shape[:2],device=self.device,dtype=torch.long))
+    def hidden_batch(self,embeds,mask):
         if embeds.shape[1]>self.policy['max_sequence']: raise ValueError('Input exceeds qualified context; no silent truncation')
-        return self.spark.model(inputs_embeds=embeds,attention_mask=torch.ones(embeds.shape[:2],device=self.device,dtype=torch.long),use_cache=False,return_dict=True).last_hidden_state
+        return self.spark.model(inputs_embeds=embeds,attention_mask=mask,use_cache=False,return_dict=True).last_hidden_state
     def text_loss(self,row,media):
         prefix=self.prefix(row,media)
-        ids=self.tokenizer(row['answer']+self.tokenizer.eos_token,add_special_tokens=False,return_tensors='pt').input_ids.to(self.device)
+        ids=self.tokenizer(row['answer']+self.chat.bot_close,add_special_tokens=False,return_tensors='pt').input_ids.to(self.device)
         if ids.shape[1]>self.policy['max_answer_tokens'] or prefix.shape[1]+ids.shape[1]>self.policy['max_sequence']: raise ValueError('Supervision would be truncated; revise a versioned context policy')
         embeds=torch.cat([prefix,self.get_input_embeddings()(ids)],dim=1)
         hidden=self.hidden_states(embeds)[:,prefix.shape[1]-1:-1]; total=hidden.new_zeros((),dtype=torch.float32)
@@ -243,6 +294,45 @@ class SparkNative(nn.Module):
             def ce(x,y): return F.cross_entropy(self.get_output_embeddings()(x).float().reshape(-1,self.config.vocab_size),y.flatten(),reduction='sum')
             total=total+checkpoint(ce,hs,labels,use_reentrant=False)
         return total/ids.numel(),ids.numel()
+    def text_batch_loss(self,examples):
+        """One padded Spark forward for text-producing records; per-record CE."""
+        prepared=[]
+        for row,media in examples:
+            prefix=self.prefix(row,media)
+            ids=self.tokenizer(row['answer']+self.chat.bot_close,add_special_tokens=False,return_tensors='pt').input_ids.to(self.device)
+            if ids.shape[1]>self.policy['max_answer_tokens'] or prefix.shape[1]+ids.shape[1]>self.policy['max_sequence']:
+                raise ValueError('Supervision would be truncated; revise a versioned context policy')
+            prepared.append((prefix,self.get_input_embeddings()(ids),ids))
+        width=max(prefix.shape[1]+answer.shape[1] for prefix,answer,_ in prepared)
+        embeds=torch.zeros(len(prepared),width,self.hidden,device=self.device,dtype=prepared[0][0].dtype)
+        mask=torch.zeros(len(prepared),width,device=self.device,dtype=torch.long)
+        for i,(prefix,answer,_) in enumerate(prepared):
+            length=prefix.shape[1]+answer.shape[1]
+            embeds[i,:length]=torch.cat([prefix,answer],dim=1)[0]
+            mask[i,:length]=1
+        hidden=self.hidden_batch(embeds,mask)
+        from torch.utils.checkpoint import checkpoint
+        losses=[]; units=[]
+        for i,(prefix,_,ids) in enumerate(prepared):
+            start=prefix.shape[1]-1; count=ids.shape[1]
+            hs=hidden[i:i+1,start:start+count]; total=hidden.new_zeros((),dtype=torch.float32)
+            for offset in range(0,count,128):
+                def ce(x,y): return F.cross_entropy(self.get_output_embeddings()(x).float().reshape(-1,self.config.vocab_size),y.flatten(),reduction='sum')
+                total=total+checkpoint(ce,hs[:,offset:offset+128],ids[:,offset:offset+128],use_reentrant=False)
+            losses.append(total/count); units.append(count)
+        return losses,units
+    def forward(self,examples=None,**kwargs):
+        if not examples or len(examples)>self.policy.get('microbatch_size',1):
+            raise ValueError('Microbatch exceeds the qualified source-record bound')
+        losses=[None]*len(examples); units=[0]*len(examples)
+        text=[i for i,(row,_) in enumerate(examples) if not row['_family'].endswith('_out')]
+        if text:
+            values,counts=self.text_batch_loss([examples[i] for i in text])
+            for i,value,count in zip(text,values,counts): losses[i],units[i]=value,count
+        for i,(row,media) in enumerate(examples):
+            if row['_family'].endswith('_out'): losses[i],units[i]=self.loss(row,media)
+        per_example=torch.stack(losses)
+        return {'loss':per_example.mean(),'per_example_loss':per_example,'supervised_units':sum(units)}
     def loss(self,row,media):
         fam=row['_family']
         if fam.endswith('_out'):
@@ -250,20 +340,21 @@ class SparkNative(nn.Module):
             if fam=='speech_out': return self.speech_out.loss(hidden,media['target_audio'],row)
             return self.sound_out.loss(hidden,media['target_audio'],row)
         return self.text_loss(row,media)
-    def forward(self,examples=None,**kwargs):
-        if not examples or len(examples)!=1: raise ValueError('Qualified microbatch is one source record')
-        row,media=examples[0]; loss,n=self.loss(row,media)
-        return {'loss':loss,'supervised_units':n}
     @torch.no_grad()
     def answer(self,row,media,max_new_tokens=None):
         if max_new_tokens is None:
             max_new_tokens=1024 if row['task'] in ('document_ocr','music_instrument_note_understanding') else (512 if row['task'] in ('factual_caption','image_caption','video_caption','video_box_tracking','region_dense_video_caption') else 256)
-        embeds=self.prefix(row,media); generated=[]
+        embeds=self.prefix(row,media); generated=[]; past=None; state=None; length=embeds.shape[1]
         for _ in range(max_new_tokens):
-            if embeds.shape[1]>=self.policy['max_sequence']: break
-            hidden=self.hidden_states(embeds); token=self.get_output_embeddings()(hidden[:,-1:]).argmax(-1)
+            if length+len(generated)>=self.policy['max_sequence']: break
+            if past is None:
+                output=self.spark.model(inputs_embeds=embeds,use_cache=True,return_dict=True)
+            else:
+                output=self.spark.model(inputs_embeds=state,past_key_values=past,use_cache=True,return_dict=True)
+            past=output.past_key_values
+            token=self.get_output_embeddings()(output.last_hidden_state[:,-1:]).argmax(-1)
             if token.item()==self.tokenizer.eos_token_id: break
-            generated.append(token.item()); embeds=torch.cat([embeds,self.get_input_embeddings()(token)],dim=1)
+            generated.append(token.item()); state=self.get_input_embeddings()(token)
         return self.tokenizer.decode(generated,skip_special_tokens=True)
     @torch.no_grad()
     def generate_audio(self,row,media,seconds=None,steps=50):

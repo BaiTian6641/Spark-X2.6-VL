@@ -43,6 +43,13 @@ def validate_config(c):
     if c['cache_bytes_per_component']*10 > 24_000_000_000: raise ValueError('Global media cache exceeds its reservation')
     if c['checkpoint_slots']!=2 or c['drive_cap_bytes']>2_000_000_000_000: raise ValueError('Storage contract changed')
     if c['gradient_accumulation']<1 or c['max_sequence']>4096: raise ValueError('Unqualified batch/sequence policy')
+    microbatch=c.get('microbatch_size',1)
+    if microbatch not in (1,2,4,8) or c['gradient_accumulation']%microbatch:
+        raise ValueError('Microbatch must divide the effective eight-record optimizer batch')
+    if not 0<=c.get('dataloader_workers',0)<=16 or not 1<=c.get('dataloader_prefetch',1)<=8:
+        raise ValueError('Invalid DataLoader worker/prefetch policy')
+    if not 0<c.get('max_wall_hours',110)<=110 or not 0<=c.get('direct_wall_hours',0)<=24:
+        raise ValueError('Campaign wall budget is 110 hours; each Colab session is at most 24 hours')
     if any(k in c for k in ('HF_TOKEN','OPENCODE_API_KEY','token','api_key')): raise ValueError('Secrets do not belong in configuration')
     return c
 

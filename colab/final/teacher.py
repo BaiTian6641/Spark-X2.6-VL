@@ -19,15 +19,9 @@ SYSTEM=('You are the external instructor for an English/Chinese multimodal train
         'This request only changes replay priority of the original source record; no answer/prompt edits.')
 
 def eligibility(config):
-    # Direct one-shot mode treats instructor use as an explicit operator choice.
-    # The API key and the $50 ledger remain mandatory; no prior-VM eligibility
-    # receipt is needed to start the configured RSI rounds.
-    if config.get('instructor_enabled') is True:
-        return {'provider':'OpenCode Go','model':MODEL,'endpoint':ENDPOINT,
-                'permits_dataset_review':True,'mode':'operator-enabled'}
     receipt=config.get('instructor_route_eligibility_receipt')
     if not isinstance(receipt,dict) or receipt.get('provider')!='OpenCode Go' or receipt.get('model')!=MODEL or receipt.get('endpoint')!=ENDPOINT or receipt.get('permits_dataset_review') is not True or not receipt.get('evidence_url') or not receipt.get('checked_at'):
-        raise RuntimeError('Instructor use is disabled. Set instructor_enabled=true for direct mode or supply an eligibility receipt.')
+        raise RuntimeError('Instructor route eligibility is unverified. Supply actual provider/account evidence that this OpenCode Go route permits the bounded dataset-review workload; an API key alone is insufficient.')
     return receipt
 
 def content(row,media,student):

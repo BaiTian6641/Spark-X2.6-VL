@@ -106,6 +106,7 @@ def qualify(campaign):
     # command-line entry point also performs this in a NEW process/VM on resume.
     profile={'schema_version':1,'passed':True,'scope':'actual whole-model CUDA profile; new-process recovery is still a separate gate','device':prop.name,'gpu_bytes':prop.total_memory,'peak_allocated':torch.cuda.max_memory_allocated(),'peak_reserved':torch.cuda.max_memory_reserved(),'host_available':psutil.virtual_memory().available,'census':census(model),'kernel_parity':kernel_parity,'changed_tensors_by_group':dict(changed),'spark_all_parameters_reached':True,'family_steps':dict(exposure),'studio_full_optimizer_updates':1,'studio_mixed_microbatches':len(mixed_order),'studio_checkpoint_receipt':studio_receipt,'warmup_updates_each':5,'timed_updates_each':30,'seconds_per_record_p90':{f:sorted(v)[math.ceil(.9*len(v))-1] for f,v in timings.items()},'complete_checkpoint_bytes':bytes_,'qualification_initial_receipt':initial,'qualification_complete_receipt':full,'initial_parameter_samples_sha256':identity(before),'full_parameter_samples_sha256':identity(after),'fresh_vm_recovery':False}
     profile['qualification_process']=process_identity()
+    profile['binding']=campaign.bound
     profile['scope']='actual whole-model CUDA profile; new-process checkpoint continuation is a separate gate'
     # Record two actual continuation updates as the recovery oracle.
     next_ids=[by_family['image'][0],by_family['sound_out'][0]]; continuation=[]
@@ -123,7 +124,8 @@ def qualify(campaign):
         seconds=sum(n*profile['seconds_per_record_p90'][fam] for fam,n in counts.items()); projected+=seconds
         stages.append({'stage':stage['name'],'records':len(order),'by_family':dict(counts),'conservative_training_seconds':seconds})
     # Reserve 25% for checkpoint transfers, evaluation, teacher waits and controls.
-    profile.update(stages=stages,projected_hours=projected*1.25/3600,projected_cu=projected*1.25/3600*c['observed_cu_per_hour'],projection_policy='p90 full-resident per-record forward/backward/step, plus25%; not a guarantee or automatic curriculum trim')
+    rate=c.get('observed_cu_per_hour')
+    profile.update(stages=stages,projected_hours=projected*1.25/3600,projected_cu=(projected*1.25/3600*rate if rate else None),projection_policy='p90 full-resident per-record forward/backward/step, plus25%; not a guarantee or automatic curriculum trim')
     write(root/'QUALIFICATION.json',profile); profile_receipt=campaign.store.small_file(root/'QUALIFICATION.json','qualification-profile')
     write(root/'QUALIFICATION_RECEIPT.json',profile_receipt)
     emit('qualification_complete',initial_receipt=initial,profile_receipt=profile_receipt,complete_checkpoint_receipt=full,projected_hours=profile['projected_hours'],projected_cu=profile['projected_cu'],next_action='Keep this G4 VM and run train in the next cell. A new subprocess verifies checkpoint continuation, then restores the initial snapshot before formal training.')

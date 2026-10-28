@@ -1,0 +1,249 @@
+{
+  "schema_version": 1,
+  "status": "full_git_one_click_ready_for_g4_qualification",
+  "execution_enabled": true,
+  "execution_prerequisite": "whole_model_qualification_fresh_process_recovery_and_instructor_route_eligibility",
+  "canonical_notebook": "colab/Spark_Formal_Full_Finetune.ipynb",
+  "runtime": "colab/final",
+  "source_checkout": "full_git_repository_with_tracked_source_digest",
+  "initialization": {
+    "backbone": "XHToken/Spark-X2.6-4B",
+    "backbone_revision": "66e3ae7bee54e0a523d692cb8ef841f35409807b",
+    "revision_receipt": "evidence/colab-original-spark-revision.json",
+    "mode": "original_pretrained_backbone_and_pretrained_components_new_bridges",
+    "existing_trained_checkpoint_upload": false,
+    "old_checkpoint_location": "workstation_only",
+    "download_original_weights_inside_colab": true
+  },
+  "storage": {
+    "drive_folder_id": "1ELmWWHxpCb3IGM2LZDQV-u7NiLxK12T_",
+    "project_cap_bytes": 2000000000000,
+    "active_working_root": "/content/spark-formal",
+    "training_from_drive_mount": false,
+    "transport": "private_huggingface_commits_with_size_sha256_and_preserved_history",
+    "source_shard_target_bytes": [
+      1073741824,
+      2147483648
+    ],
+    "old_local_checkpoint_deletion": false,
+    "permanent_artifacts_only_on_drive": false,
+    "random_read_write_on_drive": false,
+    "local_free_reserve_bytes": 44000000000,
+    "caption_restore_min_free_bytes": "legacy Drive extraction route only; HF indexed TAR path has no extracted duplicate",
+    "new_caption_artifact_transport": "HF full source uploaded; live pinned network proof tracked in evidence",
+    "storage_policy": "colab/formal/storage_policy.json",
+    "native_video_audio_rolling_loader": "worker_owned_leased_tar_readers_and_contiguous_optimizer_committed_cursor",
+    "dataset_distribution": "public_pinned_huggingface_direct_http_range",
+    "dataset_repo": "TassP0lar/SparkX2.6-MM",
+    "dataset_commit": "f472f980a6c95d3e9844f27e6045c8c09b21536a",
+    "dataset_release": "releases/full-ft-v1",
+    "dataset_catalogue_revision": "b8ddb27084b0aec0daf28bf5c67075f4f516eb6a",
+    "local_disk_planned_capacity_bytes": 230000000000,
+    "local_disk_profiles": "colab/formal/hf_storage_profiles.json",
+    "drive_role": "not_used",
+    "checkpoint_slots": 2,
+    "checkpoint_slot_initial_bytes": 44000000000,
+    "bounded_media_cache_bytes": 23000000000,
+    "cpu_notebook": "colab/Spark_HF_Rolling_Cache_CPU.ipynb",
+    "cpu_source_commit": "6d5fb34cbb6c63db100b9996a3ff7c231f26fd16",
+    "cpu_notebook_publication_commit": "7f2ca1b79f9570709648d01537751712cd3b4dc1"
+  },
+  "compute": {
+    "max_wall_hours": 110,
+    "session_wall_hours": 22,
+    "curriculum_shortening_allowed": false,
+    "projection": "whole_model_family_p90_plus_25_percent_transfer_evaluation_teacher_control_reserve",
+    "observed_planning_cu_per_hour": 8.71,
+    "proposed_topup_cu": 500,
+    "purchase_verified": false,
+    "ultra_scenario_cu": 1000,
+    "ultra_subscription_verified": false,
+    "automatically_add_scenarios": false,
+    "active_allocated_cu": null,
+    "must_observe_actual_balance_and_rate": true,
+    "uncertainty_reserve_fraction": 0.15,
+    "proposed_project_allocation_cu": 1000,
+    "latest_observed_available_cu": 1098.65,
+    "latest_observation_local": "2026-10-27 approximately 15:03 CDT",
+    "latest_observed_cu_per_hour": 0,
+    "latest_active_sessions": 0,
+    "latest_observed_subscription_label": "Colab Pro+",
+    "subscription_purchase_not_inferred": true
+  },
+  "teacher": {
+    "provider": "OpenCode",
+    "model": "mimo-v2.6-pro",
+    "secret_name": "OPENCODE_API_KEY",
+    "total_budget_usd": 50,
+    "allocation_usd": {
+      "qualification": 3,
+      "data_review": 22,
+      "rsi_round_1": 10,
+      "rsi_round_2": 10,
+      "reserve": 5
+    },
+    "max_concurrency": 1,
+    "route_batch_eligibility": "unverified",
+    "broad_modality_competence": "unverified",
+    "requests_made_by_preflight": 0,
+    "cash_list_allowance_accounted_separately": true,
+    "route": "OpenCode Go",
+    "endpoint": "https://opencode.ai/inference/go/openai/v1/chat/completions",
+    "current_formal_readiness": "not_observed_queued_cell_unexecuted_when_VM_disconnected",
+    "current_formal_readiness_requests_observed": 0,
+    "bulk_annotation_enabled": false
+  },
+  "rsi": {
+    "max_adaptive_rounds": 2,
+    "independent_verifier_required": true,
+    "promotion_gain_points": 5,
+    "max_established_slice_regression_points": 3,
+    "max_text_perplexity_relative_increase": 0.05,
+    "matched_static_or_continued_training_control_required_for_recursion_claim": true,
+    "sealed_test_after_winner_lock_only": true,
+    "arbitrary_teacher_code_execution": false
+  },
+  "implementation_gates": [
+    {
+      "id": "C0",
+      "name": "infrastructure_preflight",
+      "status": "passed_real_colab_preflight_and_drive_byte_probe",
+      "evidence": "evidence/colab_stage1_drive_release.json"
+    },
+    {
+      "id": "C1",
+      "name": "cuda_port_and_all_native_branches",
+      "status": "partial",
+      "passed": "actual Studio backend and full-parameter image/ordered-frame CUDA updates",
+      "remaining": [
+        "native motion encoder",
+        "audio input encoders",
+        "native speech output",
+        "native general-sound output"
+      ]
+    },
+    {
+      "id": "C2",
+      "name": "revised_corpus_and_teacher_qualification",
+      "status": "in_progress",
+      "caption_source_progress_file": "data/colab_formal_v2/pixmo_cap/acquisition-progress.json",
+      "remaining": [
+        "completed acquisition and source grouping",
+        "caption quality review",
+        "bilingual task/source mixture",
+        "real video/audio datasets",
+        "teacher route workload eligibility and competence"
+      ]
+    },
+    {
+      "id": "C3",
+      "name": "whole_model_profile_and_fresh_session_resume",
+      "status": "partial",
+      "passed": "8-to-10 update same-VM new-process optimizer/scheduler/RNG continuation",
+      "fresh_vm_recovery": "not_passed_no_observed_receipt_before_VM_disconnected",
+      "remaining": [
+        "fresh-VM restore and two continued updates receipt",
+        "all-native-component mixed-task profile",
+        "exact uninterrupted trajectory comparison"
+      ]
+    }
+  ],
+  "training_stages": [
+    {
+      "id": "S1",
+      "name": "alignment",
+      "status": "not_started"
+    },
+    {
+      "id": "S2",
+      "name": "image_spatial_ocr_full",
+      "status": "not_started"
+    },
+    {
+      "id": "S3",
+      "name": "video_time_full",
+      "status": "not_started"
+    },
+    {
+      "id": "S4",
+      "name": "audio_input_av_full",
+      "status": "not_started"
+    },
+    {
+      "id": "S5",
+      "name": "native_speech_and_sound_output",
+      "status": "not_started"
+    },
+    {
+      "id": "S6",
+      "name": "joint_full",
+      "status": "not_started"
+    },
+    {
+      "id": "R1",
+      "name": "instructed_round_one",
+      "status": "not_started"
+    },
+    {
+      "id": "R2",
+      "name": "instructed_round_two",
+      "status": "not_started"
+    },
+    {
+      "id": "S7",
+      "name": "final_audit_and_export",
+      "status": "not_started"
+    }
+  ],
+  "completion": "all_required_capability_gates_pass_and_complete_model_reloads",
+  "on_failed_gate": "retain_best_parent_and_export_explicit_partial_status",
+  "reference_plan": "reports/spark_multimodal/COLAB_CAMPAIGN_PLAN.md",
+  "status_updated_utc": "2026-10-27T19:04:27.239499+00:00",
+  "formal_source_preparation": {
+    "version": "formal_v2_pixmo_cap",
+    "source_revision": "edce6390d9d5be6c8db0d863fbe62718c88988a4",
+    "target_distinct_processed_images": 102000,
+    "candidate_images": 200000,
+    "caption_language": "en",
+    "progress_snapshot": {
+      "accepted_unique_processed_images": 12310,
+      "accounted_staging_bytes_upper_bound": 3322937399,
+      "attempted": 14880,
+      "created_utc": "2026-10-27T19:04:03.701633+00:00",
+      "rejections": {
+        "ChunkedEncodingError": 1,
+        "ConnectTimeout": 7,
+        "ConnectionError": 8,
+        "DecompressionBombWarning": 1,
+        "HTTPError": 2156,
+        "ReadTimeout": 6,
+        "SSLError": 25,
+        "UnidentifiedImageError": 70,
+        "ValueError": 218,
+        "duplicate_processed_pixels": 7,
+        "gaierror": 71
+      },
+      "seconds": 1795.4441210229998,
+      "stage": "formal_caption_media_acquisition",
+      "target": 102000,
+      "teacher_requests": 0,
+      "training_ready": false
+    },
+    "quality_pass": false,
+    "training_ready": false,
+    "source_release_record": "output/colab_formal_preparation_v2/release-r4.json",
+    "local_split_and_shard_worker": "running_waiting_for_successful_acquisition"
+  },
+  "multimodal_refinement": {
+    "scope": "multimodal parts only of plan24; other-project native memory/nested learning excluded",
+    "review": "reports/spark_multimodal/REFINEMENT_MULTIMODAL_REVIEW_2026-10-27.md",
+    "vision_encoder": "google/siglip2-so400m-patch16-naflex",
+    "vision_revision": "cc24074f717b612951c2dead130904ab9b65a81e",
+    "downshuffle_factor": 2,
+    "image_reduced_token_ceiling_candidate": 768,
+    "principal_stages_full_spark_parameter_updates": true,
+    "native_speech_and_general_sound_output_required": true,
+    "grounded_grpo": "deferred_separate_budget_after_SFT",
+    "ordinary_resume_resets_optimizer": false
+  }
+}
