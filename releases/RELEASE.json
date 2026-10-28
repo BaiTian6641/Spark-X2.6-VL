@@ -1,0 +1,18 @@
+{
+  "schema_version": 2,
+  "notebook": {
+    "path": "colab/Spark_Formal_Full_Finetune.ipynb",
+    "bytes": 19679,
+    "sha256": "7613359b8f67a6e7c1abcd0bf4f5cd51c29dfc220512a7a78d31052f3d854f00"
+  },
+  "source_archive": {
+    "path": "releases/spark-formal-runtime.zip",
+    "bytes": 5000398,
+    "sha256": "1d290e5e373e80b27c81b20eb43e97f1880a8c8f7a4d9b81a4d99ae39d2f0fdc",
+    "github_commit": "b2bd280613bf1b82727513265cc5d154e1b7d8bd",
+    "url": "https://raw.githubusercontent.com/BaiTian6641/Spark-X2.6-VL/b2bd280613bf1b82727513265cc5d154e1b7d8bd/releases/spark-formal-runtime.zip"
+  },
+  "source_files": 40,
+  "training_executed": false,
+  "instructor_requests_made": 0
+}
