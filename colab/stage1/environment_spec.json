@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "stage": "cuda_studio_qualification_v1",
+  "status": "dependency_resolved_cuda_execution_pending",
+  "python_minor": "3.13",
+  "pytorch_backend": "CUDA 13.0",
+  "uv": {
+    "version": "0.13.6",
+    "url": "https://files.pythonhosted.org/packages/5c/43/0688ff5142934238f2812e348f4a24e09b57d48bfb38dd8f850325a0d9de/uv-0.13.6-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+    "sha256": "22759b8895e1103578de6fb4cd27e94b4399d021023378d29f01333717751fba",
+    "bytes": 17333810
+  },
+  "studio_mode": "actual_headless_training_backend_from_official_unsloth_wheel",
+  "full_studio_ui_extra_installed": false,
+  "transformers": "4.57.3",
+  "qwen_tts_model_training_tested": false,
+  "teacher_requests": 0,
+  "source_rocm_trainer_preserved": true
+}
