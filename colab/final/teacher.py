@@ -19,10 +19,15 @@ SYSTEM=('You are the external instructor for an English/Chinese multimodal train
         'This request only changes replay priority of the original source record; no answer/prompt edits.')
 
 def eligibility(config):
+    if config.get('instructor_enabled') is True:
+        if config.get('instructor_model',MODEL)!=MODEL:
+            raise ValueError('The configured instructor must be the explicitly selected mimo-v2.6-pro')
+        return {'provider':'OpenCode Go','model':MODEL,'endpoint':ENDPOINT,
+                'permits_dataset_review':True,'mode':'operator-selected',
+                'route_eligibility':'not independently verified','multimodal_competence':'not established'}
     receipt=config.get('instructor_route_eligibility_receipt')
     if not isinstance(receipt,dict) or receipt.get('provider')!='OpenCode Go' or receipt.get('model')!=MODEL or receipt.get('endpoint')!=ENDPOINT or receipt.get('permits_dataset_review') is not True or not receipt.get('evidence_url') or not receipt.get('checked_at'):
-        raise RuntimeError('Instructor route eligibility is unverified. Supply actual provider/account evidence that this OpenCode Go route permits the bounded dataset-review workload; an API key alone is insufficient.')
-    return receipt
+        raise RuntimeError('Set instructor_enabled=true with instructor_model=mimo-v2.6-pro, or supply actual provider/account route evidence. An API key alone is not instructor competence evidence.')
 
 def content(row,media,student):
     import numpy as np, soundfile as sf

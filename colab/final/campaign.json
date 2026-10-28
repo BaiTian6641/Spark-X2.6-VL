@@ -117,6 +117,8 @@
   ],
   "evaluation_per_family_language": 32,
   "instructor_budget_usd": 50,
+  "instructor_enabled": true,
+  "instructor_model": "mimo-v2.6-pro",
   "instructor_rounds": 2,
   "instructor_records_per_round": 32,
   "instructor_per_request_reservation_usd": 0.5,

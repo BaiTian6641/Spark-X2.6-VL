@@ -91,7 +91,7 @@ def test_teacher_decisions_never_create_new_ground_truth():
     from colab.final.teacher import replay_orders,eligibility
     selected,control=replay_orders([('a',{'training_action':'replay_original','priority':3}),('b',{'training_action':'replay_original','priority':0})],3,8)
     assert len(selected)==len(control)==16 and set(selected)<=set(control)=={'a','b'}
-    with pytest.raises(RuntimeError): eligibility(CONFIG)
+    with pytest.raises(RuntimeError): eligibility({**CONFIG,'instructor_enabled':False})
 
 def test_family_language_objective_balances_supervision_without_dropping_rows():
     from colab.final.engine import loss_weights

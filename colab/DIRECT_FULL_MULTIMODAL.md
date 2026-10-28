@@ -18,7 +18,7 @@ The replacement `colab/oneshot` WSD schedule, 20-source expansion, 12 GB reserve
 ## Requirements
 
 - G4 / RTX PRO 6000 Blackwell with at least 90,000,000,000 GPU bytes and BF16.
-- `INSTRUCTOR_ROUTE_EVIDENCE`: actual provider/account eligibility receipt for the bounded OpenCode Go dataset-review route; an API key alone is not sufficient.
+- `INSTRUCTOR_MODEL`: defaults to `mimo-v2.6-pro`; this is an allowed operator selection, not independently verified provider eligibility or instructor competence.
 - Conservative 230 GB local-disk envelope; 44 GB non-borrowable free floor.
 - `HF_TOKEN`: component read access plus private model/checkpoint write access for `TassP0lar`.
 - `OPENCODE_API_KEY`: required for both instructor rounds; $50 cumulative ledger and uncertain-outcome stop remain enforced.

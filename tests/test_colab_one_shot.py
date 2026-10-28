@@ -32,7 +32,7 @@ class NotebookTests(unittest.TestCase):
         self.assertIn('"colab.final.run", "direct"', joined)
         self.assertIn('allow_codes=(DIRECT_QUALIFICATION_EXIT, DIRECT_SESSION_EXIT)', joined)
         self.assertIn('"drive_project_folder": None', joined)
-        self.assertIn('INSTRUCTOR_ROUTE_EVIDENCE', joined)
+        self.assertIn('INSTRUCTOR_MODEL', joined)
         for forbidden in ('colab.oneshot', 'spark-formal-runtime.zip', 'drive.mount(', 'run_campaign(\'cpu\')'):
             self.assertNotIn(forbidden, joined)
 
@@ -59,18 +59,15 @@ class NotebookTests(unittest.TestCase):
 
     def test_direct_config_is_valid_drive_free_and_bounded(self):
         cfg = dict(CONFIG)
-        receipt = {'provider': 'OpenCode Go', 'model': 'mimo-v2.6-pro',
-                   'endpoint': 'https://opencode.ai/inference/go/openai/v1/chat/completions',
-                   'permits_dataset_review': True, 'evidence_url': 'https://example.test/operator-evidence',
-                   'checked_at': '2026-10-27T00:00:00Z'}
         cfg.update(work_root='/content/spark-formal-test', drive_project_folder=None,
-                   instructor_route_eligibility_receipt=receipt,
+                   instructor_enabled=True, instructor_model='mimo-v2.6-pro',
+                   instructor_route_eligibility_receipt=None,
                    enforce_compute_budget=False, direct_wall_hours=22.0, max_wall_hours=110.0)
         validate_config(cfg)
         self.assertEqual(cfg['gradient_accumulation'] // cfg['microbatch_size'], 4)
         self.assertEqual(cfg['gradient_accumulation'], 8)
         from colab.final.teacher import eligibility
-        self.assertEqual(eligibility(cfg), receipt)
+        self.assertEqual(eligibility(cfg)['mode'], 'operator-selected')
         self.assertEqual(cfg['max_wall_hours'], 110)
     def test_wall_budget_stops_instead_of_shortening_curriculum(self):
         from colab.final.common import ComputeBudget

@@ -2,7 +2,7 @@
   "schema_version": 1,
   "status": "full_git_one_click_ready_for_g4_qualification",
   "execution_enabled": true,
-  "execution_prerequisite": "whole_model_qualification_fresh_process_recovery_and_instructor_route_eligibility",
+  "execution_prerequisite": "whole_model_qualification_and_fresh_process_recovery",
   "canonical_notebook": "colab/Spark_Formal_Full_Finetune.ipynb",
   "runtime": "colab/final",
   "source_checkout": "full_git_repository_with_tracked_source_digest",

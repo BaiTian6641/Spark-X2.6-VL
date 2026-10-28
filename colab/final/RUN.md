@@ -6,7 +6,7 @@ The canonical notebook clones the **full Git repository** and invokes `python -m
 
 The required wall budget is 110 cumulative GPU-hours. Optional actual CU observations add a second budget check. The 230-GB envelope uses two measured checkpoint slots, a 23-GB media cache, and a 44-GB free floor. No CPU-preflight notebook, Drive mount/API, or prior-VM user artifact is required; whole-model qualification and fresh-process recovery remain mandatory and are automated, not skipped. The complete 603,668-exposure curriculum and both matched RSI arms are never silently shortened.
 
-`INSTRUCTOR_ROUTE_EVIDENCE` remains a required provider/account receipt under `colab/final/teacher.py`. The earlier `instructor_enabled` shortcut is removed: an API key alone does not prove batch-review eligibility.
+`INSTRUCTOR_MODEL` defaults to `mimo-v2.6-pro`, an allowed operator selection. No provider-eligibility or multimodal-competence claim is inferred. Returned-model identity, source/target isolation, ledger, uncertain-outcome stop, and independent evaluation remain enforced.
 
 Historical sections below describe the earlier source-ZIP launcher and gated workflow. They remain implementation/evidence history, not the current one-click instructions.
 
