@@ -29,6 +29,17 @@ def test_actual_python_without_pip_recovers_and_repeated_setup_preserves_work(tm
     receipt = json.loads((target/'.spark-environment-ready.json').read_text())
     assert receipt['ready'] and receipt['recovered_python_without_pip']
     subprocess.run([result,'-I','-c',"import importlib.metadata as m; import requests, googleapiclient, transformers; assert m.version('pip') == '26.2.2'; assert m.version('transformers') == '4.57.3'"],check=True)
+    # Tokenizer-only CPU installs do not inherit Torch's Jinja dependency.
+    # Exercise the actual Transformers method used by the corpus audit.
+    subprocess.run([result,'-I','-c',"""
+from tokenizers import Tokenizer, models, pre_tokenizers
+from transformers import PreTrainedTokenizerFast
+backend=Tokenizer(models.WordLevel({'[UNK]':0,'hello':1},unk_token='[UNK]'))
+backend.pre_tokenizer=pre_tokenizers.Whitespace()
+tokenizer=PreTrainedTokenizerFast(tokenizer_object=backend,unk_token='[UNK]')
+tokenizer.chat_template="{% for message in messages %}{{ message['content'] }}{% endfor %}"
+assert tokenizer.apply_chat_template([{'role':'user','content':'hello'}],tokenize=True)==[1]
+"""],check=True)
     pip_source = target/'lib/python3.13/site-packages/pip/__init__.py'
     before = pip_source.stat().st_mtime_ns
     install_environment(work, ROOT, 'cpu')

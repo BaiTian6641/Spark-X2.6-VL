@@ -9,8 +9,8 @@
     },
     {
       "path": "colab/final/RUN.md",
-      "bytes": 18767,
-      "sha256": "7746bf301b9ea910802bfd5be0f78e221dfb3d004a99185e4e39c25c8940a81c"
+      "bytes": 19289,
+      "sha256": "9c4aa48abc0694df9b2025e69415a53258e79265dc153bc7eb57685b0209568f"
     },
     {
       "path": "colab/final/__init__.py",
@@ -104,13 +104,13 @@
     },
     {
       "path": "colab/final/requirements-preflight.in",
-      "bytes": 282,
-      "sha256": "5a10ae20923d4a4217cef7321eb7ec2649169f9fdef03454f3e8d3d5de7806ab"
+      "bytes": 386,
+      "sha256": "aa42139ed7f7d9f127dcc7e0f6e5108ce507bd0d0537a6967972a079fa52903e"
     },
     {
       "path": "colab/final/requirements-preflight.lock",
-      "bytes": 86281,
-      "sha256": "69de609cb0d458ec2f398ffb7433e4e1952e4096a933df3082b8d282d6870275"
+      "bytes": 99422,
+      "sha256": "5e7f42b31f74192a22d0f7ba7457e77815381a14f6d51182606c4ae43f336992"
     },
     {
       "path": "colab/final/requirements.in",
