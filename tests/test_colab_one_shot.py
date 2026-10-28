@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import re
 import tempfile
 import types
 import unittest
@@ -35,6 +36,22 @@ class NotebookTests(unittest.TestCase):
         self.assertIn('INSTRUCTOR_MODEL', joined)
         for forbidden in ('colab.oneshot', 'spark-formal-runtime.zip', 'drive.mount(', 'run_campaign(\'cpu\')'):
             self.assertNotIn(forbidden, joined)
+
+    def test_flashattention_lock_preserves_overlapping_main_versions(self):
+        def versions(path):
+            found = {}
+            for line in path.read_text().splitlines():
+                match = re.match(r'^([A-Za-z0-9_.-]+)==([^ ;\\]+)', line)
+                if match:
+                    found[match[1].lower().replace('_', '-')] = match[2]
+            return found
+        main = versions(ROOT / 'colab/final/requirements.lock')
+        supplemental = versions(ROOT / 'colab/final/requirements-flash-attn.lock')
+        self.assertIn('flash-attn-4', supplemental)
+        self.assertEqual(
+            {name: main[name] for name in main.keys() & supplemental.keys()},
+            {name: supplemental[name] for name in main.keys() & supplemental.keys()},
+        )
 
     def test_git_digest_covers_every_tracked_file(self):
         tree = ast.parse(self.code[2])

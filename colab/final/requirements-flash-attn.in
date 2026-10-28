@@ -1,6 +1,1 @@
 flash-attn-4[cu13]==4.0.0b36
-torch==2.11.0
-filelock==3.32.3
-fsspec==2026.7.0
-markupsafe==3.0.4
-networkx==3.6.1
