@@ -527,6 +527,7 @@ def recovery_check(campaign,profile):
             campaign.model,
             accum_mode='bf16_apollo_fp32_small',
             min_bf16_accum_dim=int(campaign.c.get('apollo_min_dim',128)),
+            allow_embeddings_in_apollo=bool(campaign.c.get('apollo_include_embeddings',False)),
         )
         try:
             for rid in expected['ids']:
