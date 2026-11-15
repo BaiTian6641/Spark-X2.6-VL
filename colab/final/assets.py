@@ -165,10 +165,14 @@ def prepare_local_synccraft_data(root,config,*,include_animation=True,panel_size
             raise ValueError('Existing dataset split differs; use a new campaign directory')
         return read(db.with_suffix('.report.json'))
 
-    pairs=list(build_synccraft_curriculum_records(include_animation=False,enable_thinking=True,panel_size=panel_size))
+    n_static_var=max(1,int(config.get('synccraft_num_variants',1)))
+    n_anim_var=max(6,int(config.get('synccraft_animation_variants',6)))
+    n_pilot_var=max(8,int(config.get('synccraft_pilot_groups',8)))
+
+    pairs=list(build_synccraft_curriculum_records(include_animation=False,enable_thinking=True,panel_size=panel_size,num_variants=n_static_var))
     if include_animation:
         # Build >=6 independent animation families so `video:en` satisfies independent split coverage.
-        for anim_idx in range(6):
+        for anim_idx in range(n_anim_var):
             prog=build_animated_quadruped_program(variant=anim_idx)
             rec,payloads=build_animation_clip_record(
                 prog,
@@ -182,7 +186,7 @@ def prepare_local_synccraft_data(root,config,*,include_animation=True,panel_size
             pairs.append((rec,payloads))
 
     # Add >=8 independent bilingual pure-text (`text_replay`) and RGBA/opaque visual grounding groups.
-    for idx in range(8):
+    for idx in range(n_pilot_var):
         for lang in ('en','zh'):
             txt_row={
                 'id':f'spark_text_preserve_{lang}_{idx}',

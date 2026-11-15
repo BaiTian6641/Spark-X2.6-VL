@@ -36,8 +36,8 @@
   "direct_wall_hours": 72,
   "max_sequence": 8192,
   "max_answer_tokens": 4096,
-  "learning_rate": 1e-05,
-  "connector_learning_rate": 0.0001,
+  "learning_rate": 2e-05,
+  "connector_learning_rate": 0.0002,
   "audio_output_learning_rate": 5e-06,
   "weight_decay": 0.01,
   "warmup_ratio": 0.03,
@@ -82,11 +82,14 @@
   "motion_tokens": 256,
   "audio_tokens": 384,
   "generator_prefix_tokens": 32,
+  "synccraft_num_variants": 6,
+  "synccraft_animation_variants": 8,
+  "synccraft_pilot_groups": 8,
   "split_percent": {
-    "train": 92,
-    "dev": 4,
-    "promotion": 2,
-    "audit": 2
+    "train": 76,
+    "dev": 10,
+    "promotion": 6,
+    "audit": 8
   },
   "stages": [
     {
@@ -94,7 +97,7 @@
       "families": [
         "image"
       ],
-      "epochs": 1,
+      "epochs": 4,
       "alignment_only": true,
       "stage_mode": "frozen_spark_connector",
       "max_records_per_family": 32000
@@ -105,7 +108,7 @@
         "image",
         "video"
       ],
-      "epochs": 1,
+      "epochs": 4,
       "alignment_only": true,
       "stage_mode": "frozen_spark_cross_attn"
     },
@@ -115,7 +118,7 @@
         "image",
         "text"
       ],
-      "epochs": 1,
+      "epochs": 6,
       "alignment_only": false,
       "stage_mode": "full_spark",
       "synccraft_tasks": [
@@ -133,7 +136,7 @@
         "video",
         "text"
       ],
-      "epochs": 1,
+      "epochs": 6,
       "alignment_only": false,
       "stage_mode": "full_spark",
       "include_synccraft_animation": true,

@@ -741,3 +741,70 @@ def test_spark_fp8_checkpoint_lock_roundtrip_and_frozen_spark_ce_checkpoint(tmp_
     assert any(p.grad is not None and float(p.grad.detach().abs().sum()) > 0 for p in model_b.vision_projector.parameters())
 
 
+def test_spark_chat_format_thinking_boundary_and_parametric_synccraft_rigs():
+    from colab.final.model import ChatFormat
+    from colab.final.synccraft_bridge import (
+        audit_scene,
+        build_parametric_creature_world,
+        build_parametric_mechanism_world,
+        compile_geometry,
+    )
+    from tests._spark_test_fakes import FakeTokenizer
+
+    class SparkJinjaLikeTokenizer(FakeTokenizer):
+        """Mimics Spark-X2.6 `chat_template.jinja` (`<|Bot|></think>` when reasoning_content is absent vs `<|Bot|><think>` on gen)."""
+
+        def apply_chat_template(
+            self,
+            messages: list[dict[str, str]],
+            tokenize: bool = False,
+            add_generation_prompt: bool = False,
+            enable_thinking: bool = False,
+        ):
+            parts = []
+            for m in messages:
+                role = m["role"]
+                content = m["content"]
+                if role == "system":
+                    parts.append(f"<|im_start|>system\n{content}<|im_end|>")
+                elif role == "user":
+                    parts.append(f"<|im_start|>user\n{content}<|im_end|>")
+                elif role == "assistant":
+                    rc = m.get("reasoning_content", "")
+                    think_part = f"<think>{rc}</think>" if rc else "</think>"
+                    parts.append(f"<|im_start|>assistant\n{think_part}{content}<|im_end|>")
+            if add_generation_prompt:
+                tag = "<think>" if enable_thinking else "</think>"
+                parts.append(f"<|im_start|>assistant\n{tag}")
+            rendered = "".join(parts)
+            return self.encode(rendered) if tokenize else rendered
+
+    tok = SparkJinjaLikeTokenizer()
+    cf = ChatFormat(tok)
+    assert cf.layouts[False]["user_to_bot"] == "<|im_end|><|im_start|>assistant\n</think>"
+    assert cf.layouts[False]["gen_user_to_bot"] == "<|im_end|><|im_start|>assistant\n</think>"
+    assert cf.layouts[True]["user_to_bot"] == "<|im_end|><|im_start|>assistant\n"
+    assert cf.layouts[True]["gen_user_to_bot"] == "<|im_end|><|im_start|>assistant\n<think>"
+    assert cf.layouts[True]["gen_open_prefix"] == "<think>"
+
+    # Exact token-level boundary invariance: training prefix + `<think>\ntrace</think>\nans` == gen prefix + `\ntrace</think>\nans`
+    ans = "<think>\ntask=synccraft_part_grounding\n</think>\n{\"ok\":true}"
+    pre_tr, post_tr = cf.encode("Inspect rig", enable_thinking=True, for_generation=False)
+    pre_ge, post_ge = cf.encode("Inspect rig", enable_thinking=True, for_generation=True)
+    train_seq = pre_tr + post_tr + tok.encode(ans)
+    gen_seq = pre_ge + post_ge + tok.encode("\ntask=synccraft_part_grounding\n</think>\n{\"ok\":true}")
+    assert train_seq == gen_seq
+    restored = cf.restore_thinking_prefix("\ntask=synccraft_part_grounding\n</think>\n{\"ok\":true}", cf.layouts[True], True)
+    assert restored == ans
+
+    # Verify all 6 parametric mechanism & creature variants pass 15-axis SAT + P1-02 contact audit cleanly
+    for v in range(6):
+        mw = build_parametric_mechanism_world(variant=v)
+        bw = build_parametric_creature_world(variant=v)
+        ma = audit_scene(compile_geometry(mw.program))
+        ba = audit_scene(compile_geometry(bw.program))
+        assert ma["passed"] is True and len(ma["collision_pairs"]) == 0
+        assert ba["passed"] is True and len(ba["collision_pairs"]) == 0
+
+
+

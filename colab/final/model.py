@@ -112,16 +112,37 @@ class ChatFormat:
         gen_user_to_bot = generated[len(gen_prefix):]
         if not enable_thinking and gen_user_to_bot != user_to_bot:
             raise ValueError('Generation prompt differs from the training layout')
+        # In templates like Spark-X2.6 (`{% if reasoning_content %}<think>...{% else %}</think>{% endif %}`),
+        # probing an assistant message without `reasoning_content` appends an empty-reasoning `</think>` to `user_to_bot`,
+        # whereas supervised thinking answers already begin with `<think>...</think>`. Strip that empty `</think>`
+        # so `user_to_bot + "<think>..."` matches `gen_user_to_bot` token-for-token!
+        if enable_thinking and user_to_bot.endswith('</think>'):
+            stripped = user_to_bot[:-len('</think>')]
+            if stripped.endswith('<think>'):
+                stripped = stripped[:-len('<think>')]
+            if gen_user_to_bot.startswith(stripped):
+                user_to_bot = stripped
+        gen_open_prefix = gen_user_to_bot[len(user_to_bot):] if gen_user_to_bot.startswith(user_to_bot) else ''
         return {
             'sys_prefix': sys_prefix,
             'sys_suffix': sys_suffix,
             'system_block': system_block,
             'user_to_bot': user_to_bot,
             'gen_user_to_bot': gen_user_to_bot,
+            'gen_open_prefix': gen_open_prefix,
             'bot_to_user': bot_to_user,
             'bot_close': bot_close,
             'user_open': user_open,
         }
+
+    @staticmethod
+    def restore_thinking_prefix(decoded: str, layout: dict[str, str], enable_thinking: bool) -> str:
+        if not enable_thinking or decoded.lstrip().startswith('<think>'):
+            return decoded
+        open_pref = layout.get('gen_open_prefix', '')
+        if open_pref == '<think>' and not decoded.startswith('\n'):
+            return '<think>\n' + decoded
+        return (open_pref or '<think>\n') + decoded
 
     def ids(self, text: str) -> list[int]:
         if text not in self.cache:
@@ -588,7 +609,10 @@ class SparkNative(nn.Module):
             from transformers import (AutoTokenizer,Siglip2VisionModel,Siglip2VisionConfig,AutoImageProcessor)
             self.spark=load_spark_backbone(paths['spark'],spark_dtype=spark_dtype,pretrained=pretrained)
             install_spark_sdpa(self.spark)
-            self.tokenizer=AutoTokenizer.from_pretrained(paths['spark'],trust_remote_code=True,local_files_only=True)
+            try:
+                self.tokenizer=AutoTokenizer.from_pretrained(paths['spark'],trust_remote_code=True,local_files_only=True,fix_mistral_regex=True)
+            except TypeError:
+                self.tokenizer=AutoTokenizer.from_pretrained(paths['spark'],trust_remote_code=True,local_files_only=True)
             if self.tokenizer.pad_token_id is None: self.tokenizer.pad_token=self.tokenizer.eos_token
             self.chat = ChatFormat(self.tokenizer)
             self.config=self.spark.config; self.config.use_cache=False; self.generation_config=self.spark.generation_config
@@ -1196,11 +1220,19 @@ class SparkNative(nn.Module):
         with self._visual_cross_attn_scope(visual_context):
             return self.spark.model(inputs_embeds=embeds,attention_mask=mask,use_cache=False,return_dict=True).last_hidden_state
 
+    def _effective_supervised_row(self, row: dict[str, Any]) -> dict[str, Any]:
+        want_think = bool(row.get('enable_thinking', False))
+        has_think_body = str(row.get('answer', '')).lstrip().startswith('<think>')
+        if want_think and not has_think_body:
+            return {**row, 'enable_thinking': False}
+        return row
+
     def text_loss(self,row,media):
-        bot_close=self.chat.layouts[bool(row.get('enable_thinking',False))]['bot_close']
-        ids=self.tokenizer(row['answer']+bot_close,add_special_tokens=False,return_tensors='pt').input_ids.to(self.device)
+        sup_row=self._effective_supervised_row(row)
+        bot_close=self.chat.layouts[bool(sup_row.get('enable_thinking',False))]['bot_close']
+        ids=self.tokenizer(sup_row['answer']+bot_close,add_special_tokens=False,return_tensors='pt').input_ids.to(self.device)
         if not has_multimodal_context(media):
-            pre,post=self.prompt_ids_for_row(row,for_generation=False)
+            pre,post=self.prompt_ids_for_row(sup_row,for_generation=False)
             prefix_ids=torch.tensor(pre+post,device=self.device,dtype=torch.long)[None]
             if ids.shape[1]>self.policy['max_answer_tokens'] or prefix_ids.shape[1]+ids.shape[1]>self.policy['max_sequence']:
                 raise ValueError('Supervision would be truncated; revise a versioned context policy')
@@ -1208,7 +1240,7 @@ class SparkNative(nn.Module):
             with self._visual_cross_attn_scope(None):
                 hidden=self.spark.model(input_ids=full_ids,attention_mask=torch.ones_like(full_ids),use_cache=False,return_dict=True).last_hidden_state[:,prefix_ids.shape[1]-1:-1]
         else:
-            prefix,vis_ctx=self.prefix_with_visual_context(row,media,for_generation=False)
+            prefix,vis_ctx=self.prefix_with_visual_context(sup_row,media,for_generation=False)
             if ids.shape[1]>self.policy['max_answer_tokens'] or prefix.shape[1]+ids.shape[1]>self.policy['max_sequence']:
                 raise ValueError('Supervision would be truncated; revise a versioned context policy')
             embeds=torch.cat([prefix,self.get_input_embeddings()(ids)],dim=1)
@@ -1241,10 +1273,11 @@ class SparkNative(nn.Module):
             prepared_ids=[]
             pad_id=int(self.tokenizer.pad_token_id or 0)
             for row,_ in examples:
-                pre,post=self.prompt_ids_for_row(row,for_generation=False)
+                sup_row=self._effective_supervised_row(row)
+                pre,post=self.prompt_ids_for_row(sup_row,for_generation=False)
                 p_ids=torch.tensor(pre+post,device=self.device,dtype=torch.long)[None]
-                bot_close=self.chat.layouts[bool(row.get('enable_thinking',False))]['bot_close']
-                a_ids=self.tokenizer(row['answer']+bot_close,add_special_tokens=False,return_tensors='pt').input_ids.to(self.device)
+                bot_close=self.chat.layouts[bool(sup_row.get('enable_thinking',False))]['bot_close']
+                a_ids=self.tokenizer(sup_row['answer']+bot_close,add_special_tokens=False,return_tensors='pt').input_ids.to(self.device)
                 if a_ids.shape[1]>self.policy['max_answer_tokens'] or p_ids.shape[1]+a_ids.shape[1]>self.policy['max_sequence']:
                     raise ValueError('Supervision would be truncated; revise a versioned context policy')
                 prepared_ids.append((p_ids,a_ids))
@@ -1273,10 +1306,11 @@ class SparkNative(nn.Module):
         prepared=[]
         single_vis_ctx=None
         for row,media in examples:
-            prefix,vis_ctx=self.prefix_with_visual_context(row,media,for_generation=False)
+            sup_row=self._effective_supervised_row(row)
+            prefix,vis_ctx=self.prefix_with_visual_context(sup_row,media,for_generation=False)
             if vis_ctx is not None: single_vis_ctx=vis_ctx
-            bot_close=self.chat.layouts[bool(row.get('enable_thinking',False))]['bot_close']
-            ids=self.tokenizer(row['answer']+bot_close,add_special_tokens=False,return_tensors='pt').input_ids.to(self.device)
+            bot_close=self.chat.layouts[bool(sup_row.get('enable_thinking',False))]['bot_close']
+            ids=self.tokenizer(sup_row['answer']+bot_close,add_special_tokens=False,return_tensors='pt').input_ids.to(self.device)
             if ids.shape[1]>self.policy['max_answer_tokens'] or prefix.shape[1]+ids.shape[1]>self.policy['max_sequence']:
                 raise ValueError('Supervision would be truncated; revise a versioned context policy')
             prepared.append((prefix,self.get_input_embeddings()(ids),ids))
@@ -1425,16 +1459,17 @@ class SparkNative(nn.Module):
                 top_k=top_k,
                 repetition_penalty=repetition_penalty,
             )
-            prefix_str = '<think>\n' if bool(effective_row.get('enable_thinking', False)) and 'messages' not in effective_row and not self.chat.layouts[True]['gen_user_to_bot'].endswith('<think>\n') else ''
             decoded = self.tokenizer.decode(generated, skip_special_tokens=True)
-            if bool(effective_row.get('enable_thinking', False)) and self.chat.layouts[True]['gen_user_to_bot'].endswith('<think>\n') and not decoded.lstrip().startswith('<think>'):
-                decoded = '<think>\n' + decoded
-            return prefix_str + decoded
+            return self.chat.restore_thinking_prefix(
+                decoded,
+                self.chat.layouts[True],
+                bool(effective_row.get('enable_thinking', False)),
+            )
 
         embeds, vis_ctx = self.prefix_with_visual_context(
             effective_row,
             media,
-            for_generation=bool(effective_row.get('enable_thinking', False)),
+            for_generation=True,
         )
         generated=[]; past=None; state=None; length=embeds.shape[1]
         with self._visual_cross_attn_scope(vis_ctx):
@@ -1458,9 +1493,11 @@ class SparkNative(nn.Module):
                 if token.item()==self.tokenizer.eos_token_id: break
                 generated.append(token.item()); state=self.get_input_embeddings()(token)
         decoded = self.tokenizer.decode(generated,skip_special_tokens=True)
-        if bool(effective_row.get('enable_thinking', False)) and self.chat.layouts[True]['gen_user_to_bot'].endswith('<think>\n') and not decoded.lstrip().startswith('<think>'):
-            decoded = '<think>\n' + decoded
-        return decoded
+        return self.chat.restore_thinking_prefix(
+            decoded,
+            self.chat.layouts[True],
+            bool(effective_row.get('enable_thinking', False)),
+        )
 
     @torch.no_grad()
     def generate_audio(self,row,media,seconds=None,steps=50):

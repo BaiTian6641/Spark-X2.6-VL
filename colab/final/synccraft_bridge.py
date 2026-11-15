@@ -911,21 +911,165 @@ def build_animation_clip_record(
     return row, media_payloads
 
 
+def build_parametric_mechanism_world(variant: int = 0, subdivisions_per_unit: int = 4) -> WorldState:
+    """Build clean-room articulated mechanism rigs with distinct integer geometry & OKLCH palettes."""
+    v = int(variant)
+    if v <= 0:
+        return build_articulated_mechanism_world(seed=101, subdivisions_per_unit=subdivisions_per_unit)
+    ped_w = 8 + 2 * (v % 3)
+    post_h = 6 + 2 * ((v // 2) % 3)
+    upper_len = 5 + (v % 3)
+    fore_len = 4 + ((v + 1) % 3)
+    coat_hue = float((245.0 + 43.0 * v) % 360.0)
+    program = validate_program(
+        Program(
+            meta=Meta("block_multipart", "bbmodel_5", 16),
+            palettes=[
+                Palette("stone_mat", (0.52, 0.03, 75.0), 6),
+                Palette("wood_mat", (0.56, 0.09, 62.0), 6),
+                Palette("painted_iron", (0.48, 0.14, coat_hue), 6),
+                Palette("brushed_steel", (0.76, 0.02, 235.0), 6),
+            ],
+            root=Bone(
+                name="base_frame",
+                pivot_local=(0.0, 2.0, 0.0),
+                items=[
+                    Box("stone_pedestal", (ped_w, 4, ped_w), "stone_mat"),
+                    Box(
+                        "timber_post",
+                        (4, post_h, 4),
+                        "wood_mat",
+                        place=Place("stone_pedestal", anchor=(0.0, 1.0, 0.0), align=(0.0, -1.0, 0.0)),
+                    ),
+                    Box(
+                        "housing",
+                        (6, 4, 6),
+                        "painted_iron",
+                        place=Place("timber_post", anchor=(0.0, 1.0, 0.0), align=(0.0, -1.0, 0.0)),
+                    ),
+                    Bone(
+                        name="upper_arm",
+                        attach=Attach("housing", anchor=(1.0, 0.0, 0.0), align=(-1.0, 0.0, 0.0)),
+                        rest_euler=(0.0, 0.0, 0.0),
+                        items=[
+                            Box("upper_link", (upper_len, 2, 2), "painted_iron"),
+                            Bone(
+                                name="fore_arm",
+                                attach=Attach("upper_link", anchor=(1.0, 0.0, 0.0), align=(-1.0, 0.0, 0.0)),
+                                rest_euler=(0.0, 0.0, 0.0),
+                                items=[
+                                    Box("fore_link", (fore_len, 2, 2), "brushed_steel"),
+                                ],
+                            ),
+                        ],
+                    ),
+                ],
+            ),
+        )
+    )
+    mat_prog = MaterialProgram.from_program(program, seed=101 + 37 * v)
+    domain = build_surface_domain(program, mat_prog, subdivisions_per_unit=subdivisions_per_unit)
+    return WorldState(
+        program=program,
+        material_program=mat_prog,
+        surface_state=initialize_surface_state(domain),
+        style_config=StyleConfig(quantize_to_palette_ramp=False, target_encoding="vanilla"),
+        environment=EnvironmentState(),
+    )
+
+
+def build_parametric_creature_world(variant: int = 0, subdivisions_per_unit: int = 4) -> WorldState:
+    """Build clean-room mirrored quadruped rigs with distinct integer proportions & OKLCH palettes."""
+    v = int(variant)
+    if v <= 0:
+        return build_biological_creature_world(seed=202, subdivisions_per_unit=subdivisions_per_unit)
+    torso_w = 6 + 2 * (v % 2)
+    torso_d = 9 + (v % 4)
+    limb_h = 4 + (v % 3)
+    pelt_hue = float((72.0 + 47.0 * v) % 360.0)
+    scale_hue = float((135.0 + 39.0 * v) % 360.0)
+    program = validate_program(
+        Program(
+            meta=Meta("entity", "bedrock_entity", 16),
+            palettes=[
+                Palette("pelt_skin", (0.68, 0.11, pelt_hue), 6),
+                Palette("limb_scales", (0.44, 0.08, scale_hue), 6),
+                Palette("elytra_crest", (0.36, 0.06, 210.0), 6),
+            ],
+            root=Bone(
+                name="body_root",
+                pivot_local=(0.0, 12.0, 0.0),
+                items=[
+                    Box("torso", (torso_w, 6, torso_d), "pelt_skin"),
+                    Bone(
+                        name="neck_head",
+                        attach=Attach("torso", anchor=(0.0, 0.25, -1.0), align=(0.0, -0.25, 1.0)),
+                        rest_euler=(0.0, 0.0, 0.0),
+                        items=[
+                            Box("skull", (4, 4, 4), "pelt_skin"),
+                        ],
+                    ),
+                    Bone(
+                        name="left_thigh",
+                        attach=Attach("torso", anchor=(-1.0, -0.5, -0.5), align=(1.0, 1.0, 0.0)),
+                        mirror_name="right_thigh",
+                        rest_euler=(0.0, 0.0, 0.0),
+                        items=[
+                            Box("thigh_seg", (2, limb_h, 2), "pelt_skin"),
+                            Bone(
+                                name="left_shin",
+                                attach=Attach("thigh_seg", anchor=(0.0, -1.0, 0.0), align=(0.0, 1.0, 0.0)),
+                                rest_euler=(0.0, 0.0, 0.0),
+                                items=[
+                                    Box("shin_seg", (2, limb_h, 2), "limb_scales"),
+                                ],
+                            ),
+                        ],
+                    ),
+                ],
+            ),
+        )
+    )
+    mat_prog = MaterialProgram.from_program(program, seed=202 + 41 * v)
+    domain = build_surface_domain(program, mat_prog, subdivisions_per_unit=subdivisions_per_unit)
+    return WorldState(
+        program=program,
+        material_program=mat_prog,
+        surface_state=initialize_surface_state(domain),
+        style_config=StyleConfig(quantize_to_palette_ramp=False, target_encoding="vanilla"),
+        environment=EnvironmentState(),
+    )
+
+
 def build_synccraft_curriculum_records(
     *,
     include_animation: bool = False,
     enable_thinking: bool = True,
     panel_size: tuple[int, int] = (128, 128),
+    num_variants: int = 1,
 ) -> list[tuple[dict[str, Any], dict[str, bytes]]]:
     """Generate clean-room SyncCraft records staged static-first, with optional `@behavior` animation."""
-    mech_world = build_articulated_mechanism_world(seed=101, subdivisions_per_unit=4)
-    bio_world = build_biological_creature_world(seed=202, subdivisions_per_unit=4)
+    n_var = max(1, int(num_variants))
+    rig_specs: list[tuple[WorldState, str, str]] = []
+    for v in range(n_var):
+        idx = v + 1
+        rig_specs.append(
+            (
+                build_parametric_mechanism_world(variant=v, subdivisions_per_unit=4),
+                f"synccraft_mech_{idx:03d}",
+                "articulated_robotic_arm",
+            )
+        )
+        rig_specs.append(
+            (
+                build_parametric_creature_world(variant=v, subdivisions_per_unit=4),
+                f"synccraft_bio_{idx:03d}",
+                "dog_horse_quadruped",
+            )
+        )
 
     items: list[tuple[dict[str, Any], dict[str, bytes]]] = []
-    for ws, aid, fam in (
-        (mech_world, "synccraft_mech_001", "articulated_robotic_arm"),
-        (bio_world, "synccraft_bio_001", "dog_horse_quadruped"),
-    ):
+    for ws, aid, fam in rig_specs:
         items.append(
             build_part_grounding_record(
                 ws, asset_id=aid, family_id=fam, enable_thinking=enable_thinking, panel_size=panel_size

@@ -73,11 +73,11 @@ def verify_text_only_parity(
                         break
                     gen_ids.append(int(tok.item()))
                     cur = tok
-                ref_ans = model.tokenizer.decode(gen_ids, skip_special_tokens=True)
-                if thinking and model.chat.layouts[True]['gen_user_to_bot'].endswith('<think>\n') and not ref_ans.lstrip().startswith('<think>'):
-                    ref_ans = '<think>\n' + ref_ans
-                elif thinking and not model.chat.layouts[True]['gen_user_to_bot'].endswith('<think>\n'):
-                    ref_ans = '<think>\n' + ref_ans
+                ref_ans = model.chat.restore_thinking_prefix(
+                    model.tokenizer.decode(gen_ids, skip_special_tokens=True),
+                    model.chat.layouts[True],
+                    thinking,
+                )
                 if wrapped_ans != ref_ans:
                     raise RuntimeError(
                         f'Text-only greedy generation parity failed (thinking={thinking}): {wrapped_ans!r} != {ref_ans!r}'
