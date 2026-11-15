@@ -697,12 +697,13 @@ class Campaign:
                     set_rng(saved_rng)
                     self.model.train()
                     by_st=ep_eval.get('by_stratum',{}) if isinstance(ep_eval,dict) else {}
-                    active_items=[v for k,v in by_st.items() if k.split(':',1)[0] in stage_fams and v.get('n',0)>0]
+                    def _rec_count(v): return int(v.get('records',v.get('n',0)))
+                    active_items=[v for k,v in by_st.items() if k.split(':',1)[0] in stage_fams and _rec_count(v)>0]
                     if not active_items:
-                        active_items=[v for v in by_st.values() if v.get('n',0)>0]
+                        active_items=[v for v in by_st.values() if _rec_count(v)>0]
                     if active_items:
-                        total_n=sum(int(v['n']) for v in active_items)
-                        dev_score=sum(float(v['mean_loss'])*int(v['n']) for v in active_items)/max(1,total_n)
+                        total_n=sum(_rec_count(v) for v in active_items)
+                        dev_score=sum(float(v['mean_loss'])*_rec_count(v) for v in active_items)/max(1,total_n)
                         if dev_score<best_dev_score*(1.0-min_rel_delta):
                             best_dev_score=dev_score
                             best_epoch=cur_epoch

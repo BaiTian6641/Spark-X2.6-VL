@@ -1053,7 +1053,7 @@ def test_dynamic_dataset_shuffling_augmentation_and_anti_overfit_regularization(
         eval_calls[0] += 1
         ep_num = idx + 1
         epoch_hashes[ep_num] = sample_hash(camp.model)
-        return {"membership_sha256": "dev", "by_stratum": {"text:en": {"n": 4, "mean_loss": sim_losses[idx]}}}
+        return {"membership_sha256": "dev", "by_stratum": {"text:en": {"records": 4, "mean_loss": sim_losses[idx]}}}
 
     camp.evaluate = _fake_eval  # type: ignore[method-assign]
     txt_rids = [r[0] for r in camp.catalogue.select("train", ["text"])][:2]
@@ -1068,6 +1068,19 @@ def test_dynamic_dataset_shuffling_augmentation_and_anti_overfit_regularization(
     assert es_meta["stopped_at_epoch"] == 4
     assert es_meta["best_epoch"] == 2
     assert sample_hash(camp.model) == epoch_hashes[2]  # Exact epoch-2 weights restored!
+
+    # 6. Verify `256x16` pixel-art UV atlas strip gets nearest-neighbor magnification on both RGB and alpha
+    strip_rgb = Image.fromarray(np.full((16, 256, 3), 80, dtype=np.uint8), mode="RGB")
+    strip_alpha = np.ones((16, 256), dtype=np.float32)
+    strip_alpha[2:6, 2:6] = 0.0
+    views_uv = reg_model.tile_views(strip_rgb, False, alpha=strip_alpha, is_pixel_art_atlas=True)
+    # Thumbnail + 4 detail tiles; each 128x8 detail tile is scaled 4x -> 512x32 with matching 32x512 alpha!
+    assert len(views_uv) == 5
+    tile1_im, tile1_alpha, _, _ = views_uv[1]
+    assert tile1_im.size == (512, 32)
+    assert tile1_alpha is not None and tile1_alpha.shape == (32, 512)
+    assert float(tile1_alpha.min()) == 0.0
+
 
 
 

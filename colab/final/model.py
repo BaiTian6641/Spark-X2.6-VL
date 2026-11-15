@@ -1001,11 +1001,14 @@ class SparkNative(nn.Module):
                 for i in range(nx):
                     a,b,c,d=round(i*w/nx),round(j*h/ny),round((i+1)*w/nx),round((j+1)*h/ny)
                     crop_im=image.crop((a,b,c,d))
-                    if is_pixel_art_atlas and (c-a)<64 and (d-b)<64:
-                        # Crisp nearest-neighbor magnification on tiny pixel-art UV islands prevents bilinear blur!
-                        scale=max(1,64//max(1,min(c-a,d-b)))
-                        crop_im=crop_im.resize(((c-a)*scale,(d-b)*scale),resample=Image.Resampling.NEAREST)
                     crop_alpha=alpha[b:d,a:c] if alpha is not None else None
+                    if is_pixel_art_atlas and min(c-a,d-b)<64:
+                        # Crisp nearest-neighbor magnification on narrow/tiny pixel-art UV islands prevents bilinear blur!
+                        scale=min(4,max(1,64//max(1,min(c-a,d-b))))
+                        if scale>1:
+                            crop_im=crop_im.resize(((c-a)*scale,(d-b)*scale),resample=Image.Resampling.NEAREST)
+                            if crop_alpha is not None:
+                                crop_alpha=np.repeat(np.repeat(crop_alpha,scale,axis=0),scale,axis=1)
                     views.append((crop_im,crop_alpha,(a/w,b/h,c/w,d/h),self.policy['tile_patches']))
         return views
 
