@@ -71,12 +71,13 @@ def run_verification(
             row, pkt = catalogue.row(rid)
             with reader.packet(pkt) as get:
                 media = prepare_media(row, get, cfg)
+            max_toks = 1792 if task_name.startswith("synccraft_") else int(cfg.get("evaluation_max_new_tokens", 384))
             pred = generate(
                 model,
                 row["prompt"],
                 media=media,
                 enable_thinking=bool(row.get("enable_thinking", False)),
-                max_new_tokens=int(cfg.get("evaluation_max_new_tokens", 1536)),
+                max_new_tokens=max_toks,
                 task=row["task"],
                 language=row["language"],
             )
