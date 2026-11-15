@@ -35,7 +35,7 @@
   "max_wall_hours": 240,
   "direct_wall_hours": 72,
   "max_sequence": 8192,
-  "max_answer_tokens": 4096,
+  "max_answer_tokens": 6656,
   "evaluation_max_new_tokens": 384,
   "learning_rate": 1.5e-05,
   "connector_learning_rate": 0.00015,

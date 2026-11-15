@@ -39,7 +39,7 @@ import tarfile
 from typing import Any
 
 from .common import HERE, emit, identity, read, sha, write
-from .data import build_database, family, training_views, variants
+from .data import build_database, family, infer_visual_kind, training_views, variants
 
 SAT_REPO_ID = "array/SAT"
 SAT_REVISION = "bda5dde942d7f7b41bff7935f086ed9a9e348ae3"
@@ -846,6 +846,9 @@ def _build_synccraft_world_v32_records(
                 spdx = str(ar.get("license_spdx") or "")
                 if spdx not in ("CC0-1.0", "CC-BY-4.0", "MIT", "Apache-2.0"):
                     continue
+                if len(str(ar.get("canonical_dsl") or "")) > 24_000:
+                    # Skip multi-thousand-cuboid diorama scenes that exceed the 8192-token context policy
+                    continue
                 human_rows.append(ar)
 
     human_rows.sort(key=lambda r: identity([seed, "human_cc", r["asset_id"]]))
@@ -1082,6 +1085,90 @@ def _build_synccraft_world_v32_records(
     return records, blob_map
 
 
+def _filter_packets_to_context_policy(
+    packets: list[dict[str, Any]],
+    root: Path,
+    config: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Enforce exact `max_answer_tokens` and `max_sequence` budgets before freezing `packets.jsonl.gz`.
+
+    Prevents runtime `ValueError('Supervision would be truncated; revise a versioned context policy')`
+    from oversized multi-hundred-part diorama prompts/answers while preserving zero silent truncation.
+    """
+    max_seq = int(config.get("max_sequence", 8192))
+    max_ans = int(config.get("max_answer_tokens", 4096))
+    max_vis = int(config.get("max_visual_tokens", 768))
+    detail_tiles = int(config.get("detail_tiles", 4))
+    ans_limit = max(32, max_ans - 32)
+    vis_seq_limit = max(128, max_seq - max_vis - 96)
+    txt_seq_limit = max(128, max_seq - 96)
+
+    tok = None
+    spark_comp = str(config.get("spark_component", "spark_fp8"))
+    for cand_dir in (root / "assets" / spark_comp, root / "assets" / "spark_fp8", root / "assets" / "spark"):
+        if (cand_dir / "tokenizer_config.json").is_file() or (cand_dir / "tokenizer.json").is_file():
+            from transformers import AutoTokenizer
+            tok = AutoTokenizer.from_pretrained(str(cand_dir), trust_remote_code=True)
+            break
+
+    def _tok_len(s: str) -> int:
+        if tok is not None:
+            return len(tok.encode(s, add_special_tokens=False))
+        return math.ceil(len(s.encode("utf-8")) / 2.5)
+
+    kept: list[dict[str, Any]] = []
+    dropped_by_task: Counter[str] = Counter()
+    dropped_packets = 0
+
+    for pkt in packets:
+        ok = True
+        for orig in variants(pkt["record"]):
+            for r in training_views(orig):
+                p_str = str(r.get("prompt") or "") + ("\n" + str(r["system_prompt"]) if r.get("system_prompt") else "")
+                a_str = str(r.get("answer") or "")
+                # Fast character guard avoids BPE work on huge multi-thousand-box diorama strings
+                if len(p_str) > max_seq * 5 or len(a_str) > max_ans * 5:
+                    ok = False
+                    dropped_by_task[str(r.get("task") or "unknown")] += 1
+                    break
+                nf = len(r.get("frames") or ())
+                has_vis = bool(nf or r.get("video"))
+                if nf > 0:
+                    vk = infer_visual_kind(r)
+                    min_units = nf if vk == "temporal_frame" else nf * (1 + detail_tiles)
+                    if min_units * 16 > max_vis:
+                        ok = False
+                        dropped_by_task[str(r.get("task") or "unknown")] += 1
+                        break
+                a_len = _tok_len(a_str)
+                if a_len > ans_limit:
+                    ok = False
+                    dropped_by_task[str(r.get("task") or "unknown")] += 1
+                    break
+                p_len = _tok_len(p_str)
+                if p_len + a_len > (vis_seq_limit if has_vis else txt_seq_limit):
+                    ok = False
+                    dropped_by_task[str(r.get("task") or "unknown")] += 1
+                    break
+            if not ok:
+                break
+        if ok:
+            kept.append(pkt)
+        else:
+            dropped_packets += 1
+
+    stats = {
+        "tokenizer_verified": tok is not None,
+        "max_sequence": max_seq,
+        "max_answer_tokens": max_ans,
+        "kept_packets": len(kept),
+        "dropped_packets": dropped_packets,
+        "dropped_by_task": dict(sorted(dropped_by_task.items())),
+    }
+    emit("hybrid_context_policy_filter", **stats)
+    return kept, stats
+
+
 def prepare_hybrid_world_v32_data(root: str | Path, token: str | None, config: dict[str, Any]) -> dict[str, Any]:
     """Build or verify the frozen `hybrid_world_v32` multi-source corpus & SQLite split DB."""
     root = Path(root)
@@ -1161,6 +1248,9 @@ def prepare_hybrid_world_v32_data(root: str | Path, token: str | None, config: d
         else:
             all_packets.append({"component": "synccraft_world_v32", "record": rec, "transport": None})
 
+    # Enforce qualified context policy across 100% of rows before freezing catalogue
+    all_packets, context_filter_stats = _filter_packets_to_context_policy(all_packets, root, config)
+
     # Deterministic canonical packet order
     all_packets.sort(key=lambda p: (p["component"], str(p["record"]["id"])))
 
@@ -1180,6 +1270,7 @@ def prepare_hybrid_world_v32_data(root: str | Path, token: str | None, config: d
         "sat_3d_records": len(sat_records),
         "compositional_vqa_records": len(comp_records),
         "synccraft_world_v32_records": len(sc_records),
+        "context_policy_filter": context_filter_stats,
         "task_distribution": dict(sorted(task_counts.items())),
     }
     write(db.with_suffix(".report.json"), report)

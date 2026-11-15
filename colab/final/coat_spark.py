@@ -70,35 +70,52 @@ def quantize_activation_per_group_fp8(
     group_size: int = 128,
     telemetry: CoatActivationTelemetry | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, tuple[int, ...], torch.dtype, int]:
-    """Per-group FP8 (`float8_e4m3fn`) quantization for saved training activations."""
+    """Per-group FP8 (`float8_e4m3fn`) quantization with bounded transient FP32 memory."""
     orig_shape = tuple(x.shape)
     orig_dtype = x.dtype
     flat = x.detach().reshape(-1)
     numel = flat.numel()
     pad = (-numel) % group_size
-    if pad:
-        flat_f = F.pad(flat.float(), (0, pad))
-    else:
-        flat_f = flat.float()
-    groups = flat_f.reshape(-1, group_size)
-    amax = groups.abs().amax(dim=-1, keepdim=True)
-    scale = (amax / FP8_ACT_MAX).clamp_min(1e-12)
-    scaled = groups / scale
-    q = scaled.clamp(-FP8_ACT_MAX, FP8_ACT_MAX).to(FP8_ACT_DTYPE)
-    scale_bf16 = scale.squeeze(-1).to(torch.bfloat16)
+    num_groups = (numel + pad) // group_size
+    q = torch.empty((num_groups, group_size), dtype=FP8_ACT_DTYPE, device=x.device)
+    scale_bf16 = torch.empty((num_groups,), dtype=torch.bfloat16, device=x.device)
+
+    sat_count = 0
+    uflow_count = 0
+    chunk_groups = max(1, 2_097_152 // max(1, group_size))
+
+    for g_start in range(0, num_groups, chunk_groups):
+        g_end = min(num_groups, g_start + chunk_groups)
+        e_start = g_start * group_size
+        e_end = min(numel, g_end * group_size)
+        raw_slice = flat[e_start:e_end].float()
+        valid_len = raw_slice.numel()
+        need_pad = (g_end - g_start) * group_size - valid_len
+        if need_pad > 0:
+            groups = F.pad(raw_slice, (0, need_pad)).reshape(-1, group_size)
+        else:
+            groups = raw_slice.reshape(-1, group_size)
+        amax = groups.abs().amax(dim=-1, keepdim=True)
+        scale = (amax / FP8_ACT_MAX).clamp_min(1e-12)
+        scaled = groups / scale
+        q[g_start:g_end] = scaled.clamp(-FP8_ACT_MAX, FP8_ACT_MAX).to(FP8_ACT_DTYPE)
+        scale_bf16[g_start:g_end] = scale.squeeze(-1).to(torch.bfloat16)
+
+        if telemetry is not None and valid_len > 0:
+            valid_scaled = scaled.reshape(-1)[:valid_len].abs()
+            sat_count += int((valid_scaled > FP8_ACT_MAX * 0.999).sum().item())
+            uflow_count += int(
+                ((raw_slice != 0) & (valid_scaled < FP8_ACT_MIN_NORMAL * 0.5)).sum().item()
+            )
 
     if telemetry is not None:
-        valid_scaled = scaled.reshape(-1)[:numel].abs()
-        valid_orig = flat.float().abs()
         telemetry.compressed_tensors += 1
         telemetry.uncompressed_bytes += numel * x.element_size()
         telemetry.compressed_bytes += (
             q.numel() * q.element_size() + scale_bf16.numel() * scale_bf16.element_size()
         )
-        telemetry.saturated_elements += int((valid_scaled > FP8_ACT_MAX * 0.999).sum().item())
-        telemetry.underflow_elements += int(
-            ((valid_orig > 0) & (valid_scaled < FP8_ACT_MIN_NORMAL * 0.5)).sum().item()
-        )
+        telemetry.saturated_elements += sat_count
+        telemetry.underflow_elements += uflow_count
         telemetry.total_elements += numel
 
     return q, scale_bf16, orig_shape, orig_dtype, numel
@@ -113,9 +130,20 @@ def dequantize_activation_per_group_fp8(
     *,
     as_float32: bool = False,
 ) -> torch.Tensor:
-    restored = q.float() * scale_bf16.float().unsqueeze(-1)
-    flat = restored.reshape(-1)[:numel].reshape(orig_shape)
-    return flat if as_float32 else flat.to(orig_dtype)
+    target_dtype = torch.float32 if as_float32 else orig_dtype
+    num_groups, group_size = q.shape
+    if as_float32 or q.numel() <= 2_097_152:
+        restored = q.float() * scale_bf16.float().unsqueeze(-1)
+        flat = restored.reshape(-1)[:numel].reshape(orig_shape)
+        return flat if as_float32 else flat.to(orig_dtype)
+    out = torch.empty((num_groups, group_size), dtype=target_dtype, device=q.device)
+    chunk_groups = max(1, 2_097_152 // max(1, group_size))
+    for g_start in range(0, num_groups, chunk_groups):
+        g_end = min(num_groups, g_start + chunk_groups)
+        out[g_start:g_end] = (
+            q[g_start:g_end].float() * scale_bf16[g_start:g_end].float().unsqueeze(-1)
+        ).to(target_dtype)
+    return out.reshape(-1)[:numel].reshape(orig_shape)
 
 
 def _gelu_forward_and_grad(

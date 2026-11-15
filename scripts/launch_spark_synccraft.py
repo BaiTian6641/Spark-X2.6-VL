@@ -147,6 +147,7 @@ def _invoke_runner(mode: str, config_path: Path, source_sha: str, extra_args: li
         *(extra_args or []),
     ]
     env = dict(os.environ)
+    env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     env["PYTHONPATH"] = str(REPO_ROOT) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     proc = subprocess.run(
         cmd,
