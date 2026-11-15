@@ -377,7 +377,7 @@ def load_spark_backbone(spark_path, *, spark_dtype: torch.dtype, pretrained: boo
     with safe_open(str(single_sf), framework='pt', device='cpu') as f:
         sf_keys = set(f.keys())
         for key in sorted(sf_keys):
-            if key.endswith('.weight_scale') or key.endswith('.input_scale'):
+            if key.endswith(('.weight_scale', '.input_scale', '.weight_res_q4', '.weight_res_scale')):
                 continue
             target = param_map.get(key)
             if target is None:
@@ -390,8 +390,15 @@ def load_spark_backbone(spark_path, *, spark_dtype: torch.dtype, pretrained: boo
                 if scale_key not in sf_keys:
                     raise KeyError(f'Missing channelwise FP8 scale {scale_key!r} for {key!r}')
                 w_scale = f.get_tensor(scale_key)
-                deq = (raw_t.to(torch.float32) * w_scale.to(torch.float32)).to(dtype=target.dtype)
-                target.data.copy_(deq)
+                deq = raw_t.to(torch.float32) * w_scale.to(torch.float32)
+                if (key + '_res_q4') in sf_keys and (key + '_res_scale') in sf_keys:
+                    deq = deq + _unpack_fp8_sub_lsb_residual(
+                        f.get_tensor(key + '_res_q4'),
+                        f.get_tensor(key + '_res_scale'),
+                        int(deq.shape[0]),
+                        int(deq.shape[1]),
+                    )
+                target.data.copy_(deq.to(dtype=target.dtype))
                 fp8_dequant_count += 1
             else:
                 target.data.copy_(raw_t.to(dtype=target.dtype))
@@ -486,8 +493,42 @@ def _read_safetensors_dict(src: Path) -> dict[str, torch.Tensor]:
     return out
 
 
+def _pack_fp8_sub_lsb_residual(res_f32: torch.Tensor, group_size: int = 128) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack sub-LSB `F8_E4M3` quantization residual into symmetric group-128 signed INT4 (`U8` + `BF16` scale).
+
+    Preserves full-rank APOLLO fine-tuning deltas (`~1e-4 .. 2e-3`) that otherwise snap back onto the 3-bit-mantissa
+    `E4M3` grid (`~4.18e-4` relative error — ~10x finer than BF16 — while saving ~1.70 GiB vs BF16).
+    """
+    out_f, in_f = int(res_f32.shape[0]), int(res_f32.shape[1])
+    padded_in = ((in_f + group_size - 1) // group_size) * group_size
+    res_pad = F.pad(res_f32, (0, padded_in - in_f), value=0.0) if padded_in > in_f else res_f32
+    num_groups = padded_in // group_size
+    res_g = res_pad.reshape(out_f, num_groups, group_size)
+    res_scale = (res_g.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12) / 7.0).to(torch.bfloat16)
+    rq = (res_g / res_scale.to(torch.float32)).round().clamp(-7, 7).to(torch.int8)
+    u = (rq + 8).to(torch.uint8).reshape(out_f, padded_in // 2, 2)
+    packed = (u[..., 0] | (u[..., 1] << 4)).contiguous()
+    return packed, res_scale.squeeze(-1).contiguous()
+
+
+def _unpack_fp8_sub_lsb_residual(
+    packed: torch.Tensor,
+    res_scale: torch.Tensor,
+    out_f: int,
+    in_f: int,
+    group_size: int = 128,
+) -> torch.Tensor:
+    """Reconstruct float32 residual `[out_f, in_f]` from packed `U8` nibbles + `BF16` group scales."""
+    num_groups = int(res_scale.shape[1])
+    lo = (packed & 0x0F).to(torch.int8) - 8
+    hi = ((packed >> 4) & 0x0F).to(torch.int8) - 8
+    rq = torch.stack([lo, hi], dim=-1).reshape(out_f, num_groups, group_size)
+    res_pad = (rq.to(torch.float32) * res_scale.unsqueeze(-1).to(torch.float32)).reshape(out_f, num_groups * group_size)
+    return res_pad[:, :in_f]
+
+
 def export_spark_native_fp8_safetensors(model: nn.Module, path: str | Path) -> dict[str, Any]:
-    """Export `SparkNative` with Spark linear projections quantized to symmetric channelwise `F8_E4M3` + `weight_scale`."""
+    """Export `SparkNative` with Spark linear projections quantized to `F8_E4M3` + `weight_scale` + packed `INT4` sub-LSB residual."""
     fp8_max = 448.0
     out_tensors: dict[str, torch.Tensor] = {}
     seen_ptrs: set[tuple[int, tuple[int, ...], tuple[int, ...]]] = set()
@@ -507,20 +548,29 @@ def export_spark_native_fp8_safetensors(model: nn.Module, path: str | Path) -> d
             w_f32 = t_cpu.to(torch.float32)
             scale = (w_f32.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12) / fp8_max).to(torch.bfloat16)
             w_fp8 = (w_f32 / scale.to(torch.float32)).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
+            res = w_f32 - w_fp8.to(torch.float32) * scale.to(torch.float32)
+            res_q4, res_scale = _pack_fp8_sub_lsb_residual(res)
             out_tensors[name] = w_fp8.contiguous()
             out_tensors[name + '_scale'] = scale.contiguous()
+            out_tensors[name + '_res_q4'] = res_q4
+            out_tensors[name + '_res_scale'] = res_scale
             quantized_count += 1
         else:
             out_tensors[name] = t_cpu
 
     dest = Path(path)
-    _write_safetensors_dict(out_tensors, dest, metadata={'format': 'pt', 'quant_method': 'compressed-tensors-fp8-e4m3-channel'})
-    return {'quantized_linear_tensors': quantized_count, 'bytes': dest.stat().st_size}
+    _write_safetensors_dict(
+        out_tensors,
+        dest,
+        metadata={'format': 'pt', 'quant_method': 'compressed-tensors-fp8-e4m3-channel+q4g128-residual'},
+    )
+    return {'quantized_linear_tensors': quantized_count, 'residual_format': 'q4g128', 'bytes': dest.stat().st_size}
 
 
 def load_spark_native_safetensors(model: nn.Module, path: str | Path) -> None:
-    """Load either standard BF16 `model.safetensors` or channelwise `F8_E4M3` + `weight_scale` `model.safetensors`."""
+    """Load standard BF16 `model.safetensors` or channelwise `F8_E4M3` (+ optional `q4g128` sub-LSB residual) `model.safetensors`."""
     sf_path = Path(path)
+    aux_suffixes = ('.weight_scale', '.input_scale', '.weight_res_q4', '.weight_res_scale')
     try:
         from safetensors import safe_open
         from safetensors.torch import load_model
@@ -538,7 +588,7 @@ def load_spark_native_safetensors(model: nn.Module, path: str | Path) -> None:
             buf_map = dict(model.named_buffers())
             loaded: set[str] = set()
             for key in sorted(sf_keys):
-                if key.endswith('.weight_scale'):
+                if key.endswith(aux_suffixes):
                     continue
                 target = param_map.get(key)
                 if target is None:
@@ -549,8 +599,15 @@ def load_spark_native_safetensors(model: nn.Module, path: str | Path) -> None:
                 scale_key = key + '_scale'
                 if raw_t.dtype == torch.float8_e4m3fn or scale_key in sf_keys:
                     w_scale = f.get_tensor(scale_key)
-                    deq = (raw_t.to(torch.float32) * w_scale.to(torch.float32)).to(dtype=target.dtype, device=target.device)
-                    target.data.copy_(deq)
+                    deq = raw_t.to(torch.float32) * w_scale.to(torch.float32)
+                    if (key + '_res_q4') in sf_keys and (key + '_res_scale') in sf_keys:
+                        deq = deq + _unpack_fp8_sub_lsb_residual(
+                            f.get_tensor(key + '_res_q4'),
+                            f.get_tensor(key + '_res_scale'),
+                            int(deq.shape[0]),
+                            int(deq.shape[1]),
+                        )
+                    target.data.copy_(deq.to(dtype=target.dtype, device=target.device))
                 else:
                     target.data.copy_(raw_t.to(dtype=target.dtype, device=target.device))
                 loaded.add(key)
@@ -561,7 +618,7 @@ def load_spark_native_safetensors(model: nn.Module, path: str | Path) -> None:
         buf_map = dict(model.named_buffers())
         loaded = set()
         for key in sorted(sf_keys):
-            if key.endswith('.weight_scale'):
+            if key.endswith(aux_suffixes):
                 continue
             target = param_map.get(key)
             if target is None:
@@ -572,8 +629,15 @@ def load_spark_native_safetensors(model: nn.Module, path: str | Path) -> None:
             scale_key = key + '_scale'
             if raw_t.dtype == torch.float8_e4m3fn or scale_key in sf_keys:
                 w_scale = tensors[scale_key]
-                deq = (raw_t.to(torch.float32) * w_scale.to(torch.float32)).to(dtype=target.dtype, device=target.device)
-                target.data.copy_(deq)
+                deq = raw_t.to(torch.float32) * w_scale.to(torch.float32)
+                if (key + '_res_q4') in sf_keys and (key + '_res_scale') in sf_keys:
+                    deq = deq + _unpack_fp8_sub_lsb_residual(
+                        tensors[key + '_res_q4'],
+                        tensors[key + '_res_scale'],
+                        int(deq.shape[0]),
+                        int(deq.shape[1]),
+                    )
+                target.data.copy_(deq.to(dtype=target.dtype, device=target.device))
             else:
                 target.data.copy_(raw_t.to(dtype=target.dtype, device=target.device))
             loaded.add(key)

@@ -93,14 +93,22 @@ def generate(
     if system_prompt is not None:
         row['system_prompt']=system_prompt
     model.eval()
-    return model.answer(
-        row,
-        effective_media,
-        max_new_tokens=max_new_tokens,
-        enable_thinking=enable_thinking,
-        do_sample=do_sample,
-        temperature=temperature,
-        top_p=top_p,
-        top_k=top_k,
-        repetition_penalty=repetition_penalty,
+    import contextlib, torch
+    use_bf16_amp=(
+        str(getattr(model,'device','cpu')).startswith('cuda')
+        and torch.cuda.is_available()
+        and getattr(model,'policy',{}).get('mixed_precision')=='bf16'
     )
+    amp_ctx=torch.autocast('cuda',dtype=torch.bfloat16) if use_bf16_amp else contextlib.nullcontext()
+    with torch.no_grad(), amp_ctx:
+        return model.answer(
+            row,
+            effective_media,
+            max_new_tokens=max_new_tokens,
+            enable_thinking=enable_thinking,
+            do_sample=do_sample,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            repetition_penalty=repetition_penalty,
+        )

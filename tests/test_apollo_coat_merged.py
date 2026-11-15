@@ -689,18 +689,39 @@ def test_spark_fp8_checkpoint_lock_roundtrip_and_frozen_spark_ce_checkpoint(tmp_
     assert _active_component_keys(lock, ws_cfg) == ["spark_fp8", "vision"]
     assert _active_component_keys(lock, {"modalities": "omni"}) == [k for k in lock if k != "spark_fp8"]
 
-    # Verify channelwise FP8 safetensors export + reload roundtrip & frozen_spark_connector backward
+    # Verify channelwise FP8 + q4g128 sub-LSB residual safetensors export + reload roundtrip & sub-LSB delta fidelity
     model_a = make_synthetic_spark_native({"visual_cross_attn_blocks": 3, "apollo_min_dim": 64}, seed=707)
+    # Simulate an APOLLO full-finetune sub-LSB update on top of an exact E4M3-quantized base linear layer
+    target_w = model_a.spark.model.layers[0].mlp.down_proj.weight
+    with torch.no_grad():
+        w0 = target_w.detach().float()
+        s0 = (w0.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12) / 448.0).to(torch.bfloat16)
+        q0 = (w0 / s0.float()).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+        base_deq = q0.float() * s0.float()
+        gen = torch.Generator().manual_seed(20261115)
+        sub_lsb_delta = torch.randn(w0.shape, generator=gen, dtype=torch.float32) * (s0.float() * 0.25)
+        target_w.copy_((base_deq + sub_lsb_delta).to(target_w.dtype))
+        actual_delta = target_w.detach().float() - base_deq
+        # Confirm naive single-limb E4M3 re-quantization snaps most of this sub-LSB delta back to zero
+        s_naive = (target_w.detach().float().abs().amax(dim=-1, keepdim=True).clamp_min(1e-12) / 448.0).to(torch.bfloat16)
+        q_naive = (target_w.detach().float() / s_naive.float()).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+        naive_delta = q_naive.float() * s_naive.float() - base_deq
+        assert float((actual_delta - naive_delta).norm() / actual_delta.norm()) > 0.65
+
     sf_path = tmp_path / "model.safetensors"
     meta = export_spark_native_fp8_safetensors(model_a, sf_path)
     assert meta["quantized_linear_tensors"] == len(model_a.spark.model.layers) * 5
+    assert meta["residual_format"] == "q4g128"
 
     model_b = make_synthetic_spark_native({"visual_cross_attn_blocks": 3, "apollo_min_dim": 64}, seed=999)
     load_spark_native_safetensors(model_b, sf_path)
     w_a = model_a.spark.model.layers[0].mlp.down_proj.weight.detach().float()
     w_b = model_b.spark.model.layers[0].mlp.down_proj.weight.detach().float()
     rel_err = float((w_a - w_b).norm() / w_a.norm())
-    assert rel_err < 0.08
+    assert rel_err < 1e-3
+    recovered_delta = w_b - base_deq
+    delta_rel_err = float((actual_delta - recovered_delta).norm() / actual_delta.norm())
+    assert delta_rel_err < 0.15
     # Unquantized attention gate and RMSNorm tensors match exactly
     g_a = model_a.spark.model.layers[0].self_attn.headwise_attn_output_gate.weight
     g_b = model_b.spark.model.layers[0].self_attn.headwise_attn_output_gate.weight

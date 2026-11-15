@@ -123,7 +123,7 @@ def export_and_upload(campaign,config):
                 shutil.copy2(path,dest)
             fp8_meta=export_spark_native_fp8_safetensors(campaign.model,out_fp8/'model.safetensors')
             fp8_files=manifest(out_fp8)
-            write(out_fp8/'MODEL_RELEASE.json',{'schema_version':1,'campaign_id':config['campaign_id'],'binding':campaign.bound,'training_complete':True,'quantization':'compressed-tensors-fp8-e4m3-channel',**fp8_meta,**fp8_files})
+            write(out_fp8/'MODEL_RELEASE.json',{'schema_version':1,'campaign_id':config['campaign_id'],'binding':campaign.bound,'training_complete':True,'quantization':'compressed-tensors-fp8-e4m3-channel+q4g128-residual',**fp8_meta,**fp8_files})
             emit('local_fp8_model_export_ready',directory=str(out_fp8),model_release_sha256=sha(out_fp8/'MODEL_RELEASE.json'),**fp8_meta)
             result_payload['fp8_export_directory']=str(out_fp8)
             result_payload['fp8_model_release_sha256']=sha(out_fp8/'MODEL_RELEASE.json')
