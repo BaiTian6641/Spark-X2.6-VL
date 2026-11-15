@@ -30,6 +30,8 @@ PINNED_RUNTIME_PATHS = (
     "colab/final/optimizer.py",
     "colab/final/coat_spark.py",
     "colab/final/synccraft_bridge.py",
+    "colab/final/world_pipeline.py",
+    "colab/final/hybrid_corpus.py",
     "colab/final/data.py",
     "colab/final/model.py",
     "colab/final/engine.py",
@@ -178,7 +180,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH, help="Campaign JSON config path")
     parser.add_argument("--work-root", "--root", dest="work_root", type=Path, default=None, help="Optional override for config work_root")
-    parser.add_argument("--dataset-mode", choices=("local_synccraft", "hf_full"), default=None, help="Dataset source override")
+    parser.add_argument("--dataset-mode", choices=("local_synccraft", "hybrid_world_v32", "hf_full"), default=None, help="Dataset source override")
     parser.add_argument("--steps", type=int, default=None, help="Number of optimizer updates per profile in ablate mode")
     parser.add_argument("--resume-receipt", type=str, default=None, help="Receipt JSON path for resume mode")
     parser.add_argument("--no-animation", action="store_true", help="Exclude Stage-B animation clips during static pilot prep")
@@ -217,13 +219,16 @@ def main(argv: list[str] | None = None) -> int:
         write(effective_cfg_path, cfg)
 
     if args.command == "prepare-synccraft":
-        from colab.final.assets import prepare_local_synccraft_data
+        from colab.final.assets import prepare_data, prepare_local_synccraft_data
 
-        report = prepare_local_synccraft_data(
-            work_root,
-            cfg,
-            include_animation=not args.no_animation,
-        )
+        if cfg.get("dataset_mode") == "hybrid_world_v32":
+            report = prepare_data(work_root, os.environ.get("HF_TOKEN") or None, cfg)
+        else:
+            report = prepare_local_synccraft_data(
+                work_root,
+                cfg,
+                include_animation=not args.no_animation,
+            )
         print(json.dumps({"status": "ready", "work_root": str(work_root), "report": report}, indent=2))
         return 0
 

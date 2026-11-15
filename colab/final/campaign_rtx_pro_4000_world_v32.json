@@ -1,0 +1,184 @@
+{
+  "schema_version": 1,
+  "campaign_id": "spark-x26-vl-world-v32-rtxpro4000-24gb",
+  "work_root": "./work/spark-world-v32-24gb",
+  "execution_target": "local_workstation",
+  "hardware_profile": "rtx_pro_4000_blackwell_24gb",
+  "dataset_mode": "hybrid_world_v32",
+  "modalities": "vision_text",
+  "spark_component": "spark_fp8",
+  "spark_dtype": "bfloat16",
+  "vision_dtype": "bfloat16",
+  "model_repo": "TassP0lar/SparkX2.6-VL-SyncCraft-World-v32",
+  "model_repo_private": true,
+  "checkpoint_backend": "local",
+  "checkpoint_repo": "TassP0lar/SparkX2.6-VL-SyncCraft-World-v32-checkpoints",
+  "checkpoint_repo_private": true,
+  "drive_project_folder": null,
+  "drive_cap_bytes": 2000000000000,
+  "checkpoint_slots": 2,
+  "checkpoint_minutes": 60,
+  "initial_checkpoint_reservation_bytes": 12000000000,
+  "local_free_floor_bytes": 20000000000,
+  "cache_bytes_per_component": 4000000000,
+  "max_compute_units": 1000,
+  "observed_compute_balance": null,
+  "observed_cu_per_hour": null,
+  "enforce_compute_budget": false,
+  "compute_reserve_cu": 25,
+  "balance_refresh_hours": 12,
+  "seed": 39526,
+  "gradient_accumulation": 8,
+  "dataloader_workers": 4,
+  "dataloader_prefetch": 2,
+  "microbatch_size": 1,
+  "max_wall_hours": 240,
+  "direct_wall_hours": 72,
+  "max_sequence": 8192,
+  "max_answer_tokens": 4096,
+  "evaluation_max_new_tokens": 1536,
+  "learning_rate": 1.5e-05,
+  "connector_learning_rate": 0.00015,
+  "audio_output_learning_rate": 5e-06,
+  "weight_decay": 0.02,
+  "warmup_ratio": 0.06,
+  "clip_norm": 1.0,
+  "dynamic_shuffle": true,
+  "dynamic_training_augmentation": true,
+  "dynamic_multiview_shuffle": true,
+  "dynamic_pilot_synthesis": true,
+  "dynamic_photometric_jitter": true,
+  "label_smoothing": 0.005,
+  "adapter_dropout": 0.08,
+  "visual_token_dropout": 0.04,
+  "eval_every_epoch": true,
+  "early_stopping_patience": 2,
+  "early_stopping_min_rel_delta": 0.005,
+  "optimizer_profile": "apollo_coat",
+  "optimizer_ablation_profiles": [
+    "bf16_adamw",
+    "apollo_merged",
+    "apollo_coat",
+    "apollo_coat_fp8_moments"
+  ],
+  "apollo_rank": 64,
+  "apollo_rank_candidates": [
+    64,
+    32
+  ],
+  "apollo_scale": 1.0,
+  "apollo_update_proj_gap": 200,
+  "apollo_proj_method": "random",
+  "apollo_min_2d_dim": 256,
+  "apollo_include_embeddings": true,
+  "coat_activation_fp8": true,
+  "coat_activation_group_size": 16,
+  "coat_moment_fp8": false,
+  "coat_fp8_linear_forward": false,
+  "merged_grad_norm_mode": "per_example",
+  "visual_cross_attn_blocks": 3,
+  "visual_cross_attn_candidates": [
+    0,
+    3,
+    6
+  ],
+  "enable_thinking_synccraft": true,
+  "thumbnail_patches": 256,
+  "tile_patches": 512,
+  "detail_tiles": 4,
+  "max_visual_tokens": 768,
+  "video_semantic_frames": 4,
+  "motion_frames": 16,
+  "motion_size": 384,
+  "motion_tokens": 256,
+  "audio_tokens": 384,
+  "generator_prefix_tokens": 32,
+  "hybrid_spark_mm_scale": 1.0,
+  "hybrid_sat_per_type": 400,
+  "hybrid_compositional_scenes": 120,
+  "hybrid_synccraft_rendered_rigs": 120,
+  "hybrid_synccraft_artist_rigs": 240,
+  "hybrid_synccraft_quad_clips": 28,
+  "hybrid_synccraft_flagship_variants": 16,
+  "split_percent": {
+    "train": 80,
+    "dev": 8,
+    "promotion": 6,
+    "audit": 6
+  },
+  "stages": [
+    {
+      "name": "vision_connector_pilot",
+      "families": [
+        "image"
+      ],
+      "epochs": 4,
+      "alignment_only": true,
+      "stage_mode": "frozen_spark_connector",
+      "dynamic_epoch_records_per_family": {
+        "image": 600
+      }
+    },
+    {
+      "name": "vision_cross_attn_expansion",
+      "families": [
+        "image",
+        "video"
+      ],
+      "epochs": 4,
+      "alignment_only": true,
+      "stage_mode": "frozen_spark_cross_attn",
+      "dynamic_epoch_records_per_family": {
+        "image": 550,
+        "video": 150
+      }
+    },
+    {
+      "name": "world_3d_static_and_general_full",
+      "families": [
+        "image",
+        "text"
+      ],
+      "epochs": 4,
+      "alignment_only": false,
+      "stage_mode": "full_spark",
+      "include_synccraft_animation": false,
+      "dynamic_epoch_records_per_family": {
+        "image": 750,
+        "text": 450
+      }
+    },
+    {
+      "name": "world_3d_dynamics_and_sculpted_full",
+      "families": [
+        "image",
+        "video",
+        "text"
+      ],
+      "epochs": 4,
+      "alignment_only": false,
+      "stage_mode": "full_spark",
+      "include_synccraft_animation": true,
+      "dynamic_epoch_records_per_family": {
+        "image": 650,
+        "video": 200,
+        "text": 400
+      }
+    }
+  ],
+  "evaluation_per_family_language": 16,
+  "instructor_budget_usd": 50,
+  "instructor_enabled": true,
+  "instructor_model": "mimo-v2.6-pro",
+  "instructor_rounds": 0,
+  "instructor_records_per_round": 32,
+  "instructor_per_request_reservation_usd": 0.5,
+  "instructor_route_eligibility_receipt": null,
+  "instructor_max_completion_tokens": 2048,
+  "rsi_epochs": 2,
+  "promotion_max_relative_loss_regression": 0.03,
+  "promotion_min_abs_loss_tolerance": 0.02,
+  "allow_unreviewed_final_publication": false,
+  "max_checkpoint_minutes": 180,
+  "max_loss_weight": 5.0
+}

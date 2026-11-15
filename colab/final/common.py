@@ -92,7 +92,8 @@ def validate_config(c):
     if c.get('checkpoint_backend')=='huggingface' and not c['checkpoint_repo_private'] and not public_ok:
         raise ValueError('Public checkpoints require allow_public_artifacts=true and sanitized snapshots')
     if not 0 < c['instructor_budget_usd'] <= 50 or not 0 < c['max_compute_units'] <= 1000: raise ValueError('Campaign exceeds the authorized budget')
-    if c['cache_bytes_per_component']*10 > 24_000_000_000: raise ValueError('Global media cache exceeds its reservation')
+    max_global_cache=120_000_000_000 if target=='local_workstation' else 24_000_000_000
+    if c['cache_bytes_per_component']*10 > max_global_cache: raise ValueError('Global media cache exceeds its reservation')
     if c['checkpoint_slots']!=2 or c['drive_cap_bytes']>2_000_000_000_000: raise ValueError('Storage contract changed')
     if c['gradient_accumulation']<1 or c['max_sequence']>8192: raise ValueError('Unqualified batch/sequence policy')
     microbatch=c.get('microbatch_size',1)

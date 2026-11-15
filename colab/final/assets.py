@@ -308,6 +308,9 @@ def prepare_local_synccraft_data(root,config,*,include_animation=True,panel_size
 def prepare_data(root,token,config):
     from .data import build_database
     root=Path(root); root.mkdir(exist_ok=True,parents=True)
+    if config.get('dataset_mode')=='hybrid_world_v32':
+        from .hybrid_corpus import prepare_hybrid_world_v32_data
+        return prepare_hybrid_world_v32_data(root,token,config)
     if config.get('dataset_mode')=='local_synccraft' or (root/'metadata/HANDOFF.json').is_file():
         return prepare_local_synccraft_data(root,config)
     lock=read(HERE/'dataset.lock.json'); handoff=read(HERE.parent/'formal/HF_FULL_DATASET_HANDOFF.json')

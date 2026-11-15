@@ -543,3 +543,222 @@ def test_step6_synccraft_provenance_gate_family_split_isolation_and_compiler_sat
     assert bad_eval["sat_passed"] is False
     assert bad_eval["collision_count"] >= 1
     assert bad_eval["passed"] is False
+
+
+def test_synccraft_v32_sculpted_spin_and_4way_uv_curriculum():
+    """Verify ADR 0007 sculpted + blend_with + spin(...) exemplars, anti-cheat profile gate, and 4-way UV balance."""
+    from dataclasses import replace
+    from colab.final.synccraft_bridge import (
+        build_animation_clip_record,
+        build_artist_assistant_record,
+        build_multiview_consistency_record,
+        build_parametric_creature_world,
+        build_parametric_sculpted_wyvern_world,
+        build_parametric_walking_citadel_world,
+        build_uv_seam_alpha_diagnosis_record,
+        ensure_synccraft_importable,
+        evaluate_synccraft_completion,
+        make_clean_room_provenance,
+    )
+
+    ensure_synccraft_importable()
+    from synccraft.dsl.parser import format_program, parse_program
+
+    # 1. Exact 4-way UV/alpha diagnosis (`a0_o0`, `a1_o0`, `a0_o1`, `a1_o1`)
+    bio_ws = build_parametric_creature_world(variant=0, subdivisions_per_unit=2)
+    for inject_alpha in (False, True):
+        for inject_overlap in (False, True):
+            rec, blobs = build_uv_seam_alpha_diagnosis_record(
+                bio_ws,
+                asset_id=f"bio_{int(inject_alpha)}_{int(inject_overlap)}",
+                family_id="bio_fam",
+                inject_alpha_cutout=inject_alpha,
+                inject_uv_overlap=inject_overlap,
+                vary_target_faces=True,
+                panel_size=(128, 128),
+            )
+            assert len(blobs) == 2
+            ev = evaluate_synccraft_completion(rec, rec["answer"])
+            assert ev["passed"] is True, f"4-way UV failed for ({inject_alpha}, {inject_overlap}): {ev}"
+            # Flipping `has_alpha_cutout` must fail evaluation!
+            wrong_ans = rec["answer"].replace(
+                f'"has_alpha_cutout":{str(inject_alpha).lower()}',
+                f'"has_alpha_cutout":{str(not inject_alpha).lower()}',
+            )
+            assert evaluate_synccraft_completion(rec, wrong_ans)["passed"] is False
+
+    # 2. ADR 0007 Sculpted Wyvern & Colossal Walking Citadel (`spin(...)` + `blend_with`)
+    wyvern_ws = build_parametric_sculpted_wyvern_world(variant=1, subdivisions_per_unit=1)
+    citadel_ws = build_parametric_walking_citadel_world(variant=1, subdivisions_per_unit=1)
+    assert getattr(wyvern_ws.program.meta, "audit_profile", None) == "sculpted"
+    assert getattr(citadel_ws.program.meta, "audit_profile", None) == "sculpted"
+
+    mv_rec, mv_blobs = build_multiview_consistency_record(
+        citadel_ws,
+        asset_id="citadel_mv_01",
+        family_id="citadel_fam",
+        panel_size=(96, 96),
+    )
+    assert len(mv_blobs) == 4
+    mv_eval = evaluate_synccraft_completion(mv_rec, mv_rec["answer"])
+    assert mv_eval["passed"] is True
+    assert mv_eval["audit_profile"] == "sculpted"
+    assert mv_eval["sculpted_overlap_count"] >= 1
+
+    # Anti-cheat: downgrading `audit_profile` from `sculpted` to `authored` MUST fail!
+    parsed_citadel = parse_program(format_program(citadel_ws.program))
+    cheated_prog = replace(parsed_citadel, meta=replace(parsed_citadel.meta, audit_profile="authored"))
+    cheated_ans = f"<think>\nDowngrade profile.\n</think>\n```blockdsl\n{format_program(cheated_prog)}\n```"
+    cheat_eval = evaluate_synccraft_completion(mv_rec, cheated_ans)
+    assert cheat_eval["audit_profile_ok"] is False
+    assert cheat_eval["passed"] is False
+
+    # Spin-track animation record evaluation
+    anim_rec, anim_blobs = build_animation_clip_record(
+        world_state=citadel_ws,
+        clip_name="fortress_march",
+        asset_id="citadel_anim_01",
+        family_id="citadel_fam",
+        num_keyframes=4,
+        panel_size=(96, 96),
+    )
+    assert len(anim_blobs) == 4
+    anim_eval = evaluate_synccraft_completion(anim_rec, anim_rec["answer"])
+    assert anim_eval["passed"] is True
+    assert anim_eval["spin_tracks_ok"] is True
+
+    # Artist-assistant record builder & evaluator
+    prov = make_clean_room_provenance("bio_assist_01", title="Bio assist")
+    assist_rec, _ = build_artist_assistant_record(
+        bio_ws.program,
+        mode="coarse_to_fine_upgrade",
+        asset_id="bio_assist_01",
+        family_id="bio_fam",
+        provenance_override=prov,
+    )
+    assist_eval = evaluate_synccraft_completion(assist_rec, assist_rec["answer"])
+    assert assist_eval["passed"] is True
+
+
+def test_world_pipeline_bounded_repair_and_multi_engine_export(tmp_path):
+    """Verify SyncCraftWorldPipeline PGD/model bounded repair (`<=3` re-audits, CostLedger) + multi-format exports."""
+    from dataclasses import replace
+    from colab.final.synccraft_bridge import build_animated_quadruped_program, ensure_synccraft_importable
+    from colab.final.world_pipeline import SyncCraftWorldPipeline
+
+    ensure_synccraft_importable()
+    from synccraft.dsl.ast_nodes import Attach, Bone
+    from synccraft.dsl.parser import format_program
+
+    clean_prog = build_animated_quadruped_program(0)
+    first_box = next(item for item in clean_prog.root.items if type(item).__name__ == "Box")
+    # Attempt 0 intentionally emits an overlapping sibling box; Attempt 1 repairs it when prompted with SAT feedback
+    colliding_bone = Bone(
+        name="colliding_horn_stub",
+        attach=Attach(first_box.name, anchor=(0.0, 0.2, 0.0), align=(0.0, -1.0, 0.0)),
+        items=[replace(first_box, name="colliding_slab", place=None)],
+    )
+    broken_prog = replace(clean_prog, root=replace(clean_prog.root, items=[*clean_prog.root.items, colliding_bone]))
+
+    calls = []
+
+    def mock_vlm(prompt: str, images, attempt: int) -> str:
+        calls.append((attempt, prompt))
+        if attempt == 0:
+            return f"<think>\nInitial draft.\n</think>\n```blockdsl\n{format_program(broken_prog)}\n```"
+        assert "SAT collision" in prompt or "audit" in prompt.lower()
+        return f"<think>\nRemoving colliding slab while preserving discrete sizes.\n</think>\n```blockdsl\n{format_program(clean_prog)}\n```"
+
+    pipeline = SyncCraftWorldPipeline(mock_vlm)
+    out_dir = tmp_path / "exported_quad"
+    res = pipeline.generate_3d_asset(
+        "Create an articulated quadruped creature with gait animation.",
+        prompt_spec={"min_boxes": 5},
+        asset_name="iron_hound",
+        output_dir=out_dir,
+        export_formats=("bbmodel", "bedrock", "geckolib", "gltf_pbr", "labpbr"),
+        max_reaudits=3,
+        seed=101,
+    )
+    assert res["passed"] is True
+    assert 1 <= res["reaudits_used"] <= 3
+    assert res["cost_ledger"]["initial_audit_calls"] == 1
+    assert res["cost_ledger"]["reaudit_calls"] == res["reaudits_used"]
+    assert res["cost_ledger"]["compiler_calls"] == 1 + res["reaudits_used"]
+
+    bundle = res["bundle"]
+    assert bundle is not None
+    assert bundle["exports"]["bbmodel"]["roundtrip_box_count_match"] is True
+    assert bundle["exports"]["bedrock"]["serialized_vertex_max_error"] <= 1e-6
+    assert bundle["exports"]["geckolib"]["serialized_vertex_max_error"] <= 1e-6
+    assert (out_dir / "iron_hound.bbmodel").is_file()
+    assert (out_dir / "iron_hound.geo.json").is_file()
+    assert (out_dir / "iron_hound.animation.json").is_file()
+    assert (out_dir / "iron_hound_gltf" / "iron_hound.gltf").is_file()
+    assert (out_dir / "iron_hound_labpbr_n.png").is_file()
+
+    # Verify artist `.bbmodel` ingestion + critique + upgrade roundtrip
+    bb_doc = bundle["exports"]["bbmodel"]["document"]
+    upg = pipeline.critique_and_upgrade_asset(
+        bb_doc,
+        format_kind="bbmodel",
+        use_model_first=False,
+        asset_name="iron_hound_upgraded",
+        output_dir=tmp_path / "upgraded_quad",
+        export_formats=("bbmodel", "bedrock"),
+        seed=101,
+    )
+    assert upg["license_policy"] == "local_workspace_unverified"
+    assert upg["commercial_weights_eligible"] is False
+    assert upg["result"]["passed"] is True
+
+
+def test_dynamic_epoch_stratified_slicing_and_campaign_config(tmp_path):
+    """Verify task-stratified cyclic per-epoch subsampling draws fresh slices per epoch & validates v3.2 config."""
+    import sqlite3
+    from colab.final.common import HERE, read, validate_config
+    from colab.final.data import Catalogue, CommittedCursor
+
+    cfg = validate_config(read(HERE / "campaign_rtx_pro_4000_world_v32.json"))
+    assert cfg["dataset_mode"] == "hybrid_world_v32"
+    assert cfg["cache_bytes_per_component"] == 4_000_000_000
+
+    db_path = tmp_path / "slice_test.sqlite"
+    db = sqlite3.connect(db_path)
+    db.executescript(
+        """
+        CREATE TABLE packets(pid INTEGER PRIMARY KEY, component TEXT, shard TEXT, body TEXT, group_id TEXT);
+        CREATE TABLE rows(rid TEXT PRIMARY KEY, pid INTEGER, variant INTEGER, unit INTEGER, family TEXT, language TEXT, task TEXT, split TEXT, group_id TEXT);
+        """
+    )
+    pid = 1
+    for task_name, count in (("factual_caption", 40), ("sat_3d_perspective", 40), ("synccraft_uv_alpha_diagnosis", 12)):
+        for i in range(count):
+            rid = f"{task_name}_{i:03d}"
+            grp = f"grp_{task_name}_{i // 2:03d}"
+            body = f'{{"component":"c1","record":{{"id":"{rid}","task":"{task_name}","language":"en","prompt":"p","answer":"a"}},"transport":{{"shard":"s0.tar","media":[]}}}}'
+            db.execute("INSERT INTO packets VALUES(?,?,?,?,?)", (pid, "c1", "s0.tar", body, grp))
+            db.execute("INSERT INTO rows VALUES(?,?,?,?,?,?,?,?,?)", (rid, pid, 0, 0, "image", "en", task_name, "train", grp))
+            pid += 1
+    db.commit()
+    db.close()
+
+    cat = Catalogue(db_path, modalities="vision_text")
+    stage = {
+        "name": "test_dyn_stage",
+        "families": ["image"],
+        "epochs": 2,
+        "dynamic_epoch_records_per_family": {"image": 24},
+    }
+    order1 = cat.plan(stage, seed=39526)
+    order2 = cat.plan(stage, seed=39526)
+    assert len(order1) == 48
+    assert order1 == order2  # Deterministic across checkpoint resumes!
+    ep0 = set(order1[:24])
+    ep1 = set(order1[24:])
+    assert len(ep0) == 24 and len(ep1) == 24
+    # Large pools (`factual_caption`, `sat_3d_perspective`) advance cyclically so Epoch 1 introduces fresh unseen rows!
+    assert ep0 != ep1
+    cursor = CommittedCursor(order1)
+    assert CommittedCursor(order2, cursor.state()).committed == 0
+

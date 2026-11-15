@@ -107,7 +107,7 @@ def family(row):
         return 'audiovisual' if row.get('audio') else 'video'
     if row.get('audio'): return 'speech_in' if row['task']=='speech_recognition' else 'sound_in'
     if row.get('frames'): return 'image'
-    if row['task']=='text_replay': return 'text'
+    if row['task'] in ('text_replay','general_reasoning') or str(row.get('task','')).startswith('synccraft_'): return 'text'
     raise ValueError('No implemented modality for row '+row['task'])
 
 def conditioning_members(row):
@@ -238,6 +238,58 @@ def _stratified_group_shuffle(rids, group_by_rid, rng):
         group_keys = next_keys
     return out
 
+def _stratified_epoch_slice(fam_rows, target_n, task_by_rid, seed_prefix, epoch):
+    """Draw a deterministic, task-balanced, cyclic-disjoint slice of size `target_n` for `epoch`."""
+    target_n = int(target_n)
+    if target_n <= 0 or len(fam_rows) <= target_n:
+        return list(fam_rows)
+    by_task = defaultdict(list)
+    for r in fam_rows:
+        by_task[str(task_by_rid.get(r[0], '') or 'default')].append(r)
+    tasks = sorted(by_task)
+    pools = {
+        t: sorted(by_task[t], key=lambda x: identity([*seed_prefix, 'task_pool', t, x[0]]))
+        for t in tasks
+    }
+    quotas = {t: 0 for t in tasks}
+    # Minimum floor so rare high-signal tasks are represented every epoch
+    floor_each = max(1, target_n // max(2, 2 * len(tasks)))
+    remaining = target_n
+    for t in tasks:
+        give = min(len(pools[t]), floor_each, remaining)
+        quotas[t] = give
+        remaining -= give
+    # Distribute remaining budget proportional to sqrt(pool_size) (anti-collapse temperature weighting)
+    while remaining > 0:
+        avail = [t for t in tasks if quotas[t] < len(pools[t])]
+        if not avail:
+            break
+        weights = {t: math.sqrt(len(pools[t])) for t in avail}
+        w_sum = sum(weights.values()) or 1.0
+        progressed = False
+        for t in sorted(avail, key=lambda k: (-weights[k], k)):
+            if remaining <= 0:
+                break
+            share = max(1, int(round(remaining * weights[t] / w_sum)))
+            add = min(len(pools[t]) - quotas[t], share, remaining)
+            if add > 0:
+                quotas[t] += add
+                remaining -= add
+                progressed = True
+        if not progressed:
+            break
+    selected = []
+    for t in tasks:
+        q = quotas[t]
+        if q <= 0:
+            continue
+        pool = pools[t]
+        ln = len(pool)
+        start = (epoch * q) % ln
+        selected.extend(pool[(start + j) % ln] for j in range(q))
+    return selected
+
+
 class Catalogue:
     def __init__(self,db,modalities='omni'): self.db=sqlite3.connect(db); self.path=Path(db); self.modalities=modalities
     def row(self,rid):
@@ -259,39 +311,48 @@ class Catalogue:
     def plan(self,stage,seed,modalities=None):
         eff_mod=modalities or getattr(self,'modalities','omni')
         rows=self.select('train',stage['families']); cap=stage.get('max_records_per_family')
+        dyn_cap=stage.get('dynamic_epoch_records_per_family')
+        cols={col[1] for col in self.db.execute('PRAGMA table_info(rows)')}
+        task_by_rid=dict(self.db.execute("SELECT rid,task FROM rows WHERE split='train'")) if 'task' in cols else {}
         allowed_sc=set(stage['synccraft_tasks']) if stage.get('synccraft_tasks') else None
         exclude_sc_anim=(stage.get('include_synccraft_animation') is False)
-        if allowed_sc is not None or exclude_sc_anim:
-            cols={col[1] for col in self.db.execute('PRAGMA table_info(rows)')}
-            if 'task' in cols:
-                task_by_rid=dict(self.db.execute("SELECT rid,task FROM rows WHERE split='train'"))
-                filtered=[]
-                for r in rows:
-                    t=str(task_by_rid.get(r[0],'') or '')
-                    if t.startswith('synccraft_'):
-                        if exclude_sc_anim and ('animation' in t or 'motion' in t): continue
-                        if allowed_sc is not None and t not in allowed_sc: continue
-                    filtered.append(r)
-                if filtered: rows=filtered
+        if (allowed_sc is not None or exclude_sc_anim) and task_by_rid:
+            filtered=[]
+            for r in rows:
+                t=str(task_by_rid.get(r[0],'') or '')
+                if t.startswith('synccraft_'):
+                    if exclude_sc_anim and ('animation' in t or 'motion' in t): continue
+                    if allowed_sc is not None and t not in allowed_sc: continue
+                filtered.append(r)
+            if filtered: rows=filtered
         if cap:
             buckets=defaultdict(list)
             for r in rows: buckets[r[1]].append(r)
             rows=[r for fam in sorted(buckets) for r in sorted(buckets[fam],key=lambda x:identity([seed,x[0]]))[:cap]]
+        by_fam_all=defaultdict(list)
+        for r in rows: by_fam_all[r[1]].append(r)
         replay_pool=[]
-        replay_count=0
         if stage.get('replay_fraction'):
             replay_fams=('image','video','text') if eff_mod=='vision_text' else FAMILIES
             if stage.get('alignment_only'):
                 replay_fams=tuple(f for f in replay_fams if f!='text')
             replay_pool=[r for r in self.select('train',replay_fams) if r[1] not in stage['families']] if replay_fams else []
-            replay_count=min(len(replay_pool),round(len(rows)*stage['replay_fraction']))
-        cols={col[1] for col in self.db.execute('PRAGMA table_info(rows)')}
         group_by_rid=dict(self.db.execute("SELECT rid,group_id FROM rows WHERE split='train'")) if 'group_id' in cols else {}
         order=[]
         for epoch in range(stage['epochs']):
             ep_seed=int(identity([seed,stage.get('name',''),'epoch',epoch])[:16],16)
             buckets=defaultdict(list); rng=random.Random(ep_seed)
-            epoch_rows=list(rows)
+            if dyn_cap:
+                epoch_rows=[]
+                for fam in sorted(by_fam_all):
+                    f_cap=dyn_cap.get(fam) if isinstance(dyn_cap,dict) else int(dyn_cap)
+                    if f_cap:
+                        epoch_rows.extend(_stratified_epoch_slice(by_fam_all[fam],f_cap,task_by_rid,[seed,stage.get('name',''),fam],epoch))
+                    else:
+                        epoch_rows.extend(by_fam_all[fam])
+            else:
+                epoch_rows=list(rows)
+            replay_count=min(len(replay_pool),round(len(epoch_rows)*stage['replay_fraction'])) if stage.get('replay_fraction') else 0
             if replay_count>0:
                 pool_copy=list(replay_pool)
                 rng.shuffle(pool_copy)
@@ -364,7 +425,9 @@ class MediaReader:
         self.root=Path(root); self.config=config; self.checkpoint_slot_bytes=config['initial_checkpoint_reservation_bytes']; self.caches={}; self.contracts={}
         free_floor=config.get('local_free_floor_bytes',44_000_000_000)
         for c in handoff['components']:
-            contract=DatasetContract(self.root/'indices'/c['id']/'RELEASE.json',repo_id=handoff['repo_id'],commit=handoff['revision'],index_sha256=c['release_sha256'],prefix=c['prefix'])
+            c_repo=c.get('repo_id',handoff['repo_id'])
+            c_rev=c.get('revision',handoff['revision'])
+            contract=DatasetContract(self.root/'indices'/c['id']/'RELEASE.json',repo_id=c_repo,commit=c_rev,index_sha256=c['release_sha256'],prefix=c['prefix'])
             self.contracts[c['id']]=contract
             self.caches[c['id']]=RollingShardCache(contract,HFHTTPTransport(contract,token),root=self.root/'media-cache'/c['id'],max_bytes=config['cache_bytes_per_component'],reserve_free_bytes=free_floor+reserve,lookahead=0)
     @contextmanager
@@ -553,8 +616,8 @@ def apply_dynamic_training_augmentation(row, media, rng, config):
     aug_media = dict(media)
     task = str(aug_row.get('task', '') or '')
 
-    # 1. Dynamic on-the-fly synthesis for `text_replay` so arithmetic/text prompts never memorize
-    if config.get('dynamic_pilot_synthesis', True) and task == 'text_replay':
+    # 1. Dynamic on-the-fly synthesis ONLY for synthetic pilot `text_replay` rows (never real SparkX2.6-MM encyclopedia rows)
+    if config.get('dynamic_pilot_synthesis', True) and task == 'text_replay' and not (aug_row.get('metadata') or {}).get('real_text_corpus'):
         a = rng.randint(4, 49)
         b = rng.randint(4, 49)
         c = rng.randint(2, 31)

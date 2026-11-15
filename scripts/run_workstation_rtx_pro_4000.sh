@@ -465,8 +465,8 @@ log "[Phase 3/6] Running SM120 Blackwell GPU + COAT FP8 kernel doctor..."
 # ------------------------------------------------------------------------------
 # Phase 4: Clean-Room SyncCraft v3.2 Shards & Pretrained Spark/SigLIP2 Weights
 # ------------------------------------------------------------------------------
-if [[ "${DATASET_MODE}" == "local_synccraft" ]]; then
-  log "[Phase 4/6] Preparing deterministic clean-room SyncCraft v3.2 TAR shards & frozen SQLite splits..."
+if [[ "${DATASET_MODE}" == "local_synccraft" || "${DATASET_MODE}" == "hybrid_world_v32" ]]; then
+  log "[Phase 4/6] Preparing deterministic clean-room (${DATASET_MODE}) TAR shards & frozen SQLite splits..."
   "${VENV_PY}" "${REPO_ROOT}/scripts/launch_spark_synccraft.py" prepare-synccraft \
     --config "${CONFIG_PATH}" \
     --work-root "${WORK_ROOT}" \
