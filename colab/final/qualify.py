@@ -289,7 +289,12 @@ def qualify(campaign):
     import sys
     from types import SimpleNamespace
     module=sys.modules[type(model.spark).__module__]; adapter=module.eager_attention_forward
-    rid=campaign.catalogue.select('train',['image'],'en')[0][0]; row,media=campaign.media(rid)
+    cand_image_rids=[r[0] for r in campaign.catalogue.select('train',['image'],'en')]
+    def _parity_record_len(r_id:str)->tuple[int,int,str]:
+        rw,_=campaign.catalogue.row(r_id)
+        return (len(rw.get('frames') or ()), len(str(rw.get('prompt','')))+len(str(rw.get('answer',''))), r_id)
+    rid=min(cand_image_rids,key=_parity_record_len)
+    row,media=campaign.media(rid)
     optimizer.zero_grad(set_to_none=True)
     if c.get('modalities')=='vision_text':
         # Keep model.spark.train() so HF gradient_checkpointing remains active on 24 GB VRAM;
@@ -308,6 +313,7 @@ def qualify(campaign):
         )
         try:
             try:
+                torch.manual_seed(c['seed'])
                 module.eager_attention_forward=adapter._spark_reference
                 with torch.autocast('cuda',dtype=torch.bfloat16): reference_loss,_=model.loss(row,media)
                 reference_value=float(reference_loss.detach())
@@ -319,6 +325,7 @@ def qualify(campaign):
             finally:
                 module.eager_attention_forward=adapter
             acc_parity.zero_buffers()
+            torch.manual_seed(c['seed'])
             with torch.autocast('cuda',dtype=torch.bfloat16): candidate_loss,_=model.loss(row,media)
             candidate_value=float(candidate_loss.detach())
             with acc_parity.microbatch(weight=1.0,supervised_units=1):
