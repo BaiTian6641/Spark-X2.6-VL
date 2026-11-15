@@ -409,3 +409,73 @@ def test_qualify_matched_profiles_4_rung_ablation_and_end_to_end_checkpoint_rest
     for (k, p_orig), p_load in zip(model.state_dict().items(), loaded_model.state_dict().values()):
         assert torch.equal(p_orig, p_load), f"Checkpoint reload mismatch on {k}"
     assert len(loaded_opt.state) == len(opt.state)
+
+
+def test_workstation_cuda_diagnostics_and_ablation_oom_recovery():
+    import weakref
+    from colab.final.run import _diagnose_cuda_unavailable
+
+    diag = _diagnose_cuda_unavailable(torch)
+    assert f"torch={torch.__version__}" in diag
+    assert "torch_cuda_build=" in diag
+    if torch.version.cuda is None:
+        assert "CPU-only PyTorch wheel" in diag
+
+    rgb = Image.fromarray(np.full((32, 32, 3), 120, dtype=np.uint8), mode="RGB")
+    examples = [
+        (
+            {
+                "id": "oom_ex",
+                "_family": "image",
+                "language": "en",
+                "task": "oom_test",
+                "visual_kind": "ortho_render",
+                "enable_thinking": False,
+                "prompt": "Inspect",
+                "answer": "ok",
+            },
+            {
+                "images": [rgb],
+                "alphas": [None],
+                "visual_kind": "ortho_render",
+                "visual_units": [{"visual_kind": "ortho_render", "visual_kind_index": 0, "view_id": "front", "view_id_index": 0}],
+                "times": [0.0],
+                "capture_times": None,
+                "audio": None,
+                "target_audio": None,
+                "motion": None,
+                "motion_times": None,
+            },
+        )
+    ]
+    oom_refs: list[weakref.ReferenceType] = []
+
+    def builder(cfg):
+        m = make_synthetic_spark_native(cfg, seed=77)
+        if cfg["optimizer_profile"] == "bf16_adamw":
+            oom_refs.append(weakref.ref(m))
+            orig_fwd = m.forward
+
+            def boom(*args, **kwargs):
+                _ = orig_fwd(*args, **kwargs)
+                raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 24.00 GiB")
+
+            m.forward = boom
+        return m
+
+    base_cfg = make_synthetic_spark_native().policy
+    report = qualify_matched_profiles(
+        builder,
+        examples,
+        base_cfg,
+        profiles=("bf16_adamw", "apollo_coat", "apollo_coat_fp8_moments"),
+        rank_candidates=(32,),
+        microbatch_size=1,
+        accumulation_steps=1,
+        num_updates=1,
+        device="cpu",
+    )
+    assert report["profiles"]["bf16_adamw"]["status"] == "cuda_oom"
+    assert report["profiles"]["apollo_coat"]["status"] == "passed"
+    assert report["profiles"]["apollo_coat_fp8_moments"]["status"] == "passed"
+    assert len(oom_refs) == 1 and oom_refs[0]() is None, "OOM model must be freed before subsequent profiles run"

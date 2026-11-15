@@ -138,6 +138,7 @@ def qualify_matched_profiles(
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
 
+        model=opt=acc=coat_ctrl=out=mb_loss=chunk=None
         try:
             model=model_builder(cfg)
             model.set_stage(
@@ -181,6 +182,7 @@ def qualify_matched_profiles(
                             mb_loss.backward()
                         n_examples_total+=len(chunk)
                         upd_losses.append(float(out['loss'].detach()))
+                        out=mb_loss=None
                     stats=acc.step(
                         opt,
                         None,
@@ -222,13 +224,19 @@ def qualify_matched_profiles(
                 'coat_telemetry':coat_ctrl.telemetry.summary() if coat_ctrl is not None else None,
             }
             results[label]=entry
-            del model,opt
         except RuntimeError as exc:
-            if 'out of memory' in str(exc).lower():
-                results[label]={'status':'cuda_oom','optimizer_profile':cfg['optimizer_profile'],'reason':str(exc)[:400]}
+            is_oom=isinstance(exc,getattr(torch,'OutOfMemoryError',())) or 'out of memory' in str(exc).lower()
+            if is_oom:
+                reason=str(exc)[:400]
+                exc.__traceback__=None
+                results[label]={'status':'cuda_oom','optimizer_profile':cfg['optimizer_profile'],'reason':reason}
             else:
                 raise
         finally:
+            if acc is not None:
+                try: acc.close()
+                except Exception: pass
+            model=opt=acc=coat_ctrl=out=mb_loss=chunk=None
             gc.collect()
             if is_cuda: torch.cuda.empty_cache()
 
@@ -278,24 +286,67 @@ def qualify(campaign):
     initial_key=campaign.state['last_checkpoint_local']
 
     import sys
+    from types import SimpleNamespace
     module=sys.modules[type(model.spark).__module__]; adapter=module.eager_attention_forward
     rid=campaign.catalogue.select('train',['image'],'en')[0][0]; row,media=campaign.media(rid)
-    model.eval(); optimizer.zero_grad(set_to_none=True)
-    try:
-        module.eager_attention_forward=adapter._spark_reference
-        with torch.autocast('cuda',dtype=torch.bfloat16): reference_loss,_=model.loss(row,media)
-        reference_loss.backward()
-        reference_grads={n:p.grad.detach().flatten()[:16].float().cpu().clone() for n,p in model.named_parameters() if p.grad is not None}
-        reference_norms={n:float(p.grad.detach().float().norm()) for n,p in model.named_parameters() if p.grad is not None}
-    finally: module.eager_attention_forward=adapter
     optimizer.zero_grad(set_to_none=True)
-    with torch.autocast('cuda',dtype=torch.bfloat16): candidate_loss,_=model.loss(row,media)
-    candidate_loss.backward()
-    reference_value=float(reference_loss.detach());candidate_value=float(candidate_loss.detach())
-    if abs(reference_value-candidate_value)>.01: raise RuntimeError('Full Spark BF16 attention loss parity failed')
-    parity=check_kernel_gradient_parity(reference_grads,reference_norms,model.named_parameters())
+    if c.get('modalities')=='vision_text':
+        # Keep model.spark.train() so HF gradient_checkpointing remains active on 24 GB VRAM;
+        # temporarily zero any Dropout layers so reference vs SDPA forward/backward are deterministic.
+        saved_dropouts=[(m,m.p) for m in model.modules() if isinstance(m,torch.nn.Dropout)]
+        for m,_ in saved_dropouts: m.p=0.0
+        model.train()
+        if model.vision is not None: model.vision.eval()
+        acc_parity=MergedGradientAccumulator(
+            model,
+            accum_mode='bf16_apollo_fp32_small',
+            min_bf16_accum_dim=int(c.get('apollo_min_dim',128)),
+        )
+        try:
+            try:
+                module.eager_attention_forward=adapter._spark_reference
+                with torch.autocast('cuda',dtype=torch.bfloat16): reference_loss,_=model.loss(row,media)
+                reference_value=float(reference_loss.detach())
+                with acc_parity.microbatch(weight=1.0,supervised_units=1):
+                    reference_loss.backward()
+                del reference_loss
+                reference_grads={n:acc_parity.buffers[id(p)].detach().flatten()[:16].float().cpu().clone() for n,p in model.named_parameters() if id(p) in acc_parity.buffers}
+                reference_norms={n:float(acc_parity.buffers[id(p)].detach().float().norm()) for n,p in model.named_parameters() if id(p) in acc_parity.buffers}
+            finally:
+                module.eager_attention_forward=adapter
+            acc_parity.zero_grad()
+            with torch.autocast('cuda',dtype=torch.bfloat16): candidate_loss,_=model.loss(row,media)
+            candidate_value=float(candidate_loss.detach())
+            with acc_parity.microbatch(weight=1.0,supervised_units=1):
+                candidate_loss.backward()
+            del candidate_loss
+            if abs(reference_value-candidate_value)>.01: raise RuntimeError('Full Spark BF16 attention loss parity failed')
+            cand_named=[(n,SimpleNamespace(grad=acc_parity.buffers.get(id(p)))) for n,p in model.named_parameters()]
+            parity=check_kernel_gradient_parity(reference_grads,reference_norms,cand_named)
+            del cand_named
+        finally:
+            acc_parity.close(); del acc_parity
+            for m,orig_p in saved_dropouts: m.p=orig_p
+            torch.cuda.empty_cache()
+        del reference_grads,reference_norms
+    else:
+        model.eval()
+        try:
+            module.eager_attention_forward=adapter._spark_reference
+            with torch.autocast('cuda',dtype=torch.bfloat16): reference_loss,_=model.loss(row,media)
+            reference_loss.backward()
+            reference_grads={n:p.grad.detach().flatten()[:16].float().cpu().clone() for n,p in model.named_parameters() if p.grad is not None}
+            reference_norms={n:float(p.grad.detach().float().norm()) for n,p in model.named_parameters() if p.grad is not None}
+        finally: module.eager_attention_forward=adapter
+        optimizer.zero_grad(set_to_none=True)
+        with torch.autocast('cuda',dtype=torch.bfloat16): candidate_loss,_=model.loss(row,media)
+        candidate_loss.backward()
+        reference_value=float(reference_loss.detach());candidate_value=float(candidate_loss.detach())
+        if abs(reference_value-candidate_value)>.01: raise RuntimeError('Full Spark BF16 attention loss parity failed')
+        parity=check_kernel_gradient_parity(reference_grads,reference_norms,model.named_parameters())
+        del reference_grads,reference_norms,reference_loss,candidate_loss
+    optimizer.zero_grad(set_to_none=True); model.train()
     kernel_parity={'passed':True,'real_training_record':rid,'reference_loss':reference_value,'sdpa_loss':candidate_value,**parity,'scope':'Full resident Spark+vision BF16 loss, sampled-gradient and full-tensor gradient-norm comparison; CPU tests compare all tiny-decoder gradients'}
-    del reference_grads,reference_norms,reference_loss,candidate_loss; optimizer.zero_grad(set_to_none=True); model.train()
 
     before=sample_parameters(model); seen=set(); timings=defaultdict(list); rows=campaign.catalogue.select('train'); by_family=defaultdict(list)
     for r in rows: by_family[r[1]].append(r[0])

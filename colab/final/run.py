@@ -61,13 +61,81 @@ def direct_doctor(root):
             'studio_backend_sha256':sha(backend.__file__),'direct_mode':True,'flash_attn_cute_backward':True}
     write(Path(root)/'ENVIRONMENT.json',report); emit('environment_ready',**report); return report
 
+def _diagnose_cuda_unavailable(torch) -> str:
+    import ctypes,platform,shutil,subprocess
+    facts=[
+        f'torch={torch.__version__}',
+        f'torch_cuda_build={torch.version.cuda!r}',
+        f'CUDA_VISIBLE_DEVICES={os.environ.get("CUDA_VISIBLE_DEVICES","<unset>")!r}',
+    ]
+    if torch.version.cuda is None:
+        facts.append('CAUSE=CPU-only PyTorch wheel installed in venv (reinstall CUDA wheel from cu130/cu128 with --force-reinstall)')
+    if os.environ.get('CUDA_VISIBLE_DEVICES') in ('','-1'):
+        facts.append('CAUSE=CUDA_VISIBLE_DEVICES masks all GPUs (unset CUDA_VISIBLE_DEVICES)')
+    if platform.system()=='Linux':
+        is_wsl=os.path.exists('/dev/dxg')
+        if is_wsl:
+            facts.append('env=WSL2(/dev/dxg)')
+            if not os.path.exists('/usr/lib/wsl/lib/libcuda.so.1'):
+                facts.append('CAUSE=WSL2 libcuda.so.1 missing under /usr/lib/wsl/lib (install NVIDIA Windows Driver >=570 for RTX PRO 4000 Blackwell)')
+        else:
+            devs={}
+            for dev in ('/dev/nvidiactl','/dev/nvidia0','/dev/nvidia-uvm'):
+                exists=os.path.exists(dev)
+                rw=os.access(dev,os.R_OK|os.W_OK) if exists else False
+                devs[dev]='rw' if rw else ('no_perms' if exists else 'missing')
+            facts.append(f'dev_nodes={devs}')
+            if os.path.isfile('/proc/driver/nvidia/version'):
+                try:
+                    nv_ver=Path('/proc/driver/nvidia/version').read_text().splitlines()[0].strip()
+                    facts.append(f'kernel_module={nv_ver!r}')
+                    if 'Open Kernel Module' not in nv_ver:
+                        facts.append('CAUSE=Closed proprietary nvidia.ko loaded; RTX PRO 4000 Blackwell SFF (SM120) REQUIRES nvidia-open kernel modules (nvidia-driver-580-open / 570-open)')
+                except Exception:
+                    pass
+            if devs['/dev/nvidia0']=='missing':
+                facts.append('HINT=Blackwell GPUs (RTX PRO 4000 SFF / SM120) on Linux require nvidia-open kernel modules (>=570-open) and Secure Boot MOK enrollment if enabled')
+            elif devs['/dev/nvidiactl']=='no_perms':
+                facts.append('HINT=Add user to video/render groups: sudo usermod -aG video,render $USER')
+            elif devs['/dev/nvidia-uvm']=='missing':
+                facts.append('CAUSE=/dev/nvidia-uvm missing (run: sudo apt install -y nvidia-modprobe && sudo modprobe nvidia_uvm && sudo nvidia-modprobe -u -c=0)')
+        try:
+            libcuda=ctypes.CDLL('libcuda.so.1')
+            cu_rc=int(libcuda.cuInit(0))
+            facts.append(f'libcuda_cuInit_rc={cu_rc}')
+            if cu_rc==35:
+                facts.append('CAUSE=NVIDIA driver CUDA version is older than installed PyTorch CUDA runtime (use cu128 wheel on 570/575 drivers or upgrade driver >=580 for cu130)')
+            elif cu_rc in (804,999) and not is_wsl and not os.path.exists('/dev/nvidia-uvm'):
+                facts.append('CAUSE=nvidia_uvm not initialized (run: sudo modprobe nvidia_uvm && sudo nvidia-modprobe -u -c=0)')
+        except Exception as exc:
+            facts.append(f'libcuda_load={type(exc).__name__}:{exc}')
+        if shutil.which('nvidia-smi'):
+            smi=subprocess.run(['nvidia-smi','-L'],capture_output=True,text=True,timeout=8,check=False)
+            smi_out=(smi.stdout.strip() or smi.stderr.strip()).replace('\n',' | ')[:240]
+            facts.append(f'nvidia_smi_rc={smi.returncode}:{smi_out}')
+    return '; '.join(facts)
+
+
 def workstation_doctor(root,config):
     """Verify local Blackwell SM120 24 GB workstation runtime + COAT FP8 kernels without Colab/Studio lock-in."""
-    import importlib.metadata,psutil,torch
+    import importlib.metadata,platform,psutil,shutil,subprocess
+    # Pre-initialize /dev/nvidia-uvm and strip CUDA stub paths BEFORE importing/probing torch.cuda.
+    if os.environ.get('CUDA_VISIBLE_DEVICES') in ('','-1'):
+        os.environ.pop('CUDA_VISIBLE_DEVICES',None)
+    if os.environ.get('LD_LIBRARY_PATH'):
+        cleaned=[p for p in os.environ['LD_LIBRARY_PATH'].split(':') if p and '/stubs' not in p]
+        os.environ['LD_LIBRARY_PATH']=':'.join(cleaned)
+    if platform.system()=='Linux' and os.path.exists('/dev/dxg') and os.path.isdir('/usr/lib/wsl/lib'):
+        cur_ld=os.environ.get('LD_LIBRARY_PATH','')
+        if '/usr/lib/wsl/lib' not in cur_ld.split(':'):
+            os.environ['LD_LIBRARY_PATH']='/usr/lib/wsl/lib'+(f':{cur_ld}' if cur_ld else '')
+    if platform.system()=='Linux' and os.path.exists('/dev/nvidia0') and not os.path.exists('/dev/nvidia-uvm') and shutil.which('nvidia-modprobe'):
+        subprocess.run(['nvidia-modprobe','-u','-c=0'],check=False,capture_output=True,timeout=5)
+    import torch
     from .coat_spark import qualify_coat_kernels
     from .common import HARDWARE_PROFILES
     if torch.version.hip or not torch.cuda.is_available():
-        raise RuntimeError('Workstation mode requires an NVIDIA CUDA GPU')
+        raise RuntimeError('Workstation mode requires an NVIDIA CUDA GPU ('+_diagnose_cuda_unavailable(torch)+')')
     if not torch.cuda.is_bf16_supported():
         raise RuntimeError('Native BF16 support is required')
     hw_name=config.get('hardware_profile','rtx_pro_4000_blackwell_24gb')

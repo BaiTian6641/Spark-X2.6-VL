@@ -5,6 +5,8 @@ __pycache__/
 .test-cache/
 .test-tmp/
 .venv/
+.venv-*/
+work/
 .env
 .env.*
 env-cpu/
