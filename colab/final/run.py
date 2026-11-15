@@ -362,6 +362,8 @@ def dispatch(a,config,secrets):
             lambda cfg: SparkNative(paths,cfg,device='cuda',pretrained=True),
             examples,
             config,
+            profiles=tuple(config.get('optimizer_ablation_profiles',('bf16_adamw','apollo_merged','apollo_coat','apollo_coat_fp8_moments'))),
+            rank_candidates=tuple(config.get('apollo_rank_candidates',(64,32))),
             device='cuda',
             microbatch_size=int(config.get('microbatch_size',1)),
             accumulation_steps=max(1,int(config.get('gradient_accumulation',8))//max(1,int(config.get('microbatch_size',1)))),

@@ -10,6 +10,7 @@ Mirrors Spark2_5ForCausalLM's exact architectural invariants:
 """
 from __future__ import annotations
 
+import functools
 from types import SimpleNamespace
 from typing import Any
 
@@ -18,6 +19,7 @@ from PIL import Image
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 class FakeTokenizer:
@@ -230,6 +232,8 @@ class SyntheticSparkInnerModel(nn.Module):
             ]
         )
         self.norm = Spark2_5RMSNorm(hidden_size)
+        self.gradient_checkpointing = False
+        self._gradient_checkpointing_func = functools.partial(checkpoint, use_reentrant=False)
 
     def forward(
         self,
@@ -253,7 +257,12 @@ class SyntheticSparkInnerModel(nn.Module):
         next_cache: list[tuple[torch.Tensor, torch.Tensor]] | None = [] if use_cache else None
         for idx, layer in enumerate(self.layers):
             pkv = past_key_values[idx] if past_key_values is not None else None
-            h, layer_kv = layer(h, attention_mask=attention_mask, past_kv=pkv, use_cache=use_cache)
+            if self.gradient_checkpointing and self.training and not use_cache:
+                h, layer_kv = self._gradient_checkpointing_func(
+                    layer.__call__, h, attention_mask=attention_mask, past_kv=pkv, use_cache=use_cache
+                )
+            else:
+                h, layer_kv = layer(h, attention_mask=attention_mask, past_kv=pkv, use_cache=use_cache)
             if output_hidden_states and hidden_states is not None:
                 hidden_states.append(h)
             if use_cache and next_cache is not None and layer_kv is not None:
@@ -269,6 +278,8 @@ class SyntheticSparkInnerModel(nn.Module):
 
 
 class SyntheticSparkCausalLM(nn.Module):
+    supports_gradient_checkpointing = True
+
     def __init__(
         self,
         vocab_size: int = FakeTokenizer.VOCAB_SIZE,
@@ -290,6 +301,11 @@ class SyntheticSparkCausalLM(nn.Module):
         self.model = SyntheticSparkInnerModel(vocab_size, hidden_size, intermediate_size, num_heads, num_layers)
         self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
         self.tie_weights()
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs: dict[str, Any] | None = None) -> None:
+        opts = gradient_checkpointing_kwargs or {"use_reentrant": False}
+        self.model.gradient_checkpointing = True
+        self.model._gradient_checkpointing_func = functools.partial(checkpoint, **opts)
 
     def tie_weights(self) -> None:
         self.lm_head.weight = self.model.embed_tokens.weight

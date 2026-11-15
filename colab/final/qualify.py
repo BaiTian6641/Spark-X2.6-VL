@@ -158,6 +158,7 @@ def qualify_matched_profiles(
                 model,
                 accum_mode=buf_policy,
                 min_bf16_accum_dim=int(cfg.get('apollo_min_dim',128)),
+                allow_embeddings_in_apollo=bool(cfg.get('apollo_include_embeddings',False)),
             )
             losses:list[float]=[]
             grad_norms:list[float]=[]
@@ -301,6 +302,7 @@ def qualify(campaign):
             model,
             accum_mode='bf16_apollo_fp32_small',
             min_bf16_accum_dim=int(c.get('apollo_min_dim',128)),
+            allow_embeddings_in_apollo=bool(c.get('apollo_include_embeddings',False)),
         )
         try:
             try:
@@ -375,6 +377,7 @@ def qualify(campaign):
         model,
         accum_mode='bf16_apollo_fp32_small',
         min_bf16_accum_dim=int(c.get('apollo_min_dim',128)),
+        allow_embeddings_in_apollo=bool(c.get('apollo_include_embeddings',False)),
     )
 
     try:
@@ -471,6 +474,7 @@ def qualify(campaign):
         model,
         accum_mode='bf16_apollo_fp32_small',
         min_bf16_accum_dim=int(c.get('apollo_min_dim',128)),
+        allow_embeddings_in_apollo=bool(c.get('apollo_include_embeddings',False)),
     )
     try:
         for rid in next_ids:

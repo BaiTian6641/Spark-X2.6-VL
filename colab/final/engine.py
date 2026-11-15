@@ -546,6 +546,7 @@ class Campaign:
             self.model,
             accum_mode=buf_policy,
             min_bf16_accum_dim=int(self.c.get('apollo_min_dim',128)),
+            allow_embeddings_in_apollo=bool(self.c.get('apollo_include_embeddings',False)),
         )
         norm_mode=str(self.c.get('merged_grad_norm_mode','per_example'))
 

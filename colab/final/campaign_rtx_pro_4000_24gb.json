@@ -57,6 +57,7 @@
   "apollo_update_proj_gap": 200,
   "apollo_proj_method": "random",
   "apollo_min_2d_dim": 256,
+  "apollo_include_embeddings": true,
   "coat_activation_fp8": true,
   "coat_activation_group_size": 16,
   "coat_moment_fp8": false,

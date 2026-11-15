@@ -479,3 +479,130 @@ def test_workstation_cuda_diagnostics_and_ablation_oom_recovery():
     assert report["profiles"]["apollo_coat"]["status"] == "passed"
     assert report["profiles"]["apollo_coat_fp8_moments"]["status"] == "passed"
     assert len(oom_refs) == 1 and oom_refs[0]() is None, "OOM model must be freed before subsequent profiles run"
+
+
+def test_gradient_checkpointing_recomputation_with_visual_cross_attn_and_coat():
+    """Regression test for non-reentrant gradient checkpointing + GatedVisualCrossAttentionBlock + COAT.
+
+    Verifies mixed image + pure-text microbatches save identical tensor counts during forward
+    and recomputation (no CheckpointError) under both `_gradient_checkpointing_func` and
+    direct module-level `checkpoint(...)` styles, plus `apollo_include_embeddings=True`.
+    """
+    import tests._spark_test_fakes as fakes_mod
+    from colab.final.engine import ensure_coat_for_model
+
+    rgb = Image.fromarray(np.full((48, 48, 3), 90, dtype=np.uint8), mode="RGB")
+    img_ex = (
+        {
+            "id": "ckpt_img",
+            "_family": "image",
+            "language": "en",
+            "task": "ckpt_test",
+            "visual_kind": "multiview_sheet",
+            "enable_thinking": True,
+            "prompt": "Inspect multiview",
+            "answer": "<think>\nCheck box.\n</think>\nok",
+        },
+        {
+            "images": [rgb],
+            "alphas": [None],
+            "visual_kind": "multiview_sheet",
+            "visual_units": [{"visual_kind": "multiview_sheet", "visual_kind_index": 1, "view_id": "front", "view_id_index": 0}],
+            "times": [0.0],
+            "capture_times": None,
+            "audio": None,
+            "target_audio": None,
+            "motion": None,
+            "motion_times": None,
+        },
+    )
+    txt_ex = (
+        {
+            "id": "ckpt_txt",
+            "_family": "text",
+            "language": "en",
+            "task": "ckpt_test_txt",
+            "enable_thinking": False,
+            "prompt": "Hello",
+            "answer": "world",
+        },
+        {
+            "images": None,
+            "alphas": None,
+            "times": None,
+            "capture_times": None,
+            "audio": None,
+            "target_audio": None,
+            "motion": None,
+            "motion_times": None,
+        },
+    )
+
+    cfg = {
+        "optimizer_profile": "apollo_coat",
+        "apollo_rank": 16,
+        "apollo_min_dim": 64,
+        "apollo_include_embeddings": True,
+        "visual_cross_attn_blocks": 3,
+        "microbatch_size": 2,
+    }
+    model = make_synthetic_spark_native(cfg, seed=515)
+    assert model.spark.model.gradient_checkpointing is True
+    # Set nonzero cross-attn gates so gradients actively flow through both gate_attn/gate_ffn and vis_ctx!
+    with torch.no_grad():
+        for blk in model.visual_cross_attn:
+            blk.gate_attn.fill_(0.25)
+            blk.gate_ffn.fill_(0.25)
+
+    model.set_stage(False, stage_mode="full_spark")
+    model.train()
+    coat_ctrl = ensure_coat_for_model(model, model.policy)
+    opt = optimizer_for(model, model.policy)
+    acc = MergedGradientAccumulator(
+        model,
+        accum_mode="bf16_apollo_fp32_small",
+        min_bf16_accum_dim=64,
+        allow_embeddings_in_apollo=True,
+    )
+    # Verify embed_tokens uses BF16 merged buffer and APOLLO low-rank group when apollo_include_embeddings=True
+    emb_pid = id(model.spark.model.embed_tokens.weight)
+    assert acc.buffers[emb_pid].dtype == torch.bfloat16
+    apollo_pids = {id(p) for g in opt.param_groups if g.get("kind") == "apollo" for p in g["params"]}
+    assert emb_pid in apollo_pids
+
+    try:
+        # 1. Mixed [image, pure-text] batch in a single autograd graph -> backward outside coat_ctx / scope!
+        with coat_ctrl.activation_context(training=True):
+            out = model(examples=[img_ex, txt_ex])
+            loss_sum = out["per_example_loss"].sum()
+        with acc.microbatch(weight=1.0, supervised_units=int(out["supervised_units"])):
+            loss_sum.backward()
+
+        xattn_grad_norm = sum(
+            float(acc.buffers[id(p)].float().norm())
+            for p in model.visual_cross_attn.parameters()
+            if id(p) in acc.buffers
+        )
+        proj_grad_norm = sum(
+            float(acc.buffers[id(p)].float().norm())
+            for p in model.vision_projector.parameters()
+            if id(p) in acc.buffers
+        )
+        assert xattn_grad_norm > 0.0
+        assert proj_grad_norm > 0.0
+        stats = acc.step(opt, invalidate_caches_fn=coat_ctrl.invalidate_weight_caches)
+        assert stats.finite and stats.applied
+
+        # 2. Also verify direct module-level `checkpoint(layer.__call__, ...)` path without `_gradient_checkpointing_func`
+        model.spark.model._gradient_checkpointing_func = lambda fn, *a, **kw: fakes_mod.checkpoint(
+            fn, *a, use_reentrant=False, **kw
+        )
+        with coat_ctrl.activation_context(training=True):
+            out2 = model(examples=[img_ex, txt_ex])
+            loss2 = out2["per_example_loss"].sum()
+        with acc.microbatch(weight=1.0, supervised_units=int(out2["supervised_units"])):
+            loss2.backward()
+        stats2 = acc.step(opt, invalidate_caches_fn=coat_ctrl.invalidate_weight_caches)
+        assert stats2.finite and stats2.applied
+    finally:
+        acc.close()

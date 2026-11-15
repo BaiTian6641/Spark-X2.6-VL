@@ -863,6 +863,7 @@ class MergedGradientAccumulator:
         *,
         accum_mode: str = "fp32",
         min_bf16_accum_dim: int = 128,
+        allow_embeddings_in_apollo: bool = False,
         attach_hooks: bool = True,
     ):
         if accum_mode not in ("fp32", "bf16_apollo_fp32_small", "param_dtype"):
@@ -870,6 +871,7 @@ class MergedGradientAccumulator:
         self.model = model
         self.accum_mode = accum_mode
         self.min_bf16_accum_dim = int(min_bf16_accum_dim)
+        self.allow_embeddings_in_apollo = bool(allow_embeddings_in_apollo)
         self.params: list[nn.Parameter] = []
         self.param_names: dict[int, str] = {}
         self.buffers: dict[int, torch.Tensor] = {}
@@ -899,7 +901,12 @@ class MergedGradientAccumulator:
         if self.accum_mode == "param_dtype":
             return p.dtype
         # bf16_apollo_fp32_small: keep norms/gates/biases in FP32, large 2D matrices in BF16.
-        if is_high_precision_small_or_sensitive_param(name, p, min_apollo_dim=self.min_bf16_accum_dim):
+        if is_high_precision_small_or_sensitive_param(
+            name,
+            p,
+            min_apollo_dim=self.min_bf16_accum_dim,
+            allow_embeddings_in_apollo=self.allow_embeddings_in_apollo,
+        ):
             return torch.float32
         return torch.bfloat16
 

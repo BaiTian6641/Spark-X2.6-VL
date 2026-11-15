@@ -11,7 +11,8 @@ Key contracts:
 """
 from __future__ import annotations
 from contextlib import contextmanager
-import hashlib, math, sys
+from contextvars import ContextVar
+import functools, hashlib, math, sys
 from pathlib import Path
 from typing import Any
 import numpy as np
@@ -20,6 +21,9 @@ from torch import nn
 from torch.nn import functional as F
 from .common import HERE, read, sha
 from .data import VIEW_IDS, VIEW_ID_TO_INDEX, VISUAL_KINDS, VISUAL_KIND_TO_INDEX, extract_image_rgb_and_alpha
+
+_ACTIVE_VISUAL_CONTEXT: ContextVar[torch.Tensor | None] = ContextVar('_ACTIVE_VISUAL_CONTEXT', default=None)
+_INSIDE_VIS_CKPT_WRAPPER: ContextVar[bool] = ContextVar('_INSIDE_VIS_CKPT_WRAPPER', default=False)
 
 def install_spark_sdpa(spark):
     """Replace only the reference attention kernel, keeping masks/RoPE/gates."""
@@ -425,6 +429,8 @@ class SparkNative(nn.Module):
                 def _hook(_module, _inputs, output):
                     vis_ctx = getattr(self, '_active_visual_context', None)
                     if vis_ctx is None:
+                        vis_ctx = _ACTIVE_VISUAL_CONTEXT.get()
+                    if vis_ctx is None:
                         return output
                     if isinstance(output, tuple):
                         hs = b(output[0], vis_ctx)
@@ -439,14 +445,82 @@ class SparkNative(nn.Module):
     @contextmanager
     def _visual_cross_attn_scope(self, visual_tokens: torch.Tensor | None):
         prev = getattr(self, '_active_visual_context', None)
-        if visual_tokens is not None and len(getattr(self, 'visual_cross_attn', ())) > 0:
-            self._active_visual_context = visual_tokens
-        else:
-            self._active_visual_context = None
+        active = (
+            visual_tokens
+            if (visual_tokens is not None and len(getattr(self, 'visual_cross_attn', ())) > 0)
+            else None
+        )
+        self._active_visual_context = active
+        ctx_tok = _ACTIVE_VISUAL_CONTEXT.set(active)
         try:
             yield
         finally:
+            _ACTIVE_VISUAL_CONTEXT.reset(ctx_tok)
             self._active_visual_context = prev
+
+    def _make_vis_aware_checkpoint_fn(self, base_ckpt):
+        def _vis_aware_ckpt(fn, *args, **kwargs):
+            if _INSIDE_VIS_CKPT_WRAPPER.get():
+                return base_ckpt(fn, *args, **kwargs)
+            vis_ctx = getattr(self, '_active_visual_context', None)
+            if vis_ctx is None:
+                vis_ctx = _ACTIVE_VISUAL_CONTEXT.get()
+            guard_tok = _INSIDE_VIS_CKPT_WRAPPER.set(True)
+            try:
+                if vis_ctx is None:
+                    def _no_vis_fn(*a, **kw):
+                        with self._visual_cross_attn_scope(None):
+                            return fn(*a, **kw)
+                    return base_ckpt(_no_vis_fn, *args, **kwargs)
+
+                def _with_vis_fn(captured_vis, *a, **kw):
+                    with self._visual_cross_attn_scope(captured_vis):
+                        return fn(*a, **kw)
+
+                return base_ckpt(_with_vis_fn, vis_ctx, *args, **kwargs)
+            finally:
+                _INSIDE_VIS_CKPT_WRAPPER.reset(guard_tok)
+
+        _vis_aware_ckpt._spark_vis_ctx_wrapped = True
+        return _vis_aware_ckpt
+
+    def _wrap_spark_gradient_checkpointing(self, opts: dict[str, Any]) -> None:
+        spark = getattr(self, 'spark', None)
+        if spark is None:
+            return
+        fallback_ckpt = functools.partial(torch.utils.checkpoint.checkpoint, **opts)
+        for mod in spark.modules():
+            fn = getattr(mod, '_gradient_checkpointing_func', None)
+            if callable(fn):
+                if not getattr(fn, '_spark_vis_ctx_wrapped', False):
+                    mod._gradient_checkpointing_func = self._make_vis_aware_checkpoint_fn(fn)
+            elif getattr(mod, 'gradient_checkpointing', False) is True:
+                mod._gradient_checkpointing_func = self._make_vis_aware_checkpoint_fn(fallback_ckpt)
+
+        spark_mod = sys.modules.get(type(spark).__module__)
+        orig_mod_ckpt = getattr(spark_mod, 'checkpoint', None) if spark_mod is not None else None
+        if callable(orig_mod_ckpt) and not getattr(orig_mod_ckpt, '_spark_vis_ctx_wrapped', False):
+            def _mod_vis_ckpt(fn, *args, **kwargs):
+                if _INSIDE_VIS_CKPT_WRAPPER.get():
+                    return orig_mod_ckpt(fn, *args, **kwargs)
+                vis_ctx = _ACTIVE_VISUAL_CONTEXT.get()
+                if vis_ctx is None:
+                    return orig_mod_ckpt(fn, *args, **kwargs)
+                guard_tok = _INSIDE_VIS_CKPT_WRAPPER.set(True)
+                try:
+                    def _with_vis_mod(captured_vis, *a, **kw):
+                        prev_tok = _ACTIVE_VISUAL_CONTEXT.set(captured_vis)
+                        try:
+                            return fn(*a, **kw)
+                        finally:
+                            _ACTIVE_VISUAL_CONTEXT.reset(prev_tok)
+
+                    return orig_mod_ckpt(_with_vis_mod, vis_ctx, *args, **kwargs)
+                finally:
+                    _INSIDE_VIS_CKPT_WRAPPER.reset(guard_tok)
+
+            _mod_vis_ckpt._spark_vis_ctx_wrapped = True
+            spark_mod.checkpoint = _mod_vis_ckpt
 
     @staticmethod
     def load_sound_in(path,pretrained):
@@ -486,6 +560,7 @@ class SparkNative(nn.Module):
         for module in candidates:
             if module is not None and getattr(module,'supports_gradient_checkpointing',False):
                 module.gradient_checkpointing_enable(gradient_checkpointing_kwargs=opts)
+        self._wrap_spark_gradient_checkpointing(opts)
         sound_out=getattr(self,'sound_out',None)
         if sound_out is not None and hasattr(getattr(sound_out,'dit',None),'enable_gradient_checkpointing'):
             sound_out.dit.enable_gradient_checkpointing()
