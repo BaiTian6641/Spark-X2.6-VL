@@ -535,8 +535,9 @@ def build_uv_seam_alpha_diagnosis_record(
         ],
     )
 
-    atlas_member = f"{asset_id}/atlas_rgba.png"
-    iso_member = f"{asset_id}/render_iso.png"
+    variant_suffix = f"uv_a{int(inject_alpha_cutout)}_o{int(inject_uv_overlap)}"
+    atlas_member = f"{asset_id}/{variant_suffix}_atlas_rgba.png"
+    iso_member = f"{asset_id}/{variant_suffix}_render_iso.png"
     media_payloads = {atlas_member: modified_atlas_png, iso_member: png_by_view["iso"]}
     visual_units = [
         {
@@ -554,7 +555,6 @@ def build_uv_seam_alpha_diagnosis_record(
             "visual_kind": "uv_atlas",
         },
     ]
-    variant_suffix = f"uv_a{int(inject_alpha_cutout)}_o{int(inject_uv_overlap)}"
     prov = make_clean_room_provenance(asset_id, title=f"{family_id} RGBA UV & alpha diagnosis")
     row = {
         "id": f"{asset_id}#{variant_suffix}",

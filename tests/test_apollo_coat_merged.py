@@ -807,4 +807,269 @@ def test_spark_chat_format_thinking_boundary_and_parametric_synccraft_rigs():
         assert ba["passed"] is True and len(ba["collision_pairs"]) == 0
 
 
+def test_dynamic_dataset_shuffling_augmentation_and_anti_overfit_regularization(tmp_path: Path):
+    import random
+    import sqlite3
+    from colab.final.data import Catalogue, _stratified_group_shuffle, apply_dynamic_training_augmentation
+    from colab.final.evaluate import promotion
+
+    # 1. Group-stratified anti-clustering shuffle & dynamic per-epoch replay resampling
+    group_map = {}
+    rids = []
+    for g in range(5):
+        for t in ("pg", "dsl", "uv", "edit"):
+            rid = f"asset-{g}-{t}"
+            rids.append(rid)
+            group_map[rid] = f"group-{g}"
+    shuffled = _stratified_group_shuffle(rids, group_map, random.Random(42))
+    assert set(shuffled) == set(rids) and len(shuffled) == len(rids)
+    # Each 5-item wave contains 5 distinct asset groups (zero same-asset clumping inside a wave)
+    for w in range(4):
+        wave_groups = {group_map[rid] for rid in shuffled[w * 5 : (w + 1) * 5]}
+        assert len(wave_groups) == 5
+
+    db_path = tmp_path / "dyn.sqlite"
+    con = sqlite3.connect(db_path)
+    con.executescript(
+        "CREATE TABLE packets(pid INTEGER, component TEXT, shard TEXT);"
+        "CREATE TABLE rows(rid TEXT, pid INTEGER, family TEXT, language TEXT, task TEXT, split TEXT, group_id TEXT);"
+    )
+    con.execute("INSERT INTO packets VALUES (1, 'comp', '0')")
+    rows_sql = [("vid-main-1", 1, "video", "en", "synccraft_animation_pose", "train", "gv1")]
+    rows_sql.append(("vid-main-2", 1, "video", "en", "synccraft_animation_pose", "train", "gv2"))
+    for i in range(10):
+        rows_sql.append((f"txt-rep-{i}", 1, "text", "en", "text_replay", "train", f"gt{i}"))
+    con.executemany("INSERT INTO rows VALUES (?, ?, ?, ?, ?, ?, ?)", rows_sql)
+    con.commit()
+    con.close()
+
+    cat = Catalogue(db_path, modalities="vision_text")
+    order_dyn = cat.plan(
+        {"name": "stage4", "families": ["video"], "epochs": 4, "alignment_only": False, "replay_fraction": 0.5},
+        seed=101,
+    )
+    assert len(order_dyn) == 4 * 3  # 2 video + 1 replay per epoch
+    replay_seen = {r for r in order_dyn if r.startswith("txt-rep-")}
+    assert len(replay_seen) >= 2  # Dynamic per-epoch replay draws distinct text rows across epochs!
+
+    # 2. On-the-fly dynamic pilot synthesis & calibrated multiview camera permutation
+    cfg = {
+        "dynamic_training_augmentation": True,
+        "dynamic_multiview_shuffle": True,
+        "dynamic_pilot_synthesis": True,
+        "dynamic_photometric_jitter": True,
+    }
+    txt_row = {"id": "t0", "_family": "text", "language": "en", "task": "text_replay", "prompt": "static", "answer": "static"}
+    empty_media = {"images": [], "alphas": [], "visual_kind": "independent_image", "visual_units": [], "times": None}
+    t_aug1, _ = apply_dynamic_training_augmentation(txt_row, empty_media, random.Random(1), cfg)
+    t_aug2, _ = apply_dynamic_training_augmentation(txt_row, empty_media, random.Random(2), cfg)
+    assert t_aug1["answer"] != "static" and t_aug1["prompt"] != t_aug2["prompt"]
+
+    # Multiview permutation preserves exact alignment between prompt, think-trace `views=`, images, and visual_units
+    views = ["front", "right", "top", "iso"]
+    mv_imgs = [Image.fromarray(np.full((32, 32, 3), 30 * (i + 1), dtype=np.uint8), mode="RGB") for i in range(4)]
+    mv_units = [{"visual_kind": "multiview_render", "view_id": v, "is_pixel_art_atlas": False} for v in views]
+    mv_row = {
+        "id": "mv0",
+        "_family": "image",
+        "language": "en",
+        "task": "synccraft_part_grounding",
+        "prompt": "Inspect the calibrated orthographic views (front, right, top, iso) of this rig.",
+        "answer": "<think>\ntask=synccraft_part_grounding views=['front', 'right', 'top', 'iso']\n</think>\n{\"ok\":true}",
+    }
+    mv_media = {"images": mv_imgs, "alphas": [None] * 4, "visual_kind": "multiview_render", "visual_units": mv_units, "times": [0.0] * 4}
+    mv_aug_row, mv_aug_media = apply_dynamic_training_augmentation(mv_row, mv_media, random.Random(7), cfg)
+    new_views = [u["view_id"] for u in mv_aug_media["visual_units"]]
+    assert set(new_views) == set(views)
+    assert f"orthographic views ({', '.join(new_views)})" in mv_aug_row["prompt"]
+    assert f"views={new_views!r}" in mv_aug_row["answer"]
+
+    # UV atlas texels stay completely untouched (no photometric jitter on pixel-art UV diagnostics)
+    uv_arr = np.full((32, 32, 3), 123, dtype=np.uint8)
+    uv_img = Image.fromarray(uv_arr, mode="RGB")
+    uv_media = {
+        "images": [uv_img],
+        "alphas": [np.ones((32, 32), dtype=np.float32)],
+        "visual_kind": "uv_atlas",
+        "visual_units": [{"visual_kind": "uv_atlas", "view_id": "uv", "is_pixel_art_atlas": True}],
+        "times": [0.0],
+    }
+    uv_row = {"id": "uv0", "_family": "image", "language": "en", "task": "synccraft_uv_alpha_diagnosis", "prompt": "UV", "answer": "{}"}
+    _, uv_aug_media = apply_dynamic_training_augmentation(uv_row, uv_media, random.Random(19), cfg)
+    assert np.array_equal(np.asarray(uv_aug_media["images"][0]), uv_arr)
+
+    # 3. Label smoothing + adapter dropout + visual token dropout under non-reentrant checkpointing
+    reg_model = make_synthetic_spark_native(
+        {
+            "visual_cross_attn_blocks": 3,
+            "label_smoothing": 0.1,
+            "adapter_dropout": 0.2,
+            "visual_token_dropout": 0.1,
+        },
+        seed=515,
+    )
+    # Non-zero gates so cross-attention adapter dropout actively participates in forward/backward
+    for blk in reg_model.visual_cross_attn:
+        blk.gate_attn.data.fill_(0.5)
+        blk.gate_ffn.data.fill_(0.5)
+    reg_model.set_stage(False, stage_mode="full_spark")
+    ex = (
+        {"id": "r1", "_family": "image", "language": "en", "task": "t", "prompt": "Inspect", "answer": "box part"},
+        {
+            "images": [Image.fromarray(np.full((48, 48, 3), 90, dtype=np.uint8), mode="RGB")],
+            "alphas": [None],
+            "visual_kind": "independent_image",
+            "visual_units": [],
+            "times": [0.0],
+            "capture_times": None,
+            "audio": None,
+            "target_audio": None,
+            "motion": None,
+            "motion_times": None,
+        },
+    )
+    reg_model.train()
+    torch.utils.checkpoint.set_checkpoint_debug_enabled(True)
+    try:
+        out_train = reg_model(examples=[ex])
+        loss_train = out_train["per_example_loss"].sum()
+        loss_train.backward()
+    finally:
+        torch.utils.checkpoint.set_checkpoint_debug_enabled(False)
+
+    reg_model.eval()
+    with torch.no_grad():
+        eval_l1 = float(reg_model(examples=[ex])["per_example_loss"].sum().item())
+        eval_l2 = float(reg_model(examples=[ex])["per_example_loss"].sum().item())
+    assert eval_l1 == eval_l2  # Deterministic & unsmoothed in eval mode!
+
+    # 4. Promotion gate absolute tolerance near zero NLL
+    parent = {"membership_sha256": "m1", "by_stratum": {"text:en": {"mean_loss": 0.001}, "image:en": {"mean_loss": 1.2}}}
+    cand = {"membership_sha256": "m1", "by_stratum": {"text:en": {"mean_loss": 0.05}, "image:en": {"mean_loss": 0.4}}}
+    assert promotion(parent, cand, {"promotion_max_relative_loss_regression": 0.03})["accepted"] is False
+    assert (
+        promotion(
+            parent,
+            cand,
+            {"promotion_max_relative_loss_regression": 0.03, "promotion_min_abs_loss_tolerance": 0.08},
+        )["accepted"]
+        is True
+    )
+
+    # 5. Intra-stage per-epoch dev evaluation + patience early stopping + best-epoch weight restoration
+    from colab.final.assets import prepare_data
+    from colab.final.common import write
+    from colab.final.engine import Campaign, sample_hash
+
+    work_dir = tmp_path / "es_work"
+    es_cfg = {
+        "schema_version": 1,
+        "campaign_id": "es-test",
+        "work_root": str(work_dir),
+        "execution_target": "local_workstation",
+        "hardware_profile": "rtx_pro_4000_blackwell_24gb",
+        "dataset_mode": "local_synccraft",
+        "modalities": "vision_text",
+        "spark_component": "spark_fp8",
+        "spark_dtype": "float32",
+        "vision_dtype": "float32",
+        "model_repo": "TassP0lar/SparkX2.6-VL-SyncCraft",
+        "model_repo_private": True,
+        "checkpoint_backend": "local",
+        "checkpoint_repo": "TassP0lar/SparkX2.6-VL-SyncCraft-checkpoints",
+        "checkpoint_repo_private": True,
+        "drive_project_folder": None,
+        "drive_cap_bytes": 2000000000000,
+        "checkpoint_slots": 2,
+        "checkpoint_minutes": 60,
+        "max_checkpoint_minutes": 180,
+        "initial_checkpoint_reservation_bytes": 100000000,
+        "local_free_floor_bytes": 10000000,
+        "cache_bytes_per_component": 100000000,
+        "max_compute_units": 100,
+        "observed_compute_balance": None,
+        "observed_cu_per_hour": None,
+        "enforce_compute_budget": False,
+        "compute_reserve_cu": 5,
+        "balance_refresh_hours": 12,
+        "seed": 42,
+        "gradient_accumulation": 2,
+        "dataloader_workers": 0,
+        "dataloader_prefetch": 2,
+        "microbatch_size": 2,
+        "max_wall_hours": 24,
+        "direct_wall_hours": 12,
+        "max_sequence": 512,
+        "max_answer_tokens": 256,
+        "learning_rate": 5e-4,
+        "connector_learning_rate": 1e-3,
+        "audio_output_learning_rate": 1e-5,
+        "weight_decay": 0.02,
+        "warmup_ratio": 0.05,
+        "clip_norm": 1.0,
+        "optimizer_profile": "apollo_coat",
+        "apollo_rank": 16,
+        "apollo_scale": 1.0,
+        "apollo_update_proj_gap": 2,
+        "apollo_min_dim": 64,
+        "coat_activation_fp8": True,
+        "coat_activation_group_size": 16,
+        "merged_grad_norm_mode": "per_example",
+        "dynamic_shuffle": True,
+        "dynamic_training_augmentation": True,
+        "dynamic_multiview_shuffle": True,
+        "dynamic_pilot_synthesis": True,
+        "dynamic_photometric_jitter": True,
+        "eval_every_epoch": True,
+        "early_stopping_patience": 2,
+        "early_stopping_min_rel_delta": 0.005,
+        "thumbnail_patches": 16,
+        "tile_patches": 16,
+        "detail_tiles": 2,
+        "max_visual_tokens": 256,
+        "synccraft_num_variants": 4,
+        "synccraft_animation_variants": 4,
+        "synccraft_pilot_groups": 4,
+        "split_percent": {"train": 70, "dev": 10, "promotion": 10, "audit": 10},
+        "evaluation_per_family_language": 1,
+        "instructor_budget_usd": 10,
+        "instructor_enabled": False,
+        "instructor_rounds": 0,
+        "max_loss_weight": 5.0,
+        "stages": [],
+    }
+    prepare_data(work_dir, None, es_cfg)
+    camp = Campaign(es_cfg, paths={}, source_sha="0" * 64)
+    camp.model = make_synthetic_spark_native({"visual_cross_attn_blocks": 3, "label_smoothing": 0.05}, seed=333)
+    write(work_dir / "compute-budget.json", camp.budget.state)
+
+    # Simulate held-out dev curve peaking at epoch 2 (2.0 -> 1.1 -> 1.3 -> 1.5 -> stop at ep 4 with patience=2, restore ep 2!)
+    sim_losses = [2.0, 1.1, 1.3, 1.5, 1.7]
+    epoch_hashes: dict[int, str] = {}
+    eval_calls = [0]
+
+    def _fake_eval(split: str, name: str, generate: bool = False):
+        idx = eval_calls[0]
+        eval_calls[0] += 1
+        ep_num = idx + 1
+        epoch_hashes[ep_num] = sample_hash(camp.model)
+        return {"membership_sha256": "dev", "by_stratum": {"text:en": {"n": 4, "mean_loss": sim_losses[idx]}}}
+
+    camp.evaluate = _fake_eval  # type: ignore[method-assign]
+    txt_rids = [r[0] for r in camp.catalogue.select("train", ["text"])][:2]
+    assert len(txt_rids) == 2
+    stage_spec = {"name": "es_stage", "families": ["text"], "epochs": 5, "alignment_only": False, "stage_mode": "full_spark"}
+    order_5ep = txt_rids * 5  # 2 records/epoch * 5 epochs = 10 records (5 steps)
+    camp.train_order_native(stage_spec, order_5ep, dynamic_seed=777)
+
+    assert eval_calls[0] == 4  # Stopped early at epoch 4 instead of running epoch 5!
+    assert "es_stage" in camp.state["completed_stages"]
+    es_meta = camp.state["early_stopped_stages"]["es_stage"]
+    assert es_meta["stopped_at_epoch"] == 4
+    assert es_meta["best_epoch"] == 2
+    assert sample_hash(camp.model) == epoch_hashes[2]  # Exact epoch-2 weights restored!
+
+
+
+
 

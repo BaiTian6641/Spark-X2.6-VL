@@ -1,10 +1,10 @@
 """Full-parameter & staged campaign engine supporting native APOLLO + COAT + merged-gradient training and Studio SFT."""
 from __future__ import annotations
-import contextlib, gc, importlib.metadata, math, os, random, shutil, signal, time
+import contextlib, gc, importlib.metadata, math, os, random, secrets, shutil, signal, time
 from collections import Counter,defaultdict
 from pathlib import Path
 from .common import HERE,OPTIMIZER_PROFILES,canonical,identity,read,write,sha,disk_guard,emit,ComputeBudget,runtime_boot_id
-from .data import Catalogue,CommittedCursor,MediaReader,prepare_media,FAMILIES,cursor_dataset
+from .data import Catalogue,CommittedCursor,MediaReader,prepare_media,apply_dynamic_training_augmentation,FAMILIES,cursor_dataset
 from .checkpoint_cache import acknowledged,prune,rebind_assets
 from .hf_checkpoints import receipt_path
 
@@ -395,11 +395,12 @@ def load_checkpoint(directory,config,bound,model=None,load_optimizer=True,device
 
 class MediaCollator:
     """Open independent catalogue/cache handles in each DataLoader process."""
-    def __init__(self,campaign):
+    def __init__(self,campaign,dynamic_seed:int=0):
         self.root=campaign.root; self.config=campaign.c; self.token=campaign._hf_token
         local_handoff=self.root/'metadata/HANDOFF.json'
         self.handoff=read(local_handoff) if local_handoff.is_file() else read(HERE.parent/'formal/HF_FULL_DATASET_HANDOFF.json')
         self.slot=campaign.reader.checkpoint_slot_bytes; self.worker=None
+        self.dynamic_seed=int(dynamic_seed)
     def __call__(self,rows):
         import torch
         if self.worker is None:
@@ -408,9 +409,13 @@ class MediaCollator:
             reader.checkpoint_slot_bytes=self.slot
             self.worker=(catalogue,reader)
         catalogue,reader=self.worker; examples=[]
+        use_dyn=bool(self.config.get('dynamic_training_augmentation',False))
         for item in rows:
             row,packet=catalogue.row(item['rid'])
             with reader.packet(packet) as get: media=prepare_media(row,get,self.config)
+            if use_dyn:
+                aug_seed=int(identity([self.dynamic_seed,int(item['_index']),item['rid']])[:16],16)
+                row,media=apply_dynamic_training_augmentation(row,media,random.Random(aug_seed),self.config)
             examples.append((row,media))
         # Accelerate inspects only the first mapping value for batch size.
         # Keep native PIL/array examples behind a tensor batch-size anchor.
@@ -487,7 +492,7 @@ class Campaign:
         write(self.root/'RESTORE_PROOF.json',proof); self.store.small_file(self.root/'RESTORE_PROOF.json','restore-proof')
         return optimizer,scheduler,proof
 
-    def train_order_native(self,stage,order,resume=False):
+    def train_order_native(self,stage,order,resume=False,dynamic_seed:int=0):
         """Native PyTorch APOLLO + COAT + merged-gradient training loop for 24 GB SM120 workstations and Colab."""
         import torch
         from torch.utils.data import DataLoader
@@ -556,7 +561,7 @@ class Campaign:
             cursor_dataset(order,cursor),
             batch_size=microbatch,
             num_workers=workers,
-            collate_fn=MediaCollator(self),
+            collate_fn=MediaCollator(self,dynamic_seed=dynamic_seed),
             pin_memory=False,
             **loader_kwargs,
         )
@@ -565,6 +570,22 @@ class Campaign:
         amp_ctx=(lambda: torch.autocast('cuda',dtype=torch.bfloat16)) if use_cuda_amp else contextlib.nullcontext
         coat_ctx=(lambda: coat_ctrl.activation_context(training=True)) if (coat_ctrl is not None and coat_ctrl.enabled) else contextlib.nullcontext
         inv_fn=(coat_ctrl.invalidate_weight_caches if (coat_ctrl is not None and coat_ctrl.enabled) else None)
+
+        epochs=max(1,int(stage.get('epochs',1)))
+        eval_every_epoch=bool(self.c.get('eval_every_epoch',False)) and epochs>1 and len(order)>=epochs
+        epoch_size=max(1,len(order)//epochs)
+        evaluated_epoch=cursor.committed//epoch_size
+        patience=int(stage.get('early_stopping_patience',self.c.get('early_stopping_patience',0)))
+        min_rel_delta=float(stage.get('early_stopping_min_rel_delta',self.c.get('early_stopping_min_rel_delta',0.005)))
+        best_dev_score=float('inf')
+        best_epoch=0
+        no_improve_epochs=0
+        best_trainable_cpu=None
+        early_stopped=False
+        cur_epoch=evaluated_epoch
+        stage_fams=set(stage.get('families',()))
+        if stage.get('alignment_only',False):
+            stage_fams.update(('image','video'))
 
         window_microbatches=0
         window_records=0
@@ -667,6 +688,50 @@ class Campaign:
                         raw_stratum_losses={k:v[0]/v[1] for k,v in losses_by_stratum.items() if v[1]>0},
                     )
                     losses_by_stratum.clear()
+
+                cur_epoch=min(epochs,cursor.committed//epoch_size)
+                if eval_every_epoch and cur_epoch>evaluated_epoch and not self.stop_reason:
+                    evaluated_epoch=cur_epoch
+                    saved_rng=rng_state()
+                    ep_eval=self.evaluate('dev',f"{stage['name']}-ep{cur_epoch}",generate=False)
+                    set_rng(saved_rng)
+                    self.model.train()
+                    by_st=ep_eval.get('by_stratum',{}) if isinstance(ep_eval,dict) else {}
+                    active_items=[v for k,v in by_st.items() if k.split(':',1)[0] in stage_fams and v.get('n',0)>0]
+                    if not active_items:
+                        active_items=[v for v in by_st.values() if v.get('n',0)>0]
+                    if active_items:
+                        total_n=sum(int(v['n']) for v in active_items)
+                        dev_score=sum(float(v['mean_loss'])*int(v['n']) for v in active_items)/max(1,total_n)
+                        if dev_score<best_dev_score*(1.0-min_rel_delta):
+                            best_dev_score=dev_score
+                            best_epoch=cur_epoch
+                            no_improve_epochs=0
+                            best_trainable_cpu={n:p.detach().cpu().clone() for n,p in self.model.named_parameters() if p.requires_grad}
+                        else:
+                            no_improve_epochs+=1
+                        ep_entry={
+                            'epoch':cur_epoch,
+                            'epochs':epochs,
+                            'update':offset+step_index,
+                            'dev_loss':round(dev_score,6),
+                            'best_dev_loss':round(best_dev_score,6),
+                            'best_epoch':best_epoch,
+                            'no_improve_epochs':no_improve_epochs,
+                        }
+                        self.state.setdefault('stage_epoch_history',{}).setdefault(stage['name'],[]).append(ep_entry)
+                        emit('stage_epoch_eval',stage=stage['name'],**ep_entry)
+                        if patience>0 and no_improve_epochs>=patience and cur_epoch<epochs:
+                            early_stopped=True
+                            emit(
+                                'stage_early_stopped',
+                                stage=stage['name'],
+                                stopped_at_epoch=cur_epoch,
+                                best_epoch=best_epoch,
+                                best_dev_loss=round(best_dev_score,6),
+                            )
+                            break
+
                 if self.stop_reason or time.monotonic()-self.last_checkpoint>self.effective_checkpoint_minutes*60:
                     self.save(optimizer,scheduler,cursor)
                 if self.stop_reason or batch is None:
@@ -677,18 +742,48 @@ class Campaign:
             gc.collect()
             if torch.cuda.is_available(): torch.cuda.empty_cache()
 
-        self.save(optimizer,scheduler,cursor)
-        if cursor.committed!=len(order):
-            if self.stop_reason: return
-            raise RuntimeError('Resumable stop: '+str(self.stop_reason or 'incomplete curriculum'))
-        self.state['cursor']=None
+        if not self.stop_reason and best_trainable_cpu is not None and (early_stopped or best_epoch<epochs):
+            with torch.no_grad():
+                param_map=dict(self.model.named_parameters())
+                for name,cpu_t in best_trainable_cpu.items():
+                    if name in param_map:
+                        param_map[name].copy_(cpu_t.to(device=param_map[name].device,dtype=param_map[name].dtype))
+                if hasattr(getattr(self.model,'spark',None),'tie_weights'):
+                    self.model.spark.tie_weights()
+                if inv_fn is not None:
+                    inv_fn()
+            emit(
+                'stage_best_weights_restored',
+                stage=stage['name'],
+                best_epoch=best_epoch,
+                best_dev_loss=round(best_dev_score,6),
+                early_stopped=early_stopped,
+            )
+        best_trainable_cpu=None
+
+        if early_stopped:
+            self.state['cursor']=None
+            self.state.setdefault('early_stopped_stages',{})[stage['name']]={
+                'stopped_at_epoch':cur_epoch,
+                'best_epoch':best_epoch,
+                'best_dev_loss':best_dev_score,
+                'committed_records':cursor.committed,
+                'planned_records':len(order),
+            }
+            self.save(optimizer,scheduler,cursor=None)
+        else:
+            self.save(optimizer,scheduler,cursor)
+            if cursor.committed!=len(order):
+                if self.stop_reason: return
+                raise RuntimeError('Resumable stop: '+str(self.stop_reason or 'incomplete curriculum'))
+            self.state['cursor']=None
         if stage['name'] not in self.state.setdefault('completed_stages',[]):
             self.state['completed_stages'].append(stage['name'])
         write(self.root/'CAMPAIGN.json',self.state)
         del optimizer,scheduler; gc.collect()
         if torch.cuda.is_available(): torch.cuda.empty_cache()
 
-    def train_order(self,stage,order,resume=False):
+    def train_order(self,stage,order,resume=False,dynamic_seed:int=0):
         profile=self.c.get('optimizer_profile','adamw8bit')
         use_native=(
             self.c.get('trainer_backend')=='native_merged'
@@ -696,7 +791,7 @@ class Campaign:
             or profile!='adamw8bit'
         )
         if use_native:
-            return self.train_order_native(stage,order,resume=resume)
+            return self.train_order_native(stage,order,resume=resume,dynamic_seed=dynamic_seed)
 
         import torch,unsloth
         import studio.backend.core.training.trainer as backend
@@ -929,10 +1024,17 @@ class Campaign:
         if phase in ('full','train'):
             for i,stage in enumerate(self.c['stages']):
                 if stage['name'] in self.state.get('completed_stages',[]): continue
-                order=self.catalogue.plan(stage,self.c['seed']+i)
+                stage_seed=int(self.c['seed'])+i
+                if self.c.get('dynamic_shuffle',False):
+                    seeds_map=self.state.setdefault('stage_shuffle_seeds',{})
+                    if stage['name'] not in seeds_map:
+                        seeds_map[stage['name']]=int((stage_seed^secrets.randbits(31))&0x7FFFFFFF)
+                        write(self.root/'CAMPAIGN.json',self.state)
+                    stage_seed=int(seeds_map[stage['name']])
+                order=self.catalogue.plan(stage,stage_seed)
                 resume=self.state.get('stage')==stage['name'] and self.state.get('cursor') is not None
                 parent_receipt=self.state.get('last_checkpoint')
-                self.train_order(stage,order,resume=resume)
+                self.train_order(stage,order,resume=resume,dynamic_seed=stage_seed)
                 if self.stop_reason:
                     self.state.update(training_complete=False,stopped_reason=self.stop_reason)
                     write(self.root/'CAMPAIGN.json',self.state)

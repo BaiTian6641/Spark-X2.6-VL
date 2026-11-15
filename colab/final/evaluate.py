@@ -254,9 +254,11 @@ def evaluate(model,catalogue,reader,config,split,path,generate=False,ids=None):
 def promotion(parent,candidate,config):
     if parent['membership_sha256']!=candidate['membership_sha256']: raise ValueError('Promotion membership changed')
     reasons=[]
+    abs_tol=float(config.get('promotion_min_abs_loss_tolerance',0.0))
     for key,base in parent['by_stratum'].items():
         child=candidate['by_stratum'].get(key)
-        if not child or child['mean_loss']>base['mean_loss']*(1+config['promotion_max_relative_loss_regression']): reasons.append(key+' loss regression')
+        allowed=base['mean_loss']*(1+config['promotion_max_relative_loss_regression'])+abs_tol
+        if not child or child['mean_loss']>allowed: reasons.append(key+' loss regression')
     improved=[key for key,b in parent['by_stratum'].items() if key in candidate['by_stratum'] and candidate['by_stratum'][key]['mean_loss']<b['mean_loss']]
     if not improved: reasons.append('no improved stratum')
     return {'accepted':not reasons,'reasons':reasons,'improved_strata':improved,'scope':'Automated internal loss gate only; human audio review and broader benchmarks remain separate'}

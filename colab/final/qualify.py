@@ -293,9 +293,11 @@ def qualify(campaign):
     optimizer.zero_grad(set_to_none=True)
     if c.get('modalities')=='vision_text':
         # Keep model.spark.train() so HF gradient_checkpointing remains active on 24 GB VRAM;
-        # temporarily zero any Dropout layers so reference vs SDPA forward/backward are deterministic.
+        # temporarily zero any Dropout / MultiheadAttention dropout so reference vs SDPA forward/backward are deterministic.
         saved_dropouts=[(m,m.p) for m in model.modules() if isinstance(m,torch.nn.Dropout)]
+        saved_mha_dropouts=[(m,m.dropout) for m in model.modules() if isinstance(m,torch.nn.MultiheadAttention)]
         for m,_ in saved_dropouts: m.p=0.0
+        for m,_ in saved_mha_dropouts: m.dropout=0.0
         model.train()
         if model.vision is not None: model.vision.eval()
         acc_parity=MergedGradientAccumulator(
@@ -329,6 +331,7 @@ def qualify(campaign):
         finally:
             acc_parity.close(); del acc_parity
             for m,orig_p in saved_dropouts: m.p=orig_p
+            for m,orig_d in saved_mha_dropouts: m.dropout=orig_d
             torch.cuda.empty_cache()
         del reference_grads,reference_norms
     else:

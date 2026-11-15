@@ -215,6 +215,29 @@ def build_database(catalogue,db_path,config):
             'evaluation_scope':'New internal source-held-out diagnosis/promotion/audit; not a clean official public benchmark. Prior local DOCCI/COCO exposure is recorded in source metadata.'}
     db.close(); write(db_path.with_suffix('.report.json'),report); return report
 
+def _stratified_group_shuffle(rids, group_by_rid, rng):
+    """Dynamic anti-clustering shuffle: spread sibling tasks of the same asset group across waves."""
+    by_group = defaultdict(list)
+    for rid in rids:
+        by_group[group_by_rid.get(rid, rid)].append(rid)
+    group_keys = sorted(by_group)
+    for g in group_keys:
+        rng.shuffle(by_group[g])
+    out = []
+    while group_keys:
+        wave = []
+        next_keys = []
+        for g in group_keys:
+            items = by_group[g]
+            if items:
+                wave.append(items.pop())
+            if items:
+                next_keys.append(g)
+        rng.shuffle(wave)
+        out.extend(wave)
+        group_keys = next_keys
+    return out
+
 class Catalogue:
     def __init__(self,db,modalities='omni'): self.db=sqlite3.connect(db); self.path=Path(db); self.modalities=modalities
     def row(self,rid):
@@ -254,20 +277,31 @@ class Catalogue:
             buckets=defaultdict(list)
             for r in rows: buckets[r[1]].append(r)
             rows=[r for fam in sorted(buckets) for r in sorted(buckets[fam],key=lambda x:identity([seed,x[0]]))[:cap]]
+        replay_pool=[]
+        replay_count=0
         if stage.get('replay_fraction'):
             replay_fams=('image','video','text') if eff_mod=='vision_text' else FAMILIES
             if stage.get('alignment_only'):
                 replay_fams=tuple(f for f in replay_fams if f!='text')
-            pool=[r for r in self.select('train',replay_fams) if r[1] not in stage['families']] if replay_fams else []
-            random.Random(seed).shuffle(pool); rows+=pool[:round(len(rows)*stage['replay_fraction'])]
+            replay_pool=[r for r in self.select('train',replay_fams) if r[1] not in stage['families']] if replay_fams else []
+            replay_count=min(len(replay_pool),round(len(rows)*stage['replay_fraction']))
+        cols={col[1] for col in self.db.execute('PRAGMA table_info(rows)')}
+        group_by_rid=dict(self.db.execute("SELECT rid,group_id FROM rows WHERE split='train'")) if 'group_id' in cols else {}
         order=[]
         for epoch in range(stage['epochs']):
-            buckets=defaultdict(list); rng=random.Random(seed+epoch)
-            for r in rows: buckets[(r[3],r[4])].append(r[0])
+            ep_seed=int(identity([seed,stage.get('name',''),'epoch',epoch])[:16],16)
+            buckets=defaultdict(list); rng=random.Random(ep_seed)
+            epoch_rows=list(rows)
+            if replay_count>0:
+                pool_copy=list(replay_pool)
+                rng.shuffle(pool_copy)
+                epoch_rows.extend(pool_copy[:replay_count])
+            for r in epoch_rows: buckets[(r[3],r[4])].append(r[0])
             queues=defaultdict(list)
             shard_keys=sorted(buckets); rng.shuffle(shard_keys)
             for key in shard_keys:
-                rng.shuffle(buckets[key]); queues[key[0]].extend([buckets[key][i:i+128] for i in range(0,len(buckets[key]),128)])
+                shuffled_bucket=_stratified_group_shuffle(buckets[key],group_by_rid,rng)
+                queues[key[0]].extend([shuffled_bucket[i:i+128] for i in range(0,len(shuffled_bucket),128)])
             queues={key:deque(windows) for key,windows in queues.items()}
             # Interleave sources while finishing each source's current shard.
             # Randomizing all shard windows globally would redownload gigabytes
@@ -501,3 +535,121 @@ def prepare_media(row,get,config):
         if len(row['audio'])!=1: raise ValueError('Only one explicitly paired input waveform is qualified')
         result['audio']=decode_audio(get(row['audio'][0]))
     return result
+
+
+def apply_dynamic_training_augmentation(row, media, rng, config):
+    """Training-only dynamic view permutation, pilot synthesis, and subtle photometric jitter.
+
+    Never called during evaluation (`evaluate.py`), preserving frozen held-out benchmarks while
+    preventing template/slot/pixel memorization across training epochs.
+    """
+    import numpy as np
+    from PIL import Image
+
+    if not config.get('dynamic_training_augmentation', False):
+        return row, media
+
+    aug_row = dict(row)
+    aug_media = dict(media)
+    task = str(aug_row.get('task', '') or '')
+
+    # 1. Dynamic on-the-fly synthesis for `text_replay` so arithmetic/text prompts never memorize
+    if config.get('dynamic_pilot_synthesis', True) and task == 'text_replay':
+        a = rng.randint(4, 49)
+        b = rng.randint(4, 49)
+        c = rng.randint(2, 31)
+        op_mode = rng.randint(0, 2)
+        lang = aug_row.get('language', 'en')
+        thinking = bool(aug_row.get('enable_thinking', False))
+        if op_mode == 0:
+            val = a * b
+            prompt = f'Compute {a} * {b} and state the integer result.' if lang == 'en' else f'计算 {a} 乘以 {b} 并给出整数结果。'
+            trace = f'Multiply {a} by {b} to get {val}.'
+        elif op_mode == 1:
+            val = a * b + c
+            prompt = f'Evaluate {a} * {b} + {c} and return only the integer value.' if lang == 'en' else f'计算 {a} * {b} + {c} 并仅给出整数结果。'
+            trace = f'First {a} * {b} = {a * b}, then add {c} -> {val}.'
+        else:
+            val = (a + b) * c
+            prompt = f'Compute ({a} + {b}) * {c} and give the exact integer.' if lang == 'en' else f'计算 ({a} + {b}) * {c} 并给出准确整数结果。'
+            trace = f'Sum {a} + {b} = {a + b}, multiply by {c} -> {val}.'
+        aug_row['prompt'] = prompt
+        aug_row['answer'] = f'<think>\n{trace}\n</think>\n{val}' if thinking else str(val)
+        aug_row['target'] = {'kind': 'text', 'text': str(val)}
+        return aug_row, aug_media
+
+    # 2. Dynamic on-the-fly RGBA cutout/opaque texture synthesis for `rgba_visual_pilot`
+    if config.get('dynamic_pilot_synthesis', True) and task == 'rgba_visual_pilot' and aug_media.get('images'):
+        has_cutout = bool(rng.getrandbits(1))
+        h_px, w_px = 64, 64
+        arr = np.zeros((h_px, w_px, 4), dtype=np.uint8)
+        r_c, g_c, b_c = rng.randint(25, 235), rng.randint(25, 235), rng.randint(25, 235)
+        arr[:, :, 0] = r_c
+        arr[:, :, 1] = g_c
+        arr[:, :, 2] = b_c
+        # Add subtle procedural border/stripe RGB pattern so opaque vs cutout cannot rely on flat RGB stats
+        stripe = rng.randint(4, 12)
+        arr[::stripe, :, :3] = np.clip(arr[::stripe, :, :3].astype(np.int16) + rng.randint(-30, 30), 0, 255).astype(np.uint8)
+        arr[:, :, 3] = 255
+        if has_cutout:
+            y0 = rng.randint(8, 24)
+            y1 = rng.randint(y0 + 12, 56)
+            x0 = rng.randint(8, 24)
+            x1 = rng.randint(x0 + 12, 56)
+            arr[y0:y1, x0:x1, 3] = 0
+        rgb_img = Image.fromarray(arr[:, :, :3], mode='RGB')
+        alpha_arr = arr[:, :, 3].astype(np.float32) / 255.0
+        aug_media['images'] = [rgb_img]
+        aug_media['alphas'] = [alpha_arr]
+        ans_txt = 'transparent_cutout' if has_cutout else 'opaque_solid'
+        aug_row['answer'] = ans_txt
+        aug_row['target'] = {'kind': 'text', 'text': ans_txt}
+        return aug_row, aug_media
+
+    # 3. Dynamic calibrated multi-view camera permutation (`multiview_render`)
+    vkind = aug_media.get('visual_kind')
+    imgs = list(aug_media.get('images') or [])
+    units = list(aug_media.get('visual_units') or [])
+    if (
+        config.get('dynamic_multiview_shuffle', True)
+        and vkind == 'multiview_render'
+        and len(imgs) > 1
+        and len(units) == len(imgs)
+    ):
+        orig_views = [str(u.get('view_id', '')) for u in units]
+        old_phrase = f"orthographic views ({', '.join(orig_views)})"
+        if all(orig_views) and old_phrase in str(aug_row.get('prompt', '')):
+            perm = list(range(len(imgs)))
+            rng.shuffle(perm)
+            if perm != list(range(len(imgs))):
+                new_views = [orig_views[i] for i in perm]
+                new_phrase = f"orthographic views ({', '.join(new_views)})"
+                aug_media['images'] = [imgs[i] for i in perm]
+                if aug_media.get('alphas') and len(aug_media['alphas']) == len(imgs):
+                    aug_media['alphas'] = [aug_media['alphas'][i] for i in perm]
+                aug_media['visual_units'] = [dict(units[i]) for i in perm]
+                if aug_media.get('times') and len(aug_media['times']) == len(imgs):
+                    aug_media['times'] = [aug_media['times'][i] for i in perm]
+                aug_row['prompt'] = str(aug_row['prompt']).replace(old_phrase, new_phrase, 1)
+                old_think_views = f"views={orig_views!r}"
+                new_think_views = f"views={new_views!r}"
+                if old_think_views in str(aug_row.get('answer', '')):
+                    aug_row['answer'] = str(aug_row['answer']).replace(old_think_views, new_think_views, 1)
+                imgs = aug_media['images']
+
+    # 4. Subtle photometric jitter on 3D renders / temporal frames ONLY (never `uv_atlas`!)
+    if (
+        config.get('dynamic_photometric_jitter', True)
+        and imgs
+        and vkind in ('multiview_render', 'independent_image', 'state_pair', 'temporal_frame')
+    ):
+        gain = rng.uniform(0.96, 1.04)
+        bias = rng.uniform(-3.0, 3.0)
+        jittered = []
+        for im in imgs:
+            rgb_np = np.asarray(im.convert('RGB'), dtype=np.float32)
+            out_np = np.clip(rgb_np * gain + bias, 0.0, 255.0).round().astype(np.uint8)
+            jittered.append(Image.fromarray(out_np, mode='RGB'))
+        aug_media['images'] = jittered
+
+    return aug_row, aug_media

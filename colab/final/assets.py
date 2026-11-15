@@ -248,6 +248,8 @@ def prepare_local_synccraft_data(root,config,*,include_animation=True,panel_size
     blob_map={}
     for _row,payloads in pairs:
         for m_path,payload in payloads.items():
+            if m_path in blob_map and blob_map[m_path]!=payload:
+                raise ValueError(f'Conflicting TAR media member path {m_path!r} with distinct byte payloads')
             blob_map[m_path]=payload
 
     member_files=[]

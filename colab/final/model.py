@@ -180,13 +180,14 @@ class GatedVisualCrossAttentionBlock(nn.Module):
     At initialization (`gate_attn == 0`, `gate_ffn == 0`), outputs exact identity `x`.
     Completely skipped when no visual context is active.
     """
-    def __init__(self, hidden_size: int, num_heads: int = 8, ffn_mult: int = 2):
+    def __init__(self, hidden_size: int, num_heads: int = 8, ffn_mult: int = 2, dropout: float = 0.0):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_heads = num_heads
+        self.drop = nn.Dropout(float(dropout))
         self.norm_q = nn.LayerNorm(hidden_size)
         self.norm_kv = nn.LayerNorm(hidden_size)
-        self.attn = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True)
+        self.attn = nn.MultiheadAttention(hidden_size, num_heads, dropout=float(dropout), batch_first=True)
         self.gate_attn = nn.Parameter(torch.zeros(1))
 
         inner = hidden_size * ffn_mult
@@ -207,10 +208,12 @@ class GatedVisualCrossAttentionBlock(nn.Module):
         q = self.norm_q(x)
         kv = self.norm_kv(vis)
         attn_out, _ = self.attn(q, kv, kv, need_weights=False)
+        attn_out = self.drop(attn_out)
         x = x + torch.tanh(self.gate_attn) * attn_out
 
         h = self.norm_ffn(x)
-        ffn_out = self.ffn_down(F.gelu(self.ffn_gate(h), approximate='tanh') * self.ffn_up(h))
+        ffn_hidden = self.drop(F.gelu(self.ffn_gate(h), approximate='tanh') * self.ffn_up(h))
+        ffn_out = self.drop(self.ffn_down(ffn_hidden))
         x = x + torch.tanh(self.gate_ffn) * ffn_out
         return x.to(orig_dtype)
 
@@ -635,6 +638,7 @@ class SparkNative(nn.Module):
         self.view_id_embedding=nn.Embedding(len(VIEW_IDS),h)
         nn.init.normal_(self.view_id_embedding.weight, mean=0.0, std=0.01)
         self.modality=nn.Embedding(5,h)
+        self.visual_token_drop=nn.Dropout(float(policy.get('visual_token_dropout',0.0)))
 
         # Optional 0 / 3 / 6 Flamingo-style zero-init gated visual cross-attention blocks.
         self._active_visual_context: torch.Tensor | None = None
@@ -719,8 +723,9 @@ class SparkNative(nn.Module):
         heads = max(1, min(8, self.hidden // max(1, min(64, self.hidden // 2))))
         while self.hidden % heads != 0 and heads > 1:
             heads -= 1
+        adapter_drop = float(self.policy.get('adapter_dropout', 0.0))
         self.visual_cross_attn = nn.ModuleList(
-            [GatedVisualCrossAttentionBlock(self.hidden, num_heads=heads) for _ in unique_indices]
+            [GatedVisualCrossAttentionBlock(self.hidden, num_heads=heads, dropout=adapter_drop) for _ in unique_indices]
         ).to(device=self.device, dtype=torch.float32)
         self.visual_cross_attn_layer_indices = unique_indices
 
@@ -877,6 +882,9 @@ class SparkNative(nn.Module):
                 sound_out.freeze_fixed_conditioning()
     def train(self,mode=True):
         super().train(mode)
+        vision=getattr(self,'vision',None)
+        if mode and vision is not None and not any(p.requires_grad for p in vision.parameters()):
+            vision.eval()
         speech_out=getattr(self,'speech_out',None)
         if speech_out is not None and getattr(speech_out,'codec_model',None) is not None:
             speech_out.codec_model.eval()
@@ -1104,6 +1112,7 @@ class SparkNative(nn.Module):
                     + self.view_id_embedding.weight[vid_idx].to(proj_dtype)
                     + self.modality.weight[0].to(proj_dtype)
                 )
+                token_out=self.visual_token_drop(token_out)
                 outputs[index]=token_out.to(self.embed_dtype)
         return torch.cat(outputs,dim=1) if outputs else None
 
@@ -1247,10 +1256,11 @@ class SparkNative(nn.Module):
             hidden=self.hidden_states(embeds,visual_context=vis_ctx)[:,prefix.shape[1]-1:-1]
 
         total=hidden.new_zeros((),dtype=torch.float32)
+        ls=float(self.policy.get('label_smoothing',0.0)) if self.training else 0.0
         from torch.utils.checkpoint import checkpoint
         for start in range(0,ids.shape[1],128):
             hs_2d=hidden[:,start:start+128].reshape(-1,self.hidden); labels_1d=ids[:,start:start+128].reshape(-1)
-            def ce(x,y): return F.cross_entropy(self.get_output_embeddings()(x).float().reshape(-1,self.config.vocab_size),y,reduction='sum')
+            def ce(x,y): return F.cross_entropy(self.get_output_embeddings()(x).float().reshape(-1,self.config.vocab_size),y,reduction='sum',label_smoothing=ls)
             total=total+checkpoint(ce,hs_2d,labels_1d,use_reentrant=False)
         return total/ids.numel(),ids.numel()
 
@@ -1292,13 +1302,14 @@ class SparkNative(nn.Module):
             with self._visual_cross_attn_scope(None):
                 hidden=self.spark.model(input_ids=input_ids,attention_mask=mask,use_cache=False,return_dict=True).last_hidden_state
             from torch.utils.checkpoint import checkpoint
+            ls=float(self.policy.get('label_smoothing',0.0)) if self.training else 0.0
             losses=[]; units=[]
             for i,(p_ids,a_ids) in enumerate(prepared_ids):
                 start=p_ids.shape[1]-1; count=a_ids.shape[1]
                 hs=hidden[i:i+1,start:start+count]; total=hidden.new_zeros((),dtype=torch.float32)
                 for offset in range(0,count,128):
                     hs_2d=hs[:,offset:offset+128].reshape(-1,self.hidden); lbl_1d=a_ids[:,offset:offset+128].reshape(-1)
-                    def ce(x,y): return F.cross_entropy(self.get_output_embeddings()(x).float().reshape(-1,self.config.vocab_size),y,reduction='sum')
+                    def ce(x,y): return F.cross_entropy(self.get_output_embeddings()(x).float().reshape(-1,self.config.vocab_size),y,reduction='sum',label_smoothing=ls)
                     total=total+checkpoint(ce,hs_2d,lbl_1d,use_reentrant=False)
                 losses.append(total/count); units.append(count)
             return losses,units
@@ -1323,13 +1334,14 @@ class SparkNative(nn.Module):
             mask[i,:length]=1
         hidden=self.hidden_batch(embeds,mask,visual_context=single_vis_ctx if len(prepared)==1 else None)
         from torch.utils.checkpoint import checkpoint
+        ls=float(self.policy.get('label_smoothing',0.0)) if self.training else 0.0
         losses=[]; units=[]
         for i,(prefix,_,ids) in enumerate(prepared):
             start=prefix.shape[1]-1; count=ids.shape[1]
             hs=hidden[i:i+1,start:start+count]; total=hidden.new_zeros((),dtype=torch.float32)
             for offset in range(0,count,128):
                 hs_2d=hs[:,offset:offset+128].reshape(-1,self.hidden); lbl_1d=ids[:,offset:offset+128].reshape(-1)
-                def ce(x,y): return F.cross_entropy(self.get_output_embeddings()(x).float().reshape(-1,self.config.vocab_size),y,reduction='sum')
+                def ce(x,y): return F.cross_entropy(self.get_output_embeddings()(x).float().reshape(-1,self.config.vocab_size),y,reduction='sum',label_smoothing=ls)
                 total=total+checkpoint(ce,hs_2d,lbl_1d,use_reentrant=False)
             losses.append(total/count); units.append(count)
         return losses,units
