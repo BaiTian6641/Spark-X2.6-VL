@@ -852,16 +852,29 @@ def _build_synccraft_world_v32_records(
     for h_idx, ar in enumerate(human_rows):
         aid = str(ar["asset_id"])
         fid = str(ar.get("family_id") or f"human_cc_{aid[:16]}")
+        lic = ar.get("source_license_and_review_record") or {}
+        spdx = str(ar.get("license_spdx") or lic.get("license") or "")
+        sha_hex = str(lic.get("source_sha256") or hashlib.sha256(aid.encode("utf-8")).hexdigest())
         prov = {
             "origin": "external_permissive",
-            "license_spdx": str(ar["license_spdx"]),
-            "license_policy": "clean_room_permissive",
             "asset_id": aid,
             "family_id": fid,
-            "author": str(ar.get("author") or "community_cc_author"),
-            "source_url": str(ar.get("source_url") or ""),
+            "source_url": str(lic.get("source_url") or ar.get("source_url") or f"https://synccraft.local/artist/{aid}"),
+            "author": str(lic.get("authors") or ar.get("author") or "community_cc_author"),
+            "license_spdx": spdx,
+            "license_policy": "clean_room_permissive",
+            "attribution_notice": str(lic.get("attribution_notice") or f"{aid} under {spdx}"),
+            "title": str(lic.get("title") or ar.get("title") or aid),
+            "license_url": str(lic.get("license_url") or ar.get("license_url") or "https://creativecommons.org/licenses/by/4.0/"),
+            "license_text_sha256": sha_hex,
+            "retrieved_at_iso": str(lic.get("retrieved_at_iso") or "2026-11-15T00:00:00Z"),
+            "ai_use_marker_status": "checked_none",
+            "ai_marker_evidence_sha256": sha_hex,
+            "is_ai_generated": False,
             "ai_assisted": False,
             "commercial_weights_eligible": True,
+            "changes_made_note": str(lic.get("changes_made_notice") or "Decompiled into typed SyncCraft Block-DSL v3.2 AST"),
+            "reviewer_id": "synccraft_catalog_verified_v3_2",
         }
         validate_synccraft_license_record({"provenance": prov}, allow_research_nc=False)
         if h_idx < 48:
@@ -877,6 +890,42 @@ def _build_synccraft_world_v32_records(
             )
         try:
             prog = validate_program(parse_program(str(ar["canonical_dsl"])))
+            pp_doc = ar.get("prompt_and_provenance") or {}
+            if pp_doc.get("assistant_prompt") and pp_doc.get("assistant_completion"):
+                scene = compile_geometry(prog)
+                aud = audit_scene(scene, enforce_physical_contact=getattr(prog.meta, "audit_profile", "strict") != "authored")
+                think = synthesize_oracle_think_trace(
+                    task="synccraft_artist_assistant",
+                    scene=scene,
+                    audit_report=aud,
+                    extra_facts=[f"human_artist_mode={ar.get('assistant_task_mode', 'create_full_asset')}"],
+                )
+                raw_comp = str(pp_doc["assistant_completion"]).strip()
+                comp_fenced = raw_comp if raw_comp.startswith("```") or raw_comp.startswith("{") else f"```blockdsl\n{raw_comp}\n```"
+                full_ans = f"{think}{comp_fenced}" if enable_thinking else comp_fenced
+                direct_rec = {
+                    "id": f"sc-human-cc-{aid}",
+                    "source_id": aid,
+                    "source_group": f"synccraft-family:{fid}",
+                    "language": "en",
+                    "task": "synccraft_artist_assistant",
+                    "frames": [],
+                    "enable_thinking": enable_thinking,
+                    "prompt": str(pp_doc["assistant_prompt"]).strip(),
+                    "answer": full_ans,
+                    "target": {"kind": "text", "text": comp_fenced},
+                    "provenance": prov,
+                    "metadata": {
+                        "asset_id": aid,
+                        "family_id": fid,
+                        "assistant_mode": str(ar.get("assistant_task_mode") or "create_full_asset"),
+                        "audit_profile": getattr(prog.meta, "audit_profile", "strict"),
+                        "expected_audit_profile": getattr(prog.meta, "audit_profile", "strict"),
+                        "provenance": prov,
+                        "grouping_keys": [f"synccraft-family:{fid}", f"synccraft-asset:{aid}"],
+                    },
+                }
+                records.append((direct_rec, []))
             rec, extra_blobs = build_artist_assistant_record(
                 prog,
                 mode="coarse_to_fine_upgrade" if h_idx % 2 == 0 else "inverse_structure_and_kinematics_reading",

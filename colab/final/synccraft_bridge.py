@@ -249,22 +249,37 @@ def synccraft_group_keys(record: dict[str, Any]) -> list[str]:
     return sorted(keys)
 
 
-def make_clean_room_provenance(asset_id: str, title: str = "SyncCraft Clean-Room Procedural Rig") -> dict[str, Any]:
-    """Construct verified Apache-2.0 clean-room procedural provenance metadata."""
-    evidence_hash = hashlib.sha256(f"synccraft-v3.2:{asset_id}".encode("utf-8")).hexdigest()
+def make_clean_room_provenance(
+    asset_id: str,
+    title: str = "SyncCraft Clean-Room Procedural Rig",
+    *,
+    license_spdx: str = "Apache-2.0",
+    author: str = "SyncCraft Deterministic Clean-Room Generator v3.2",
+    source_url: str | None = None,
+    attribution_notice: str = "SyncCraft v3.2 clean-room procedural synthesis",
+) -> dict[str, Any]:
+    """Construct verified permissive clean-room procedural provenance metadata."""
+    evidence_hash = hashlib.sha256(f"synccraft-v3.2:{asset_id}:{license_spdx}".encode("utf-8")).hexdigest()
+    lic_urls = {
+        "Apache-2.0": "https://www.apache.org/licenses/LICENSE-2.0",
+        "MIT": "https://opensource.org/licenses/MIT",
+        "CC0-1.0": "https://creativecommons.org/publicdomain/zero/1.0/",
+        "CC-BY-4.0": "https://creativecommons.org/licenses/by/4.0/",
+    }
     return {
         "asset_id": asset_id,
-        "source_url": f"https://synccraft.local/procedural/{asset_id}",
-        "author": "SyncCraft Deterministic Clean-Room Generator v3.2",
-        "license_spdx": "Apache-2.0",
-        "attribution_notice": "SyncCraft v3.2 clean-room procedural synthesis",
+        "source_url": source_url or f"https://synccraft.local/procedural/{asset_id}",
+        "author": author,
+        "license_spdx": license_spdx,
+        "attribution_notice": attribution_notice,
         "title": title,
-        "license_url": "https://www.apache.org/licenses/LICENSE-2.0",
+        "license_url": lic_urls.get(license_spdx, "https://www.apache.org/licenses/LICENSE-2.0"),
         "license_text_sha256": evidence_hash,
         "retrieved_at_iso": "2026-11-14T00:00:00Z",
         "ai_use_marker_status": "opt_in_signed",
         "ai_marker_evidence_sha256": evidence_hash,
         "is_ai_generated": False,
+        "ai_assisted": False,
         "changes_made_note": "Procedural SE(3) + GGX/OKLCH clean-room synthesis",
         "reviewer_id": "synccraft_automated_gate_v3_2",
     }
@@ -1334,7 +1349,15 @@ def build_world_capability_record_from_ladder_row(
         ],
     )
     base_group = f"synccraft-ladder:{comp_triple}:{sample_id.rsplit('_', 1)[0]}"
-    prov = make_clean_room_provenance(sample_id, title=f"SyncCraft World Capability {level_id}")
+    probe_pair_id = ladder_row.get("probe_pair_id")
+    extra_gkeys = [base_group]
+    if probe_pair_id:
+        extra_gkeys.append(f"synccraft-probe:{probe_pair_id}")
+    prov = make_clean_room_provenance(
+        sample_id,
+        title=f"SyncCraft World Capability {level_id}",
+        license_spdx=str(ladder_row.get("license") or "Apache-2.0"),
+    )
     ladder_eval_spec = {
         "sample_id": sample_id,
         "level": level_id,
@@ -1360,6 +1383,7 @@ def build_world_capability_record_from_ladder_row(
             "provenance": prov,
             "ladder_eval_spec": ladder_eval_spec,
             "expected_audit_profile": aud_prof,
+            "grouping_keys": extra_gkeys,
         },
     }
     if frame_paths and visual_kind is not None:
