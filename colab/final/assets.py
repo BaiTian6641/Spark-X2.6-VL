@@ -68,59 +68,241 @@ def check_gated_access(spec,token):
     emit('model_access_verified',repository=repo,revision=spec['revision'],weights_downloaded=False)
 
 
+def _active_component_keys(lock,config):
+    if config.get('modalities','omni')=='vision_text':
+        return [k for k in ('spark','vision') if k in lock]
+    return list(lock.keys())
+
+
 def prepare_assets(root,token,config,download_weights=True):
-    from huggingface_hub import HfApi
     root=Path(root); lock=read(HERE/'components.lock.json'); paths={}
-    api=HfApi(token=token)
-    if not token: raise ValueError('HF_TOKEN must be enabled in Colab Secrets')
-    who=api.whoami()
-    role=(who.get('auth',{}).get('accessToken') or {}).get('role')
-    if role=='read': raise ValueError('HF_TOKEN must permit writing the configured model/checkpoint repositories, not only reading datasets')
-    if who.get('name')!='TassP0lar': raise ValueError('HF_TOKEN belongs to an unexpected publishing account')
-    emit('hf_identity_verified',account=who['name'],token_role=role,publication_write_access_proven=False)
-    # Check gated access before allocating a GPU or downloading other weights.
-    check_gated_access(lock['sound_out'],token)
+    active_keys=_active_component_keys(lock,config)
+    include_motion='motion' in active_keys
+    is_local_workstation=(config.get('execution_target')=='local_workstation' and config.get('checkpoint_backend')=='local')
+
     checks={};remaining=0
-    for key,spec in lock.items():
+    for key in active_keys:
         if key=='motion': continue
+        spec=lock[key]
         for f in spec['files']:
             candidate=root/'assets'/key/f['path'];weight=f['path'].endswith(('.safetensors','.bin'))
             valid=verified(candidate,f) if download_weights or not weight else False
             checks[candidate]=valid
             if download_weights and weight and not valid: remaining+=f['bytes']
-    motion_path=root/'assets/motion.pt';motion_valid=verified(motion_path,lock['motion']['checkpoint']) if download_weights else False
-    checks[motion_path]=motion_valid
-    if download_weights and not motion_valid: remaining+=lock['motion']['checkpoint']['bytes']
+    motion_path=root/'assets/motion.pt'
+    if include_motion:
+        motion_valid=verified(motion_path,lock['motion']['checkpoint']) if download_weights else False
+        checks[motion_path]=motion_valid
+        if download_weights and not motion_valid: remaining+=lock['motion']['checkpoint']['bytes']
+
+    all_local_verified=bool(checks) and all(checks.values())
+    if not (is_local_workstation and all_local_verified):
+        from huggingface_hub import HfApi
+        api=HfApi(token=token)
+        if not token: raise ValueError('HF_TOKEN must be enabled in Colab Secrets')
+        who=api.whoami()
+        role=(who.get('auth',{}).get('accessToken') or {}).get('role')
+        if not is_local_workstation:
+            if role=='read': raise ValueError('HF_TOKEN must permit writing the configured model/checkpoint repositories, not only reading datasets')
+            if who.get('name')!='TassP0lar': raise ValueError('HF_TOKEN belongs to an unexpected publishing account')
+        emit('hf_identity_verified',account=who.get('name'),token_role=role,publication_write_access_proven=False)
+        if 'sound_out' in active_keys:
+            # Check gated access before allocating a GPU or downloading other weights.
+            check_gated_access(lock['sound_out'],token)
+
     from .run import directory_bytes
     allocated=directory_bytes(root/'checkpoints') if (root/'checkpoints').exists() else 0
     checkpoint_reserve=max(0,2*config['initial_checkpoint_reservation_bytes']-allocated) if download_weights else 0
-    if download_weights: disk_guard(root,pending=remaining,reserve=checkpoint_reserve)
-    for key,spec in lock.items():
+    free_floor=config.get('local_free_floor_bytes',44_000_000_000)
+    if download_weights: disk_guard(root,pending=remaining,reserve=checkpoint_reserve,min_free_bytes=free_floor)
+    for key in active_keys:
         if key=='motion': continue
+        spec=lock[key]
         path=root/'assets'/key; paths[key]=path
         for f in spec['files']:
             is_weight=f['path'].endswith(('.safetensors','.bin'))
             if is_weight and not download_weights: continue
             fetch(f"https://huggingface.co/{spec['repository']}/resolve/{spec['revision']}/{f['path']}",path/f['path'],f,token,reserve=checkpoint_reserve,verified_existing=checks[path/f['path']])
         emit('component_ready',component=key,revision=spec['revision'],weights=download_weights)
-    motion=lock['motion']; archive=HERE/motion['source_archive']['path']
-    if sha(archive)!=motion['source_archive']['sha256']: raise ValueError('V-JEPA source archive changed')
-    source=root/'vendor'; source.mkdir(exist_ok=True)
-    with zipfile.ZipFile(archive) as z:
-        for item in z.infolist():
-            target=(source/item.filename).resolve()
-            if not target.is_relative_to(source.resolve()) or item.file_size>100*1024**2: raise ValueError('Unsafe source archive member')
-        z.extractall(source)
-        prefix=z.namelist()[0].split('/')[0]
-    paths['motion_source']=source/prefix
-    paths['motion']=motion_path
-    if download_weights: fetch(motion['checkpoint']['url'],paths['motion'],motion['checkpoint'],reserve=checkpoint_reserve,verified_existing=checks[motion_path])
-    write(root/'asset-receipt.json',{'component_lock_sha256':sha(HERE/'components.lock.json'),'weights_downloaded':download_weights,'gated_access_checked':True,'paths':{k:str(v) for k,v in paths.items()}})
+    if include_motion:
+        motion=lock['motion']; archive=HERE/motion['source_archive']['path']
+        if sha(archive)!=motion['source_archive']['sha256']: raise ValueError('V-JEPA source archive changed')
+        source=root/'vendor'; source.mkdir(exist_ok=True)
+        with zipfile.ZipFile(archive) as z:
+            for item in z.infolist():
+                target=(source/item.filename).resolve()
+                if not target.is_relative_to(source.resolve()) or item.file_size>100*1024**2: raise ValueError('Unsafe source archive member')
+            z.extractall(source)
+            prefix=z.namelist()[0].split('/')[0]
+        paths['motion_source']=source/prefix
+        paths['motion']=motion_path
+        if download_weights: fetch(motion['checkpoint']['url'],paths['motion'],motion['checkpoint'],reserve=checkpoint_reserve,verified_existing=checks[motion_path])
+    write(root/'asset-receipt.json',{'component_lock_sha256':sha(HERE/'components.lock.json'),'modalities':config.get('modalities','omni'),'weights_downloaded':download_weights,'gated_access_checked':'sound_out' in active_keys,'paths':{k:str(v) for k,v in paths.items()}})
     return paths
+
+
+def prepare_local_synccraft_data(root,config,*,include_animation=True,panel_size=(128,128)):
+    """Build a verified local TAR shard + SQLite split corpus for clean-room SyncCraft + vision tasks."""
+    import gzip,io,json,tarfile
+    from PIL import Image
+    from .common import identity
+    from .data import build_database
+    from .synccraft_bridge import (
+        build_animated_quadruped_program,
+        build_animation_clip_record,
+        build_synccraft_curriculum_records,
+    )
+
+    root=Path(root); root.mkdir(parents=True,exist_ok=True)
+    db=root/'metadata/corpus.sqlite'
+    cat=root/'metadata/packets.jsonl.gz'
+    handoff_path=root/'metadata/HANDOFF.json'
+    if db.exists() and cat.exists() and handoff_path.exists():
+        expected={'catalogue_sha256':sha(cat),'split':config['split_percent'],'seed':config['seed']}
+        if read(root/'metadata/BUILD.json')!=expected:
+            raise ValueError('Existing dataset split differs; use a new campaign directory')
+        return read(db.with_suffix('.report.json'))
+
+    pairs=list(build_synccraft_curriculum_records(include_animation=False,enable_thinking=True,panel_size=panel_size))
+    if include_animation:
+        # Build >=6 independent animation families so `video:en` satisfies independent split coverage.
+        for anim_idx in range(6):
+            prog=build_animated_quadruped_program(variant=anim_idx)
+            rec,payloads=build_animation_clip_record(
+                prog,
+                clip_name='walk_cycle',
+                asset_id=f'synccraft_anim_quad_{anim_idx:03d}',
+                family_id=f'quadruped_gait_family_{anim_idx:03d}',
+                num_keyframes=4,
+                enable_thinking=True,
+                panel_size=panel_size,
+            )
+            pairs.append((rec,payloads))
+
+    # Add >=8 independent bilingual pure-text (`text_replay`) and RGBA/opaque visual grounding groups.
+    for idx in range(8):
+        for lang in ('en','zh'):
+            txt_row={
+                'id':f'spark_text_preserve_{lang}_{idx}',
+                'source_group':f'spark_text_group_{lang}_{idx}',
+                'language':lang,
+                'task':'text_replay',
+                'enable_thinking':bool(idx%2==0),
+                'frames':[],
+                'prompt':(
+                    f'Compute {idx+3} * {idx+5} and state the integer result.'
+                    if lang=='en'
+                    else f'计算 {idx+3} 乘以 {idx+5} 并给出整数结果。'
+                ),
+                'answer':(
+                    f'<think>\nMultiply {idx+3} by {idx+5}.\n</think>\n{(idx+3)*(idx+5)}'
+                    if idx%2==0
+                    else str((idx+3)*(idx+5))
+                ),
+                'target':{'kind':'text','text':str((idx+3)*(idx+5))},
+                'metadata':{},
+            }
+            pairs.append((txt_row,{}))
+
+            has_cutout=(idx%2==0)
+            arr=__import__('numpy').zeros((64,64,4),dtype='uint8')
+            arr[:,:,0]=(40+23*idx)%255; arr[:,:,1]=(90+17*idx)%255; arr[:,:,2]=(180+11*(0 if lang=='en' else 3))%255; arr[:,:,3]=255
+            if has_cutout:
+                arr[16:48,16:48,3]=0
+            buf=io.BytesIO()
+            Image.fromarray(arr,mode='RGBA').save(buf,format='PNG')
+            png_bytes=buf.getvalue()
+            member=f'pilot/{lang}_{idx}/texture.png'
+            ans_txt='transparent_cutout' if has_cutout else 'opaque_solid'
+            vis_row={
+                'id':f'spark_rgba_pilot_{lang}_{idx}',
+                'source_group':f'spark_rgba_group_{lang}_{idx}',
+                'language':lang,
+                'task':'rgba_visual_pilot',
+                'visual_kind':'uv_atlas',
+                'enable_thinking':False,
+                'frames':[member],
+                'media_times_s':[0.0],
+                'visual_units':[{'visual_kind':'uv_atlas','view_id':'uv_vanilla','is_pixel_art_atlas':True}],
+                'prompt':(
+                    'Inspect the RGBA texture and state whether it has a transparent cutout region.'
+                    if lang=='en'
+                    else '检查该 RGBA 贴图并说明是否包含透明镂空区域。'
+                ),
+                'answer':ans_txt,
+                'target':{'kind':'text','text':ans_txt},
+                'metadata':{'has_alpha_cutout':has_cutout},
+            }
+            pairs.append((vis_row,{member:png_bytes}))
+
+    shard_name='shard-00000.tar'
+    cache_dir=root/'media-cache/synccraft_local'
+    cache_dir.mkdir(parents=True,exist_ok=True)
+    shard_path=cache_dir/shard_name
+    blob_map={}
+    for _row,payloads in pairs:
+        for m_path,payload in payloads.items():
+            blob_map[m_path]=payload
+
+    member_files=[]
+    member_offsets={}
+    with tarfile.open(shard_path,'w:') as tf:
+        for m_path in sorted(blob_map):
+            payload=blob_map[m_path]
+            ti=tarfile.TarInfo(name=m_path)
+            ti.size=len(payload)
+            ti.mtime=0
+            ti.mode=0o644
+            tf.addfile(ti,io.BytesIO(payload))
+    with tarfile.open(shard_path,'r:') as tf:
+        for m in tf.getmembers():
+            payload=blob_map[m.name]
+            digest=hashlib.sha256(payload).hexdigest()
+            member_offsets[m.name]={'member':m.name,'offset':m.offset_data,'length':m.size,'sha256':digest}
+            member_files.append({'path':m.name,'bytes':m.size,'sha256':digest,'offset_data':m.offset_data})
+
+    shard_bytes=shard_path.stat().st_size
+    shard_sha=sha(shard_path)
+    release_doc={
+        'schema_version':1,
+        'kind':'immutable_multimodal_dataset_shards',
+        'role':'training',
+        'dataset_manifest_sha256':identity({'items':len(pairs),'seed':config['seed']}),
+        'media_manifest_sha256':identity(member_files),
+        'payload_bytes':shard_bytes,
+        'shards':[{'path':shard_name,'bytes':shard_bytes,'sha256':shard_sha,'files':member_files}],
+    }
+    release_path=root/'indices/synccraft_local/RELEASE.json'
+    write(release_path,release_doc)
+    release_sha=sha(release_path)
+    handoff_doc={
+        'repo_id':'local/synccraft-cleanroom',
+        'revision':'22ff1605d75143870743d26fa5d9445a32d6e627',
+        'components':[{'id':'synccraft_local','prefix':'synccraft_local','release_bytes':release_path.stat().st_size,'release_sha256':release_sha}],
+    }
+    write(handoff_path,handoff_doc)
+
+    cat.parent.mkdir(parents=True,exist_ok=True)
+    with gzip.open(cat,'wt',encoding='utf-8') as gz:
+        for row,payloads in pairs:
+            frames=row.get('frames') or []
+            transport=None
+            if frames:
+                transport={'shard':shard_name,'media':[dict(member_offsets[m_name]) for m_name in frames]}
+            packet={'component':'synccraft_local','record':row,'transport':transport}
+            gz.write(json.dumps(packet,ensure_ascii=False,separators=(',',':'))+'\n')
+
+    report=build_database(cat,db,config)
+    write(root/'metadata/BUILD.json',{'catalogue_sha256':sha(cat),'split':config['split_percent'],'seed':config['seed']})
+    return report
+
 
 def prepare_data(root,token,config):
     from .data import build_database
-    root=Path(root); root.mkdir(exist_ok=True,parents=True); lock=read(HERE/'dataset.lock.json'); handoff=read(HERE.parent/'formal/HF_FULL_DATASET_HANDOFF.json')
+    root=Path(root); root.mkdir(exist_ok=True,parents=True)
+    if config.get('dataset_mode')=='local_synccraft' or (root/'metadata/HANDOFF.json').is_file():
+        return prepare_local_synccraft_data(root,config)
+    lock=read(HERE/'dataset.lock.json'); handoff=read(HERE.parent/'formal/HF_FULL_DATASET_HANDOFF.json')
     cat=root/'metadata/packets.jsonl.gz'; fetch(lock['catalogue_url'],cat,lock['catalogue'],token)
     for c in handoff['components']:
         f={'bytes':c['release_bytes'],'sha256':c['release_sha256']}

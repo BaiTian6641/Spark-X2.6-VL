@@ -1,27 +1,31 @@
-"""Native differentiable multimodal Spark wrapper. No external generation API.
+"""Native differentiable multimodal Spark wrapper with pure-text bypass, RGBA/pose encoding, and gated cross-attention.
 
-The Spark decoder is called directly: this custom backbone does not return
-hidden_states through its CausalLM wrapper. Targets never enter input encoders.
+Key contracts:
+- Pure-text requests (`not has_multimodal_context(media)`) bypass all visual/audio encoders,
+  projectors, clocks, and cross-attention blocks, calling Spark directly with native KV cache,
+  dual `<think>` / non-thinking chat formatting, and full generation controls.
+- `modalities='vision_text'` loads only Spark + SigLIP2 (deferring Whisper/CLAP/V-JEPA/TTS/DiT)
+  so full 4B finetuning with APOLLO + COAT + merged gradients fits comfortably in 24 GB VRAM.
+- Visual encoding preserves RGBA alpha channels, detail tiles on multiviews/UVs/state-pairs,
+  and explicit `visual_kind`, `view_id`, and orthographic camera basis conditioning.
 """
 from __future__ import annotations
-import math, sys, zipfile
+from contextlib import contextmanager
+import hashlib, math, sys
 from pathlib import Path
+from typing import Any
 import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
 from .common import HERE, read, sha
+from .data import VIEW_IDS, VIEW_ID_TO_INDEX, VISUAL_KINDS, VISUAL_KIND_TO_INDEX, extract_image_rgb_and_alpha
 
 def install_spark_sdpa(spark):
-    """Replace only the reference attention kernel, keeping masks/RoPE/gates.
-
-    Spark's original class does not advertise the Transformers `sdpa` loader
-    flag. Load its declared eager interface, then install this tested kernel
-    adapter. The original immutable source files are never modified.
-    """
+    """Replace only the reference attention kernel, keeping masks/RoPE/gates."""
     module=sys.modules[type(spark).__module__]
-    current=module.eager_attention_forward
-    if getattr(current,'_spark_native_sdpa',False): return
+    current=getattr(module,'eager_attention_forward',None)
+    if current is None or getattr(current,'_spark_native_sdpa',False): return
     reference=current
     def sdpa(attention,query,key,value,attention_mask=None,scaling=None,dropout=0.,**kwargs):
         key=module.repeat_kv(key,attention.num_key_value_groups)
@@ -36,44 +40,103 @@ SYSTEM_PROMPT = ('You are Spark, an English and Chinese multimodal assistant. Us
                  'Report uncertainty when capture time or evidence is unknown.')
 
 
+def has_multimodal_context(media:dict[str,Any]|None)->bool:
+    """Return True iff any visual, motion, or input audio conditioning is present."""
+    if not media:
+        return False
+    return bool(
+        media.get('images')
+        or media.get('motion')
+        or media.get('audio') is not None
+    )
+
+
 class ChatFormat:
-    """Exact non-thinking Spark layout with media inside the first user turn."""
+    """Exact Spark chat layout supporting both non-thinking and `<think>` modes plus native system prompts."""
 
     def __init__(self, tokenizer, system=SYSTEM_PROMPT):
         self.tok = tokenizer
+        self.default_system = system
+        self.layouts = {}
+        for thinking in (False, True):
+            self.layouts[thinking] = self._probe_layout(tokenizer, system, enable_thinking=thinking)
+        # Retain top-level attributes for non-thinking backward compatibility.
+        base = self.layouts[False]
+        self.system_block = base['system_block']
+        self.user_to_bot = base['user_to_bot']
+        self.bot_to_user = base['bot_to_user']
+        self.bot_close = base['bot_close']
+        self.user_open = base['user_open']
+        self.cache = {}
+
+    @staticmethod
+    def _probe_layout(tokenizer, system: str, *, enable_thinking: bool) -> dict[str, str]:
         marks = ['\x01S\x01', '\x01U1\x01', '\x01A1\x01', '\x01U2\x01', '\x01A2\x01']
-        messages = [{'role': 'system', 'content': marks[0]}, {'role': 'user', 'content': marks[1]},
-                    {'role': 'assistant', 'content': marks[2]}, {'role': 'user', 'content': marks[3]},
-                    {'role': 'assistant', 'content': marks[4]}]
-        text = tokenizer.apply_chat_template(messages, tokenize=False, enable_thinking=False)
+        messages = [
+            {'role': 'system', 'content': marks[0]},
+            {'role': 'user', 'content': marks[1]},
+            {'role': 'assistant', 'content': marks[2]},
+            {'role': 'user', 'content': marks[3]},
+            {'role': 'assistant', 'content': marks[4]},
+        ]
+        try:
+            text = tokenizer.apply_chat_template(messages, tokenize=False, enable_thinking=enable_thinking)
+        except TypeError:
+            text = tokenizer.apply_chat_template(messages, tokenize=False)
         positions = [text.index(mark) for mark in marks]
         if positions != sorted(positions):
             raise ValueError('Unexpected Spark chat-template ordering')
-        self.system_block = text[:positions[0]] + system + text[positions[0] + len(marks[0]):positions[1]]
-        self.user_to_bot = text[positions[1] + len(marks[1]):positions[2]]
-        self.bot_to_user = text[positions[2] + len(marks[2]):positions[3]]
-        self.bot_close = text[positions[4] + len(marks[4]):]
-        if not self.bot_to_user.startswith(self.bot_close):
+        sys_prefix = text[:positions[0]]
+        sys_suffix = text[positions[0] + len(marks[0]):positions[1]]
+        system_block = sys_prefix + system + sys_suffix
+        user_to_bot = text[positions[1] + len(marks[1]):positions[2]]
+        bot_to_user = text[positions[2] + len(marks[2]):positions[3]]
+        bot_close = text[positions[4] + len(marks[4]):]
+        if not bot_to_user.startswith(bot_close):
             raise ValueError('Assistant close marker is inconsistent')
-        self.user_open = self.bot_to_user[len(self.bot_close):]
-        generated = tokenizer.apply_chat_template(messages[:2], tokenize=False,
-                                                  add_generation_prompt=True, enable_thinking=False)
-        expected = self.system_block.replace(system, marks[0]) + marks[1] + self.user_to_bot
-        if generated != expected:
+        user_open = bot_to_user[len(bot_close):]
+        try:
+            generated = tokenizer.apply_chat_template(
+                messages[:2], tokenize=False, add_generation_prompt=True, enable_thinking=enable_thinking
+            )
+        except TypeError:
+            generated = tokenizer.apply_chat_template(messages[:2], tokenize=False, add_generation_prompt=True)
+        # In thinking mode, add_generation_prompt may append `<think>\n` to `user_to_bot`.
+        gen_prefix = sys_prefix + marks[0] + sys_suffix + marks[1]
+        if not generated.startswith(gen_prefix):
+            raise ValueError('Generation prompt prefix differs from the training layout')
+        gen_user_to_bot = generated[len(gen_prefix):]
+        if not enable_thinking and gen_user_to_bot != user_to_bot:
             raise ValueError('Generation prompt differs from the training layout')
-        self.cache = {}
+        return {
+            'sys_prefix': sys_prefix,
+            'sys_suffix': sys_suffix,
+            'system_block': system_block,
+            'user_to_bot': user_to_bot,
+            'gen_user_to_bot': gen_user_to_bot,
+            'bot_to_user': bot_to_user,
+            'bot_close': bot_close,
+            'user_open': user_open,
+        }
 
-    def ids(self, text):
+    def ids(self, text: str) -> list[int]:
         if text not in self.cache:
             self.cache[text] = self.tok(text, add_special_tokens=False).input_ids
         return list(self.cache[text])
 
-    def encode(self, prompt):
-        """Return system/user-open ids and user-content/non-thinking-bot-open ids."""
-        pre = self.ids(self.system_block)
-        # Tokenize content separately so no special tokens are synthesized.
-        post = self.tok(prompt, add_special_tokens=False).input_ids + self.ids(self.user_to_bot)
+    def encode(self, prompt: str, *, enable_thinking: bool = False, system: str | None = None, for_generation: bool = False):
+        """Return `(pre_ids, post_ids)` for system/user-open and user-content/assistant-open."""
+        layout = self.layouts[bool(enable_thinking)]
+        sys_block = (
+            layout['system_block']
+            if system is None
+            else (layout['sys_prefix'] + system + layout['sys_suffix'])
+        )
+        pre = self.ids(sys_block)
+        turn_Transition = layout['gen_user_to_bot'] if for_generation else layout['user_to_bot']
+        post = self.tok(prompt, add_special_tokens=False).input_ids + self.ids(turn_Transition)
         return pre, post
+
 
 class Resampler(nn.Module):
     def __init__(self,dim,hidden,n,heads=8):
@@ -84,6 +147,48 @@ class Resampler(nn.Module):
         if position is not None: x=x+position.to(x.dtype)
         q=self.queries[None].expand(x.shape[0],-1,-1).to(x.dtype)
         return self.out(q+self.attn(q,self.norm(x),self.norm(x),need_weights=False)[0])
+
+
+class GatedVisualCrossAttentionBlock(nn.Module):
+    """Flamingo-style zero-initialized tanh-gated visual cross-attention + gated-GELU FFN adapter.
+
+    At initialization (`gate_attn == 0`, `gate_ffn == 0`), outputs exact identity `x`.
+    Completely skipped when no visual context is active.
+    """
+    def __init__(self, hidden_size: int, num_heads: int = 8, ffn_mult: int = 2):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.norm_q = nn.LayerNorm(hidden_size)
+        self.norm_kv = nn.LayerNorm(hidden_size)
+        self.attn = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True)
+        self.gate_attn = nn.Parameter(torch.zeros(1))
+
+        inner = hidden_size * ffn_mult
+        self.norm_ffn = nn.LayerNorm(hidden_size)
+        self.ffn_gate = nn.Linear(hidden_size, inner)
+        self.ffn_up = nn.Linear(hidden_size, inner)
+        self.ffn_down = nn.Linear(inner, hidden_size)
+        self.gate_ffn = nn.Parameter(torch.zeros(1))
+
+    def forward(self, hidden_states: torch.Tensor, visual_tokens: torch.Tensor) -> torch.Tensor:
+        orig_dtype = hidden_states.dtype
+        work_dtype = self.norm_q.weight.dtype
+        x = hidden_states.to(work_dtype)
+        vis = visual_tokens.to(work_dtype)
+        if vis.shape[0] == 1 and x.shape[0] > 1:
+            vis = vis.expand(x.shape[0], -1, -1)
+
+        q = self.norm_q(x)
+        kv = self.norm_kv(vis)
+        attn_out, _ = self.attn(q, kv, kv, need_weights=False)
+        x = x + torch.tanh(self.gate_attn) * attn_out
+
+        h = self.norm_ffn(x)
+        ffn_out = self.ffn_down(F.gelu(self.ffn_gate(h), approximate='tanh') * self.ffn_up(h))
+        x = x + torch.tanh(self.gate_ffn) * ffn_out
+        return x.to(orig_dtype)
+
 
 def spatial_downshuffle(x,h,w):
     """Preserve the actual NaFlex grid; concatenate each real 2x2 neighborhood."""
@@ -96,47 +201,253 @@ def spatial_downshuffle(x,h,w):
     mask=valid.reshape(hh//2,2,ww//2,2).permute(0,2,1,3).flatten(2).any(-1).flatten()
     return out[:,mask],mask
 
+
+def compute_patch_alpha_transparency_features(
+    alpha_hw: np.ndarray | None,
+    hh: int,
+    ww: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Compute 16-dim downshuffled transparency features per visual token.
+
+    For completely opaque RGB images (`alpha_hw is None` or `alpha == 1.0` everywhere),
+    returns exact zeros `[1, num_tokens, 16]` so zero-bias `alpha_projector` adds 0.0 shift!
+    For RGBA cutouts / translucent textures, encodes `[mean_transp, max_transp, min_transp, edge_std]`
+    per 2x2 sub-patch, cleanly separating opaque, cutout, and semi-transparent UV islands.
+    """
+    gh, gw = (hh + 1) // 2, (ww + 1) // 2
+    if alpha_hw is None:
+        return torch.zeros((1, gh * gw, 16), device=device, dtype=torch.float32)
+    a_t = torch.as_tensor(alpha_hw, device=device, dtype=torch.float32)
+    if a_t.ndim != 2 or a_t.numel() == 0 or float(a_t.min().item()) >= 1.0 - 1e-6:
+        return torch.zeros((1, gh * gw, 16), device=device, dtype=torch.float32)
+
+    transp = (1.0 - a_t.clamp(0.0, 1.0))[None, None]  # [1, 1, H, W]
+    mean_t = F.adaptive_avg_pool2d(transp, (hh, ww))
+    max_t = F.adaptive_max_pool2d(transp, (hh, ww))
+    min_t = 1.0 - F.adaptive_max_pool2d(1.0 - transp, (hh, ww))
+    sq_t = F.adaptive_avg_pool2d(transp * transp, (hh, ww))
+    std_t = (sq_t - mean_t * mean_t).clamp_min(0.0).sqrt()
+
+    feat = torch.cat([mean_t, max_t, min_t, std_t], dim=1)  # [1, 4, hh, ww]
+    feat_tokens = feat.permute(0, 2, 3, 1).reshape(1, hh * ww, 4)
+    downshuffled, _ = spatial_downshuffle(feat_tokens, hh, ww)
+    return downshuffled
+
+
+def _sample_next_token(
+    logits: torch.Tensor,
+    *,
+    generated_ids: list[int],
+    do_sample: bool = False,
+    temperature: float = 1.0,
+    top_p: float = 1.0,
+    top_k: int | None = None,
+    repetition_penalty: float = 1.0,
+) -> torch.Tensor:
+    """Select next token `[1, 1]` supporting exact greedy argmax and standard nucleus/top-k sampling."""
+    scores = logits[:, -1, :].float().clone()
+    if repetition_penalty is not None and repetition_penalty != 1.0 and generated_ids:
+        seen = torch.tensor(sorted(set(generated_ids)), device=scores.device, dtype=torch.long)
+        seen_scores = scores[:, seen]
+        scores[:, seen] = torch.where(
+            seen_scores < 0, seen_scores * repetition_penalty, seen_scores / repetition_penalty
+        )
+    if not do_sample or temperature <= 0.0:
+        return scores.argmax(dim=-1, keepdim=True)
+    if temperature != 1.0:
+        scores = scores / float(temperature)
+    if top_k is not None and top_k > 0 and top_k < scores.shape[-1]:
+        kth = torch.topk(scores, int(top_k), dim=-1).values[..., -1, None]
+        scores = scores.masked_fill(scores < kth, float('-inf'))
+    if top_p is not None and 0.0 < top_p < 1.0:
+        sorted_logits, sorted_indices = torch.sort(scores, descending=True, dim=-1)
+        probs = F.softmax(sorted_logits, dim=-1)
+        cumprobs = torch.cumsum(probs, dim=-1)
+        cutoff = cumprobs > float(top_p)
+        cutoff[..., 1:] = cutoff[..., :-1].clone()
+        cutoff[..., 0] = False
+        sorted_logits = sorted_logits.masked_fill(cutoff, float('-inf'))
+        scores = torch.zeros_like(scores).scatter(-1, sorted_indices, sorted_logits)
+    probs = F.softmax(scores, dim=-1)
+    return torch.multinomial(probs, num_samples=1)
+
+
 def audio_resample(wav,sr,target):
     import scipy.signal
     if sr==target: return wav
     g=math.gcd(sr,target); return scipy.signal.resample_poly(wav,target//g,sr//g,axis=-1).astype('float32')
 
+
 class SparkNative(nn.Module):
     main_input_name='input_ids'
     supports_gradient_checkpointing=True
-    def __init__(self,paths,policy,device='cuda',pretrained=True):
+    def __init__(self,paths,policy,device='cuda',pretrained=True,components=None):
         super().__init__()
-        from transformers import (AutoConfig,AutoModelForCausalLM,AutoTokenizer,Siglip2VisionModel,Siglip2VisionConfig,AutoImageProcessor,WhisperModel,WhisperConfig,WhisperFeatureExtractor,ClapModel,ClapAudioModel,ClapAudioConfig,ClapFeatureExtractor)
-        self.policy=policy; self.paths={k:str(v) for k,v in paths.items()}; self.pretrained=pretrained
-        self.spark=(AutoModelForCausalLM.from_pretrained(paths['spark'],trust_remote_code=True,local_files_only=True,dtype=torch.float32,attn_implementation='eager') if pretrained else AutoModelForCausalLM.from_config(AutoConfig.from_pretrained(paths['spark'],trust_remote_code=True,local_files_only=True),trust_remote_code=True,attn_implementation='eager'))
-        install_spark_sdpa(self.spark)
-        self.tokenizer=AutoTokenizer.from_pretrained(paths['spark'],trust_remote_code=True,local_files_only=True)
-        if self.tokenizer.pad_token_id is None: self.tokenizer.pad_token=self.tokenizer.eos_token
-        self.chat = ChatFormat(self.tokenizer)
-        self.config=self.spark.config; self.config.use_cache=False; self.generation_config=self.spark.generation_config
-        self.vision=(Siglip2VisionModel.from_pretrained(paths['vision'],local_files_only=True,dtype=torch.float32) if pretrained else Siglip2VisionModel(Siglip2VisionConfig.from_pretrained(paths['vision'],local_files_only=True)))
-        # Pooling heads are not part of the dense patch interface.
-        if hasattr(self.vision.vision_model,'head'): del self.vision.vision_model.head
-        self.vision.vision_model.use_head=False
-        self.image_processor=AutoImageProcessor.from_pretrained(paths['vision'],local_files_only=True)
-        whisper=(WhisperModel.from_pretrained(paths['speech_in'],local_files_only=True,dtype=torch.float32) if pretrained else WhisperModel(WhisperConfig.from_pretrained(paths['speech_in'],local_files_only=True)))
-        self.speech_in=whisper.encoder; del whisper
-        self.speech_processor=WhisperFeatureExtractor.from_pretrained(paths['speech_in'],local_files_only=True)
-        self.sound_in=self.load_sound_in(paths['sound_in'],pretrained)
-        self.sound_processor=ClapFeatureExtractor.from_pretrained(paths['sound_in'],local_files_only=True)
-        self.motion=self.load_motion(paths['motion_source'],paths['motion'] if pretrained else None)
+        self.policy=policy; self.paths={k:str(v) for k,v in (paths or {}).items()}; self.pretrained=pretrained
+        self.modalities=policy.get('modalities','omni')
+        default_backbone_dtype='float32' if self.modalities=='omni' or str(device).startswith('cpu') else 'bfloat16'
+        spark_dtype=getattr(torch,policy.get('spark_dtype',default_backbone_dtype))
+        vision_dtype=getattr(torch,policy.get('vision_dtype',default_backbone_dtype))
+
+        if components is not None:
+            self.spark=components['spark'].to(dtype=spark_dtype)
+            install_spark_sdpa(self.spark)
+            self.tokenizer=components['tokenizer']
+            if getattr(self.tokenizer,'pad_token_id',None) is None and getattr(self.tokenizer,'eos_token',None) is not None:
+                self.tokenizer.pad_token=self.tokenizer.eos_token
+            self.chat = ChatFormat(self.tokenizer)
+            self.config=self.spark.config; self.config.use_cache=False; self.generation_config=getattr(self.spark,'generation_config',None)
+            self.vision=components['vision'].to(dtype=vision_dtype)
+            if hasattr(getattr(self.vision,'vision_model',None),'head'): del self.vision.vision_model.head
+            if hasattr(self.vision,'vision_model'): self.vision.vision_model.use_head=False
+            self.image_processor=components['image_processor']
+        else:
+            from transformers import (AutoConfig,AutoModelForCausalLM,AutoTokenizer,Siglip2VisionModel,Siglip2VisionConfig,AutoImageProcessor)
+            self.spark=(AutoModelForCausalLM.from_pretrained(paths['spark'],trust_remote_code=True,local_files_only=True,dtype=spark_dtype,attn_implementation='eager') if pretrained else AutoModelForCausalLM.from_config(AutoConfig.from_pretrained(paths['spark'],trust_remote_code=True,local_files_only=True),trust_remote_code=True,attn_implementation='eager').to(dtype=spark_dtype))
+            install_spark_sdpa(self.spark)
+            self.tokenizer=AutoTokenizer.from_pretrained(paths['spark'],trust_remote_code=True,local_files_only=True)
+            if self.tokenizer.pad_token_id is None: self.tokenizer.pad_token=self.tokenizer.eos_token
+            self.chat = ChatFormat(self.tokenizer)
+            self.config=self.spark.config; self.config.use_cache=False; self.generation_config=self.spark.generation_config
+
+            self.vision=(Siglip2VisionModel.from_pretrained(paths['vision'],local_files_only=True,dtype=vision_dtype) if pretrained else Siglip2VisionModel(Siglip2VisionConfig.from_pretrained(paths['vision'],local_files_only=True)).to(dtype=vision_dtype))
+            if hasattr(self.vision.vision_model,'head'): del self.vision.vision_model.head
+            self.vision.vision_model.use_head=False
+            self.image_processor=AutoImageProcessor.from_pretrained(paths['vision'],local_files_only=True)
+
         h=self.config.hidden_size; self.hidden=h
         self.vision_projector=nn.Sequential(nn.LayerNorm(self.vision.config.hidden_size*4),nn.Linear(self.vision.config.hidden_size*4,h),nn.GELU(),nn.Linear(h,h))
+        # Zero-bias transparency projector: exact 0.0 on opaque RGB images, distinct on RGBA cutouts/translucency.
+        self.alpha_projector=nn.Sequential(nn.Linear(16,h,bias=False),nn.GELU(),nn.Linear(h,h,bias=False))
+        nn.init.normal_(self.alpha_projector[2].weight, mean=0.0, std=0.02)
         self.spatial_clock=nn.Sequential(nn.Linear(12,h),nn.GELU(),nn.Linear(h,h))
-        self.motion_projector=Resampler(self.motion.embed_dim,h,policy['motion_tokens'])
-        self.speech_projector=Resampler(self.speech_in.config.d_model,h,policy['audio_tokens'])
-        self.sound_projector=Resampler(self.sound_in.config.hidden_size,h,policy['audio_tokens'])
+        self.camera_pose_encoder=nn.Sequential(nn.Linear(8,h,bias=False),nn.GELU(),nn.Linear(h,h,bias=False))
+        nn.init.zeros_(self.camera_pose_encoder[2].weight)
+        self.visual_kind_embedding=nn.Embedding(len(VISUAL_KINDS),h)
+        nn.init.normal_(self.visual_kind_embedding.weight, mean=0.0, std=0.01)
+        self.view_id_embedding=nn.Embedding(len(VIEW_IDS),h)
+        nn.init.normal_(self.view_id_embedding.weight, mean=0.0, std=0.01)
         self.modality=nn.Embedding(5,h)
-        self.audio_clock=nn.Sequential(nn.Linear(4,h),nn.GELU(),nn.Linear(h,h))
-        from .outputs import NativeSpeechOutput,NativeSoundOutput
-        self.speech_out=NativeSpeechOutput(paths['speech_out'],h,policy,pretrained=pretrained)
-        self.sound_out=NativeSoundOutput(paths['sound_out'],h,policy,pretrained=pretrained)
-        self.to(device=device,dtype=torch.float32); self.freeze_infrastructure(); self.gradient_checkpointing_enable()
+
+        # Optional 0 / 3 / 6 Flamingo-style zero-init gated visual cross-attention blocks.
+        self._active_visual_context: torch.Tensor | None = None
+        self._xattn_hooks: list[Any] = []
+        n_xattn = int(policy.get('visual_cross_attn_blocks', 0))
+        if n_xattn not in (0, 3, 6):
+            raise ValueError(f'visual_cross_attn_blocks must be 0, 3, or 6; got {n_xattn}')
+        self.visual_cross_attn = nn.ModuleList()
+        self.visual_cross_attn_layer_indices: list[int] = []
+        if n_xattn > 0:
+            self.install_visual_cross_attention(n_xattn)
+
+        if self.modalities=='omni':
+            from transformers import WhisperModel,WhisperConfig,WhisperFeatureExtractor,ClapFeatureExtractor
+            whisper=(WhisperModel.from_pretrained(paths['speech_in'],local_files_only=True,dtype=torch.float32) if pretrained else WhisperModel(WhisperConfig.from_pretrained(paths['speech_in'],local_files_only=True)))
+            self.speech_in=whisper.encoder; del whisper
+            self.speech_processor=WhisperFeatureExtractor.from_pretrained(paths['speech_in'],local_files_only=True)
+            self.sound_in=self.load_sound_in(paths['sound_in'],pretrained)
+            self.sound_processor=ClapFeatureExtractor.from_pretrained(paths['sound_in'],local_files_only=True)
+            self.motion=self.load_motion(paths['motion_source'],paths['motion'] if pretrained else None)
+            self.motion_projector=Resampler(self.motion.embed_dim,h,policy['motion_tokens'])
+            self.speech_projector=Resampler(self.speech_in.config.d_model,h,policy['audio_tokens'])
+            self.sound_projector=Resampler(self.sound_in.config.hidden_size,h,policy['audio_tokens'])
+            self.audio_clock=nn.Sequential(nn.Linear(4,h),nn.GELU(),nn.Linear(h,h))
+            from .outputs import NativeSpeechOutput,NativeSoundOutput
+            self.speech_out=NativeSpeechOutput(paths['speech_out'],h,policy,pretrained=pretrained)
+            self.sound_out=NativeSoundOutput(paths['sound_out'],h,policy,pretrained=pretrained)
+            self.to(device=device,dtype=torch.float32)
+        else:
+            self.speech_in=None; self.speech_processor=None
+            self.sound_in=None; self.sound_processor=None
+            self.motion=None; self.motion_projector=None
+            self.speech_projector=None; self.sound_projector=None
+            self.audio_clock=None; self.speech_out=None; self.sound_out=None
+            # Move Spark + SigLIP2 preserving their configured dtypes; keep connectors/adapters in float32.
+            self.spark.to(device=device,dtype=spark_dtype)
+            if hasattr(self.spark,'tie_weights'): self.spark.tie_weights()
+            self.vision.to(device=device,dtype=vision_dtype)
+            for conn in self._connector_modules():
+                conn.to(device=device,dtype=torch.float32)
+
+        self.freeze_infrastructure()
+        self.gradient_checkpointing_enable()
+
+    def _connector_modules(self) -> list[nn.Module]:
+        mods: list[nn.Module] = []
+        for attr in (
+            'vision_projector',
+            'alpha_projector',
+            'spatial_clock',
+            'camera_pose_encoder',
+            'visual_kind_embedding',
+            'view_id_embedding',
+            'modality',
+            'visual_cross_attn',
+        ):
+            m = getattr(self, attr, None)
+            if isinstance(m, nn.Module):
+                mods.append(m)
+        return mods
+
+    def install_visual_cross_attention(self, num_blocks: int) -> list[int]:
+        """Attach `num_blocks` (`3` or `6`) zero-init gated visual cross-attention adapters across Spark layers."""
+        for handle in getattr(self, '_xattn_hooks', []):
+            handle.remove()
+        self._xattn_hooks = []
+        if num_blocks == 0:
+            self.visual_cross_attn = nn.ModuleList()
+            self.visual_cross_attn_layer_indices = []
+            return []
+        layers = getattr(getattr(self.spark, 'model', None), 'layers', None)
+        if layers is None or len(layers) == 0:
+            raise ValueError('Cannot attach gated visual cross-attention: spark.model.layers not found')
+        n_layers = len(layers)
+        step = max(1, n_layers // num_blocks)
+        chosen = [min(n_layers - 1, (i + 1) * step - 1) for i in range(num_blocks)]
+        # Deduplicate if tiny test model has fewer layers than num_blocks.
+        unique_indices: list[int] = []
+        for idx in chosen:
+            if idx not in unique_indices:
+                unique_indices.append(idx)
+        heads = max(1, min(8, self.hidden // max(1, min(64, self.hidden // 2))))
+        while self.hidden % heads != 0 and heads > 1:
+            heads -= 1
+        self.visual_cross_attn = nn.ModuleList(
+            [GatedVisualCrossAttentionBlock(self.hidden, num_heads=heads) for _ in unique_indices]
+        ).to(device=self.device, dtype=torch.float32)
+        self.visual_cross_attn_layer_indices = unique_indices
+
+        for block_idx, layer_idx in enumerate(unique_indices):
+            block = self.visual_cross_attn[block_idx]
+
+            def _make_hook(b: GatedVisualCrossAttentionBlock):
+                def _hook(_module, _inputs, output):
+                    vis_ctx = getattr(self, '_active_visual_context', None)
+                    if vis_ctx is None:
+                        return output
+                    if isinstance(output, tuple):
+                        hs = b(output[0], vis_ctx)
+                        return (hs, *output[1:])
+                    return b(output, vis_ctx)
+
+                return _hook
+
+            self._xattn_hooks.append(layers[layer_idx].register_forward_hook(_make_hook(block)))
+        return unique_indices
+
+    @contextmanager
+    def _visual_cross_attn_scope(self, visual_tokens: torch.Tensor | None):
+        prev = getattr(self, '_active_visual_context', None)
+        if visual_tokens is not None and len(getattr(self, 'visual_cross_attn', ())) > 0:
+            self._active_visual_context = visual_tokens
+        else:
+            self._active_visual_context = None
+        try:
+            yield
+        finally:
+            self._active_visual_context = prev
+
     @staticmethod
     def load_sound_in(path,pretrained):
         from transformers import ClapModel,ClapAudioModel,ClapAudioConfig
@@ -146,8 +457,6 @@ class SparkNative(nn.Module):
     @staticmethod
     def load_motion(source,checkpoint):
         sys.path.insert(0,str(source))
-        # Direct construction avoids the upstream localhost pretrained URL and
-        # never allocates an unused predictor/teacher network.
         from app.vjepa_2_1.models.vision_transformer import vit_base
         motion=vit_base(patch_size=16,img_size=(384,384),num_frames=64,tubelet_size=2,use_sdpa=True,use_SiLU=False,wide_SiLU=True,uniform_power=False,use_rope=True,img_temporal_dim_size=1,interpolate_rope=True)
         if checkpoint is not None:
@@ -155,74 +464,233 @@ class SparkNative(nn.Module):
             if 'ema_encoder' not in state: raise ValueError('Wrong V-JEPA checkpoint key')
             clean={k.replace('module.','').replace('backbone.',''):v for k,v in state['ema_encoder'].items()}
             motion.load_state_dict(clean,strict=True); del state,clean
-        # The image-only stem is absent from our fixed 16-frame motion route;
-        # still-image features come from SigLIP2. Remove unused source parameters.
         motion.patch_embed_img=None; motion.img_temporal_dim_size=None
         if hasattr(motion,'img_mod_embed'): del motion.img_mod_embed
         if hasattr(motion,'use_activation_checkpointing'): motion.use_activation_checkpointing=True
         return motion
     @property
     def device(self): return next(self.spark.parameters()).device
+    @property
+    def embed_dtype(self): return self.get_input_embeddings().weight.dtype
     def get_input_embeddings(self): return self.spark.get_input_embeddings()
     def get_output_embeddings(self): return self.spark.get_output_embeddings()
     def gradient_checkpointing_enable(self,gradient_checkpointing_kwargs=None):
         opts=gradient_checkpointing_kwargs or {'use_reentrant':False}
-        for module in (self.spark,self.vision,self.speech_in,self.sound_in,self.speech_out.talker):
-            if getattr(module,'supports_gradient_checkpointing',False): module.gradient_checkpointing_enable(gradient_checkpointing_kwargs=opts)
-        if hasattr(self.sound_out.dit,'enable_gradient_checkpointing'): self.sound_out.dit.enable_gradient_checkpointing()
+        candidates=[
+            getattr(self,'spark',None),
+            getattr(self,'vision',None),
+            getattr(self,'speech_in',None),
+            getattr(self,'sound_in',None),
+            getattr(getattr(self,'speech_out',None),'talker',None),
+        ]
+        for module in candidates:
+            if module is not None and getattr(module,'supports_gradient_checkpointing',False):
+                module.gradient_checkpointing_enable(gradient_checkpointing_kwargs=opts)
+        sound_out=getattr(self,'sound_out',None)
+        if sound_out is not None and hasattr(getattr(sound_out,'dit',None),'enable_gradient_checkpointing'):
+            sound_out.dit.enable_gradient_checkpointing()
     def freeze_infrastructure(self):
-        self.speech_out.freeze_codec(); self.sound_out.vae.requires_grad_(False)
-        self.sound_out.freeze_fixed_conditioning()
+        speech_out=getattr(self,'speech_out',None)
+        if speech_out is not None: speech_out.freeze_codec()
+        sound_out=getattr(self,'sound_out',None)
+        if sound_out is not None:
+            if hasattr(sound_out,'vae') and sound_out.vae is not None:
+                sound_out.vae.requires_grad_(False)
+            if hasattr(sound_out,'freeze_fixed_conditioning'):
+                sound_out.freeze_fixed_conditioning()
     def train(self,mode=True):
-        super().train(mode); self.speech_out.codec_model.eval(); self.sound_out.vae.eval(); return self
-    def set_stage(self,alignment_only=False):
-        self.requires_grad_(True); self.freeze_infrastructure()
-        if alignment_only:
-            for name in ('spark','vision','motion','speech_in','sound_in'):
-                getattr(self,name).requires_grad_(False)
-            self.speech_out.talker.requires_grad_(False); self.sound_out.dit.requires_grad_(False)
-        if not alignment_only and any(not p.requires_grad for p in self.spark.parameters()): raise AssertionError('Full Spark is not trainable')
+        super().train(mode)
+        speech_out=getattr(self,'speech_out',None)
+        if speech_out is not None and getattr(speech_out,'codec_model',None) is not None:
+            speech_out.codec_model.eval()
+        sound_out=getattr(self,'sound_out',None)
+        if sound_out is not None and getattr(sound_out,'vae',None) is not None:
+            sound_out.vae.eval()
+        return self
+
+    def _unfreeze_late_vision_layers(self, last_n_layers: int) -> None:
+        vision = getattr(self, 'vision', None)
+        if vision is None or last_n_layers <= 0:
+            return
+        vision.requires_grad_(False)
+        vmod = getattr(vision, 'vision_model', vision)
+        enc_layers = getattr(getattr(vmod, 'encoder', None), 'layers', None)
+        if enc_layers is not None and len(enc_layers) > 0:
+            for layer in enc_layers[-int(last_n_layers):]:
+                layer.requires_grad_(True)
+        post_ln = getattr(vmod, 'post_layernorm', None)
+        if post_ln is not None:
+            post_ln.requires_grad_(True)
+
+    def set_stage(
+        self,
+        alignment_only=False,
+        *,
+        stage_mode: str | None = None,
+        unfreeze_vision_last_n_layers: int = 0,
+    ):
+        """Configure parameter trainability across staged connector, gated cross-attn, vision, and full-Spark runs."""
+        mode = stage_mode or ('alignment_only' if alignment_only else 'full_spark')
+        self.requires_grad_(True)
+        self.freeze_infrastructure()
+
+        if mode in ('alignment_only', 'frozen_spark_connector', 'frozen_spark_cross_attn'):
+            for name in ('spark', 'vision', 'motion', 'speech_in', 'sound_in'):
+                mod = getattr(self, name, None)
+                if mod is not None:
+                    mod.requires_grad_(False)
+            speech_out = getattr(self, 'speech_out', None)
+            if speech_out is not None and getattr(speech_out, 'talker', None) is not None:
+                speech_out.talker.requires_grad_(False)
+            sound_out = getattr(self, 'sound_out', None)
+            if sound_out is not None and getattr(sound_out, 'dit', None) is not None:
+                sound_out.dit.requires_grad_(False)
+            if mode == 'frozen_spark_connector' and getattr(self, 'visual_cross_attn', None) is not None:
+                self.visual_cross_attn.requires_grad_(False)
+            if unfreeze_vision_last_n_layers > 0:
+                self._unfreeze_late_vision_layers(unfreeze_vision_last_n_layers)
+            return
+
+        if mode == 'vision_late_unfreeze':
+            if getattr(self, 'spark', None) is not None:
+                self.spark.requires_grad_(False)
+            if getattr(self, 'vision', None) is not None:
+                self._unfreeze_late_vision_layers(max(1, int(unfreeze_vision_last_n_layers or 2)))
+            return
+
+        if mode == 'full_spark':
+            # In vision_text 24GB profile, keep SigLIP2 frozen unless explicitly unfrozen via unfreeze_vision_last_n_layers.
+            if getattr(self, 'modalities', 'omni') == 'vision_text' and getattr(self, 'vision', None) is not None:
+                if unfreeze_vision_last_n_layers > 0:
+                    self._unfreeze_late_vision_layers(unfreeze_vision_last_n_layers)
+                elif not getattr(self, 'policy', {}).get('unfreeze_vision_in_full_spark', False):
+                    self.vision.requires_grad_(False)
+            if any(not p.requires_grad for p in self.spark.parameters()):
+                raise AssertionError('Full Spark is not trainable')
+            return
+
+        raise ValueError(f'Unknown stage_mode {mode!r}')
+
+    def frozen_parameter_hashes(self) -> dict[str, str]:
+        """Compute exact raw-byte SHA256 hashes for all frozen (`not requires_grad`) parameters."""
+        hashes: dict[str, str] = {}
+        seen: set[int] = set()
+        for name, p in self.named_parameters():
+            if p.requires_grad or id(p) in seen:
+                continue
+            seen.add(id(p))
+            raw = p.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
+            hashes[name] = hashlib.sha256(raw).hexdigest()
+        return hashes
+
     def named_groups(self):
+        connector_prefixes = {
+            'vision_projector',
+            'alpha_projector',
+            'spatial_clock',
+            'camera_pose_encoder',
+            'visual_kind_embedding',
+            'view_id_embedding',
+            'motion_projector',
+            'speech_projector',
+            'sound_projector',
+            'modality',
+            'audio_clock',
+            'visual_cross_attn',
+        }
         for name,p in self.named_parameters():
             prefix=name.split('.')[0]
-            if prefix in ('vision_projector','spatial_clock','motion_projector','speech_projector','sound_projector','modality','audio_clock'): group='connectors'
+            if prefix in connector_prefixes: group='connectors'
             elif prefix=='speech_out': group='speech_output'
             elif prefix=='sound_out': group='sound_output'
             else: group=prefix
             yield group,name,p
-    def tile_views(self,image,video):
-        w,h=image.size; views=[(image,(0.,0.,1.,1.),self.policy['thumbnail_patches'])]
+
+    def tile_views(self,image,video,*,alpha=None,is_pixel_art_atlas=False):
+        from PIL import Image
+        w,h=image.size; views=[(image,alpha,(0.,0.,1.,1.),self.policy['thumbnail_patches'])]
         if not video and self.policy['detail_tiles']:
             if self.policy['detail_tiles'] not in (2,4): raise ValueError('Qualified tile count is 0/2/4')
             nx,ny=(2,2) if self.policy['detail_tiles']==4 else ((2,1) if w>=h else (1,2))
             for j in range(ny):
                 for i in range(nx):
                     a,b,c,d=round(i*w/nx),round(j*h/ny),round((i+1)*w/nx),round((j+1)*h/ny)
-                    views.append((image.crop((a,b,c,d)),(a/w,b/h,c/w,d/h),self.policy['tile_patches']))
+                    crop_im=image.crop((a,b,c,d))
+                    if is_pixel_art_atlas and (c-a)<64 and (d-b)<64:
+                        # Crisp nearest-neighbor magnification on tiny pixel-art UV islands prevents bilinear blur!
+                        scale=max(1,64//max(1,min(c-a,d-b)))
+                        crop_im=crop_im.resize(((c-a)*scale,(d-b)*scale),resample=Image.Resampling.NEAREST)
+                    crop_alpha=alpha[b:d,a:c] if alpha is not None else None
+                    views.append((crop_im,crop_alpha,(a/w,b/h,c/w,d/h),self.policy['tile_patches']))
         return views
-    def image_tokens(self,images,times,capture):
-        outputs=[]; video=len(images)>1; units=[]
-        for fi,image in enumerate(images):
-            for vi,(view,box,patches) in enumerate(self.tile_views(image,video)):
-                batch=self.image_processor(images=view,return_tensors='pt',max_num_patches=patches)
-                units.append({'frame':fi,'view':vi,'image':view,'box':box,'patches':patches,'batch':batch})
+
+    def image_tokens(self,images,times,capture,alphas=None,visual_units=None):
+        if not images:
+            return None
+        # Only genuine temporal_frame sequences disable detail tiles; multiview renders,
+        # UV atlases, and before/after state pairs preserve full detail tile crops!
+        if visual_units:
+            is_temporal=all(u.get('visual_kind')=='temporal_frame' for u in visual_units)
+        else:
+            is_temporal=len(images)>1 and any(float(t)!=0.0 for t in (times or []))
+
+        units=[]
+        for fi,raw_image in enumerate(images):
+            rgb_image,derived_alpha=extract_image_rgb_and_alpha(raw_image)
+            explicit_alpha=alphas[fi] if alphas is not None and fi<len(alphas) else None
+            alpha_arr=explicit_alpha if explicit_alpha is not None else derived_alpha
+            u_meta=visual_units[fi] if visual_units and fi<len(visual_units) else {
+                'visual_kind':'temporal_frame' if is_temporal else ('multiview_render' if len(images)>1 else 'independent_image'),
+                'visual_kind_index':VISUAL_KIND_TO_INDEX['temporal_frame' if is_temporal else ('multiview_render' if len(images)>1 else 'independent_image')],
+                'view_id':'frame' if is_temporal else 'single',
+                'view_id_index':VIEW_ID_TO_INDEX['frame' if is_temporal else 'single'],
+                'camera_right':[1.0,0.0,0.0],
+                'camera_up':[0.0,1.0,0.0],
+                'ortho_scale':1.0,
+                'timestamp_s':float(times[fi]) if times and fi<len(times) else 0.0,
+                'has_timestamp':bool(is_temporal or (times and fi<len(times) and float(times[fi])!=0.0)),
+                'capture_s':None if not capture or fi>=len(capture) or capture[fi] is None else float(capture[fi]),
+                'is_pixel_art_atlas':False,
+            }
+            for vi,(view_rgb,view_alpha,box,patches) in enumerate(
+                self.tile_views(rgb_image,is_temporal,alpha=alpha_arr,is_pixel_art_atlas=bool(u_meta.get('is_pixel_art_atlas',False)))
+            ):
+                batch=self.image_processor(images=view_rgb,return_tensors='pt',max_num_patches=patches)
+                units.append({'frame':fi,'view':vi,'image':view_rgb,'alpha':view_alpha,'meta':u_meta,'box':box,'patches':patches,'batch':batch})
+
         def count(unit):
             hh,ww=(int(x) for x in unit['batch']['spatial_shapes'][0])
             return ((hh+1)//2)*((ww+1)//2)
+
         while sum(count(u) for u in units)>self.policy['max_visual_tokens']:
             candidates=[u for u in units if u['patches']>64]
             if not candidates: raise ValueError('Actual visual grids cannot fit the qualified token budget')
             u=max(candidates,key=count); u['patches']=max(64,u['patches']//2)
             u['batch']=self.image_processor(images=u['image'],return_tensors='pt',max_num_patches=u['patches'])
+
         outputs=[None]*len(units); groups={}
         for index,unit in enumerate(units): groups.setdefault(unit['patches'],[]).append((index,unit))
+        vis_dtype=next(self.vision.parameters()).dtype
+        proj_dtype=self.vision_projector[0].weight.dtype
+
         for _,items in sorted(groups.items()):
-            batch={k:torch.cat([u['batch'][k] for _,u in items],dim=0).to(self.device) for k in ('pixel_values','pixel_attention_mask','spatial_shapes')}
+            batch={
+                k:torch.cat([u['batch'][k] for _,u in items],dim=0).to(
+                    self.device,
+                    dtype=vis_dtype if k=='pixel_values' else None,
+                )
+                for k in ('pixel_values','pixel_attention_mask','spatial_shapes')
+            }
             features=self.vision(**batch).last_hidden_state
             for position,(index,unit) in enumerate(items):
-                fi,vi,box=unit['frame'],unit['view'],unit['box']
+                fi,vi,box,u_meta=unit['frame'],unit['view'],unit['box'],unit['meta']
                 hh,ww=(int(x) for x in batch['spatial_shapes'][position])
-                tokens,_=spatial_downshuffle(features[position:position+1],hh,ww); tokens=self.vision_projector(tokens)
+                tokens,_=spatial_downshuffle(features[position:position+1],hh,ww)
+                tokens=self.vision_projector(tokens.to(proj_dtype))
+
+                alpha_feat=compute_patch_alpha_transparency_features(unit['alpha'],hh,ww,self.device).to(proj_dtype)
+                tokens=tokens+self.alpha_projector(alpha_feat)
+
                 gh,gw=(hh+1)//2,(ww+1)//2
                 yy,xx=torch.meshgrid(torch.arange(gh,device=self.device),torch.arange(gw,device=self.device),indexing='ij')
                 xx,yy=xx.flatten().float(),yy.flatten().float(); xmin,ymin,xmax,ymax=box
@@ -230,13 +698,40 @@ class SparkNative(nn.Module):
                 y0=2*yy/hh; y1=torch.clamp(2*yy+2,max=hh)/hh
                 x=xmin+(x0+x1)/2*(xmax-xmin); y=ymin+(y0+y1)/2*(ymax-ymin)
                 bw=(x1-x0)*(xmax-xmin); bh=(y1-y0)*(ymax-ymin)
-                time=float(times[fi]); cap=capture[fi] if capture is not None and fi<len(capture) else None
-                clock=[time/60,math.sin(time),math.cos(time),0. if cap is None else float(cap)/3600,0. if cap is None else 1.]
-                coord=torch.stack([x,y,bw,bh,torch.full_like(x,float(fi)),*([torch.full_like(x,v) for v in clock]),torch.full_like(x,float(vi)),torch.full_like(x,float(vi==0))],dim=-1)
-                outputs[index]=tokens+self.spatial_clock(coord[None])+self.modality.weight[0]
+
+                has_ts=bool(u_meta.get('has_timestamp',False))
+                time_val=float(u_meta.get('timestamp_s',0.0)) if has_ts else 0.0
+                cap=u_meta.get('capture_s')
+                clock=[time_val/60,math.sin(time_val) if has_ts else 0.,math.cos(time_val) if has_ts else 1.,0. if cap is None else float(cap)/3600,0. if cap is None else 1.]
+                coord=torch.stack([x,y,bw,bh,torch.full_like(x,float(fi)),*([torch.full_like(x,v) for v in clock]),torch.full_like(x,float(vi)),torch.full_like(x,float(vi==0))],dim=-1).to(proj_dtype)
+
+                cam_vec=torch.tensor(
+                    [
+                        *u_meta.get('camera_right',[1.,0.,0.])[:3],
+                        *u_meta.get('camera_up',[0.,1.,0.])[:3],
+                        float(u_meta.get('ortho_scale',1.0)),
+                        float(bool(u_meta.get('is_pixel_art_atlas',False))),
+                    ],
+                    device=self.device,
+                    dtype=proj_dtype,
+                ).view(1,1,8).expand(1,tokens.shape[1],8)
+
+                vkind_idx=int(u_meta.get('visual_kind_index',VISUAL_KIND_TO_INDEX.get(u_meta.get('visual_kind','independent_image'),0)))
+                vid_idx=int(u_meta.get('view_id_index',VIEW_ID_TO_INDEX.get(u_meta.get('view_id','single'),0)))
+
+                token_out=(
+                    tokens
+                    + self.spatial_clock(coord[None])
+                    + self.camera_pose_encoder(cam_vec)
+                    + self.visual_kind_embedding.weight[vkind_idx].to(proj_dtype)
+                    + self.view_id_embedding.weight[vid_idx].to(proj_dtype)
+                    + self.modality.weight[0].to(proj_dtype)
+                )
+                outputs[index]=token_out.to(self.embed_dtype)
         return torch.cat(outputs,dim=1) if outputs else None
+
     def motion_tokens(self,frames):
-        if not frames: return None
+        if not frames or getattr(self,'motion',None) is None: return None
         n=self.policy['motion_frames']; ids=np.linspace(0,len(frames)-1,n).round().astype(int)
         arrays=[np.asarray(frames[i].resize((self.policy['motion_size'],)*2),dtype=np.float32)/255 for i in ids]
         x=torch.from_numpy(np.stack(arrays)).permute(3,0,1,2)[None].to(self.device)
@@ -244,9 +739,12 @@ class SparkNative(nn.Module):
         out=self.motion((x-mean)/std,training=True)
         if isinstance(out,(list,tuple)): out=out[-1]
         if out.shape[-1]!=self.motion.embed_dim: out=out.reshape(*out.shape[:-1],-1,self.motion.embed_dim).mean(-2)
-        return self.motion_projector(out)+self.modality.weight[1]
+        return (self.motion_projector(out)+self.modality.weight[1]).to(self.embed_dtype)
+
     def audio_tokens(self,audio,fam):
         if audio is None: return None
+        if getattr(self,'speech_in',None) is None:
+            raise ValueError('Audio modalities are deferred in vision_text mode')
         wav,sr=audio; wav=wav.mean(axis=0)
         if fam in ('speech_in','audiovisual'):
             mono=audio_resample(wav,sr,16000); parts=[]; clocks=[]
@@ -258,7 +756,7 @@ class SparkNative(nn.Module):
                 clocks.append(start/16000+torch.arange(out.shape[1],device=self.device)/50)
             times=torch.cat(clocks)
             position=self.audio_clock(torch.stack([times/30,torch.sin(times),torch.cos(times),torch.ones_like(times)],dim=-1))[None]
-            return self.speech_projector(torch.cat(parts,dim=1),position=position)+self.modality.weight[2]
+            return (self.speech_projector(torch.cat(parts,dim=1),position=position)+self.modality.weight[2]).to(self.embed_dtype)
         mono=audio_resample(wav,sr,48000); parts=[]; clocks=[]
         for start in range(0,len(mono),10*48000):
             piece=mono[start:start+10*48000]
@@ -271,42 +769,160 @@ class SparkNative(nn.Module):
             parts.append(out.flatten(2).transpose(1,2))
         times=torch.cat(clocks)
         position=self.audio_clock(torch.stack([times/30,torch.sin(times),torch.cos(times),torch.ones_like(times)],dim=-1))[None]
-        return self.sound_projector(torch.cat(parts,dim=1),position=position)+self.modality.weight[3]
-    def prompt_parts(self,prompt):
-        pre,post=self.chat.encode(prompt)
+        return (self.sound_projector(torch.cat(parts,dim=1),position=position)+self.modality.weight[3]).to(self.embed_dtype)
+
+    def forward_text_only(self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None, **kwargs):
+        """Pure-text fast path calling `self.spark` directly with zero visual module overhead."""
+        with self._visual_cross_attn_scope(None):
+            return self.spark(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
+
+    def prompt_ids_for_row(self, row: dict[str, Any], *, for_generation: bool = False) -> tuple[list[int], list[int]]:
+        thinking = bool(row.get('enable_thinking', False))
+        system = row.get('system_prompt')
+        return self.chat.encode(
+            row['prompt'],
+            enable_thinking=thinking,
+            system=system,
+            for_generation=for_generation,
+        )
+
+    def prompt_parts(self,prompt,*,enable_thinking=False,system=None,for_generation=False):
+        pre,post=self.chat.encode(prompt,enable_thinking=enable_thinking,system=system,for_generation=for_generation)
         return (torch.tensor(pre,device=self.device,dtype=torch.long)[None],
                 torch.tensor(post,device=self.device,dtype=torch.long)[None])
-    def prefix(self,row,media):
-        if row['_family'].endswith('_out') and any(media[k] is not None for k in ('audio','motion')): raise ValueError('Output target leaked into input encoder')
-        pre,post=self.prompt_parts(row['prompt'])
+
+    def _encode_visual_tokens_for_media(self, media: dict[str, Any]) -> torch.Tensor | None:
+        img_fn = getattr(self, 'image_tokens', None)
+        if img_fn is None:
+            return None
+        # Backward compatibility for mock lambdas in unit tests (`model.image_tokens = lambda *args: None`)
+        try:
+            return img_fn(
+                media['images'],
+                media['times'],
+                media['capture_times'],
+                media.get('alphas'),
+                media.get('visual_units'),
+            )
+        except TypeError:
+            return img_fn(media['images'], media['times'], media['capture_times'])
+
+    def prefix_with_visual_context(self, row, media, *, for_generation: bool = False) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if row['_family'].endswith('_out') and any(media.get(k) is not None for k in ('audio','motion')):
+            raise ValueError('Output target leaked into input encoder')
+        pre,post=self.prompt_parts(
+            row['prompt'],
+            enable_thinking=bool(row.get('enable_thinking',False)),
+            system=row.get('system_prompt'),
+            for_generation=for_generation,
+        )
+        emb_dtype=self.embed_dtype
         parts=[self.get_input_embeddings()(pre)]
-        for x in (self.image_tokens(media['images'],media['times'],media['capture_times']),self.motion_tokens(media['motion']),self.audio_tokens(media['audio'],row['_family'])):
-            if x is not None: parts.append(x)
-        parts.append(self.get_input_embeddings()(post)); return torch.cat(parts,dim=1)
-    def hidden_states(self,embeds):
-        return self.hidden_batch(embeds,torch.ones(embeds.shape[:2],device=self.device,dtype=torch.long))
-    def hidden_batch(self,embeds,mask):
+        vis_tokens = self._encode_visual_tokens_for_media(media) if media.get('images') else None
+        mot_tokens = self.motion_tokens(media.get('motion')) if getattr(self, 'motion_tokens', None) else None
+        aud_tokens = self.audio_tokens(media.get('audio'), row['_family']) if getattr(self, 'audio_tokens', None) else None
+        for x in (vis_tokens, mot_tokens, aud_tokens):
+            if x is not None:
+                parts.append(x.to(emb_dtype))
+        parts.append(self.get_input_embeddings()(post))
+        return torch.cat(parts,dim=1), vis_tokens
+
+    def prefix(self,row,media):
+        embeds, _ = self.prefix_with_visual_context(row, media, for_generation=False)
+        return embeds
+
+    def hidden_states(self,embeds,visual_context=None):
+        return self.hidden_batch(
+            embeds,
+            torch.ones(embeds.shape[:2],device=self.device,dtype=torch.long),
+            visual_context=visual_context,
+        )
+
+    def hidden_batch(self,embeds,mask,visual_context=None):
         if embeds.shape[1]>self.policy['max_sequence']: raise ValueError('Input exceeds qualified context; no silent truncation')
-        return self.spark.model(inputs_embeds=embeds,attention_mask=mask,use_cache=False,return_dict=True).last_hidden_state
+        with self._visual_cross_attn_scope(visual_context):
+            return self.spark.model(inputs_embeds=embeds,attention_mask=mask,use_cache=False,return_dict=True).last_hidden_state
+
     def text_loss(self,row,media):
-        prefix=self.prefix(row,media)
-        ids=self.tokenizer(row['answer']+self.chat.bot_close,add_special_tokens=False,return_tensors='pt').input_ids.to(self.device)
-        if ids.shape[1]>self.policy['max_answer_tokens'] or prefix.shape[1]+ids.shape[1]>self.policy['max_sequence']: raise ValueError('Supervision would be truncated; revise a versioned context policy')
-        embeds=torch.cat([prefix,self.get_input_embeddings()(ids)],dim=1)
-        hidden=self.hidden_states(embeds)[:,prefix.shape[1]-1:-1]; total=hidden.new_zeros((),dtype=torch.float32)
-        # Recompute chunked logits during backward; do not hold L*vocab logits.
+        bot_close=self.chat.layouts[bool(row.get('enable_thinking',False))]['bot_close']
+        ids=self.tokenizer(row['answer']+bot_close,add_special_tokens=False,return_tensors='pt').input_ids.to(self.device)
+        if not has_multimodal_context(media):
+            pre,post=self.prompt_ids_for_row(row,for_generation=False)
+            prefix_ids=torch.tensor(pre+post,device=self.device,dtype=torch.long)[None]
+            if ids.shape[1]>self.policy['max_answer_tokens'] or prefix_ids.shape[1]+ids.shape[1]>self.policy['max_sequence']:
+                raise ValueError('Supervision would be truncated; revise a versioned context policy')
+            full_ids=torch.cat([prefix_ids,ids],dim=1)
+            with self._visual_cross_attn_scope(None):
+                hidden=self.spark.model(input_ids=full_ids,attention_mask=torch.ones_like(full_ids),use_cache=False,return_dict=True).last_hidden_state[:,prefix_ids.shape[1]-1:-1]
+        else:
+            prefix,vis_ctx=self.prefix_with_visual_context(row,media,for_generation=False)
+            if ids.shape[1]>self.policy['max_answer_tokens'] or prefix.shape[1]+ids.shape[1]>self.policy['max_sequence']:
+                raise ValueError('Supervision would be truncated; revise a versioned context policy')
+            embeds=torch.cat([prefix,self.get_input_embeddings()(ids)],dim=1)
+            hidden=self.hidden_states(embeds,visual_context=vis_ctx)[:,prefix.shape[1]-1:-1]
+
+        total=hidden.new_zeros((),dtype=torch.float32)
         from torch.utils.checkpoint import checkpoint
         for start in range(0,ids.shape[1],128):
             hs=hidden[:,start:start+128]; labels=ids[:,start:start+128]
             def ce(x,y): return F.cross_entropy(self.get_output_embeddings()(x).float().reshape(-1,self.config.vocab_size),y.flatten(),reduction='sum')
             total=total+checkpoint(ce,hs,labels,use_reentrant=False)
         return total/ids.numel(),ids.numel()
+
     def text_batch_loss(self,examples):
-        """One padded Spark forward for text-producing records; per-record CE."""
+        """One padded Spark forward for text-producing records; pure-text batches bypass all visual modules."""
+        all_pure_text = all(not has_multimodal_context(media) for _, media in examples)
+        has_active_xattn = len(getattr(self, 'visual_cross_attn', ())) > 0 and any(
+            has_multimodal_context(media) and bool(media.get('images')) for _, media in examples
+        )
+        if has_active_xattn and len(examples) > 1:
+            # Per-example visual context tokens differ across rows; evaluate cleanly per example.
+            losses, units = [], []
+            for row, media in examples:
+                l_val, u_val = self.text_loss(row, media)
+                losses.append(l_val)
+                units.append(u_val)
+            return losses, units
+
+        if all_pure_text:
+            prepared_ids=[]
+            pad_id=int(self.tokenizer.pad_token_id or 0)
+            for row,_ in examples:
+                pre,post=self.prompt_ids_for_row(row,for_generation=False)
+                p_ids=torch.tensor(pre+post,device=self.device,dtype=torch.long)[None]
+                bot_close=self.chat.layouts[bool(row.get('enable_thinking',False))]['bot_close']
+                a_ids=self.tokenizer(row['answer']+bot_close,add_special_tokens=False,return_tensors='pt').input_ids.to(self.device)
+                if a_ids.shape[1]>self.policy['max_answer_tokens'] or p_ids.shape[1]+a_ids.shape[1]>self.policy['max_sequence']:
+                    raise ValueError('Supervision would be truncated; revise a versioned context policy')
+                prepared_ids.append((p_ids,a_ids))
+            width=max(p.shape[1]+a.shape[1] for p,a in prepared_ids)
+            input_ids=torch.full((len(prepared_ids),width),pad_id,device=self.device,dtype=torch.long)
+            mask=torch.zeros((len(prepared_ids),width),device=self.device,dtype=torch.long)
+            for i,(p_ids,a_ids) in enumerate(prepared_ids):
+                seq=torch.cat([p_ids,a_ids],dim=1)[0]
+                input_ids[i,:seq.shape[0]]=seq
+                mask[i,:seq.shape[0]]=1
+            if width>self.policy['max_sequence']: raise ValueError('Input exceeds qualified context; no silent truncation')
+            with self._visual_cross_attn_scope(None):
+                hidden=self.spark.model(input_ids=input_ids,attention_mask=mask,use_cache=False,return_dict=True).last_hidden_state
+            from torch.utils.checkpoint import checkpoint
+            losses=[]; units=[]
+            for i,(p_ids,a_ids) in enumerate(prepared_ids):
+                start=p_ids.shape[1]-1; count=a_ids.shape[1]
+                hs=hidden[i:i+1,start:start+count]; total=hidden.new_zeros((),dtype=torch.float32)
+                for offset in range(0,count,128):
+                    def ce(x,y): return F.cross_entropy(self.get_output_embeddings()(x).float().reshape(-1,self.config.vocab_size),y.flatten(),reduction='sum')
+                    total=total+checkpoint(ce,hs[:,offset:offset+128],a_ids[:,offset:offset+128],use_reentrant=False)
+                losses.append(total/count); units.append(count)
+            return losses,units
+
         prepared=[]
+        single_vis_ctx=None
         for row,media in examples:
-            prefix=self.prefix(row,media)
-            ids=self.tokenizer(row['answer']+self.chat.bot_close,add_special_tokens=False,return_tensors='pt').input_ids.to(self.device)
+            prefix,vis_ctx=self.prefix_with_visual_context(row,media,for_generation=False)
+            if vis_ctx is not None: single_vis_ctx=vis_ctx
+            bot_close=self.chat.layouts[bool(row.get('enable_thinking',False))]['bot_close']
+            ids=self.tokenizer(row['answer']+bot_close,add_special_tokens=False,return_tensors='pt').input_ids.to(self.device)
             if ids.shape[1]>self.policy['max_answer_tokens'] or prefix.shape[1]+ids.shape[1]>self.policy['max_sequence']:
                 raise ValueError('Supervision would be truncated; revise a versioned context policy')
             prepared.append((prefix,self.get_input_embeddings()(ids),ids))
@@ -317,7 +933,7 @@ class SparkNative(nn.Module):
             length=prefix.shape[1]+answer.shape[1]
             embeds[i,:length]=torch.cat([prefix,answer],dim=1)[0]
             mask[i,:length]=1
-        hidden=self.hidden_batch(embeds,mask)
+        hidden=self.hidden_batch(embeds,mask,visual_context=single_vis_ctx if len(prepared)==1 else None)
         from torch.utils.checkpoint import checkpoint
         losses=[]; units=[]
         for i,(prefix,_,ids) in enumerate(prepared):
@@ -328,6 +944,7 @@ class SparkNative(nn.Module):
                 total=total+checkpoint(ce,hs[:,offset:offset+128],ids[:,offset:offset+128],use_reentrant=False)
             losses.append(total/count); units.append(count)
         return losses,units
+
     def forward(self,examples=None,**kwargs):
         if not examples or len(examples)>self.policy.get('microbatch_size',1):
             raise ValueError('Microbatch exceeds the qualified source-record bound')
@@ -340,6 +957,7 @@ class SparkNative(nn.Module):
             if row['_family'].endswith('_out'): losses[i],units[i]=self.loss(row,media)
         per_example=torch.stack(losses)
         return {'loss':per_example.mean(),'per_example_loss':per_example,'supervised_units':sum(units)}
+
     def loss(self,row,media):
         fam=row['_family']
         if fam.endswith('_out'):
@@ -347,22 +965,148 @@ class SparkNative(nn.Module):
             if fam=='speech_out': return self.speech_out.loss(hidden,media['target_audio'],row)
             return self.sound_out.loss(hidden,media['target_audio'],row)
         return self.text_loss(row,media)
+
     @torch.no_grad()
-    def answer(self,row,media,max_new_tokens=None):
+    def generate_text_only_ids(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        max_new_tokens: int = 256,
+        do_sample: bool = False,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        top_k: int | None = None,
+        repetition_penalty: float = 1.0,
+    ) -> list[int]:
+        """KV-cached pure-text decoding directly on `self.spark.model(input_ids=...)` with zero visual overhead."""
+        generated: list[int] = []
+        past = None
+        cur_ids = input_ids
+        length = int(input_ids.shape[1])
+        max_seq = int(getattr(self, 'policy', {}).get('max_sequence', 8192))
+        eos_id = self.tokenizer.eos_token_id
+        with self._visual_cross_attn_scope(None):
+            for _ in range(max_new_tokens):
+                if length + len(generated) >= max_seq:
+                    break
+                output = self.spark.model(
+                    input_ids=cur_ids,
+                    past_key_values=past,
+                    use_cache=True,
+                    return_dict=True,
+                )
+                past = output.past_key_values
+                logits = self.get_output_embeddings()(output.last_hidden_state[:, -1:])
+                token = _sample_next_token(
+                    logits,
+                    generated_ids=generated,
+                    do_sample=do_sample,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    repetition_penalty=repetition_penalty,
+                )
+                if eos_id is not None and token.item() == eos_id:
+                    break
+                generated.append(int(token.item()))
+                cur_ids = token
+        return generated
+
+    @torch.no_grad()
+    def answer(
+        self,
+        row,
+        media,
+        max_new_tokens=None,
+        *,
+        enable_thinking: bool | None = None,
+        do_sample: bool = False,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        top_k: int | None = None,
+        repetition_penalty: float = 1.0,
+    ):
         if max_new_tokens is None:
-            max_new_tokens=1024 if row['task'] in ('document_ocr','music_instrument_note_understanding') else (512 if row['task'] in ('factual_caption','image_caption','video_caption','video_box_tracking','region_dense_video_caption') else 256)
-        embeds=self.prefix(row,media); generated=[]; past=None; state=None; length=embeds.shape[1]
-        for _ in range(max_new_tokens):
-            if length+len(generated)>=self.policy['max_sequence']: break
-            if past is None:
-                output=self.spark.model(inputs_embeds=embeds,use_cache=True,return_dict=True)
+            task = row.get('task', '')
+            if str(task).startswith('synccraft_') or task in ('document_ocr', 'music_instrument_note_understanding'):
+                max_new_tokens = 1024
+            elif task in ('factual_caption', 'image_caption', 'video_caption', 'video_box_tracking', 'region_dense_video_caption'):
+                max_new_tokens = 512
             else:
-                output=self.spark.model(inputs_embeds=state,past_key_values=past,use_cache=True,return_dict=True)
-            past=output.past_key_values
-            token=self.get_output_embeddings()(output.last_hidden_state[:,-1:]).argmax(-1)
-            if token.item()==self.tokenizer.eos_token_id: break
-            generated.append(token.item()); state=self.get_input_embeddings()(token)
-        return self.tokenizer.decode(generated,skip_special_tokens=True)
+                max_new_tokens = 256
+
+        effective_row = row if enable_thinking is None else {**row, 'enable_thinking': bool(enable_thinking)}
+
+        # Pure-text fast path: call Spark directly via `input_ids` with zero visual-module execution!
+        if not has_multimodal_context(media):
+            if 'messages' in effective_row:
+                thinking = bool(effective_row.get('enable_thinking', False))
+                try:
+                    rendered = self.tokenizer.apply_chat_template(
+                        effective_row['messages'],
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        enable_thinking=thinking,
+                    )
+                except TypeError:
+                    rendered = self.tokenizer.apply_chat_template(
+                        effective_row['messages'],
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
+                prompt_ids = self.tokenizer(rendered, add_special_tokens=False, return_tensors='pt').input_ids.to(self.device)
+            else:
+                # For non-thinking prompts without explicit `<think>` generation flag, keep exact layout compatibility.
+                for_gen = bool(effective_row.get('enable_thinking', False))
+                pre, post = self.prompt_ids_for_row(effective_row, for_generation=for_gen)
+                prompt_ids = torch.tensor(pre + post, device=self.device, dtype=torch.long)[None]
+
+            generated = self.generate_text_only_ids(
+                prompt_ids,
+                max_new_tokens=max_new_tokens,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                repetition_penalty=repetition_penalty,
+            )
+            prefix_str = '<think>\n' if bool(effective_row.get('enable_thinking', False)) and 'messages' not in effective_row and not self.chat.layouts[True]['gen_user_to_bot'].endswith('<think>\n') else ''
+            decoded = self.tokenizer.decode(generated, skip_special_tokens=True)
+            if bool(effective_row.get('enable_thinking', False)) and self.chat.layouts[True]['gen_user_to_bot'].endswith('<think>\n') and not decoded.lstrip().startswith('<think>'):
+                decoded = '<think>\n' + decoded
+            return prefix_str + decoded
+
+        embeds, vis_ctx = self.prefix_with_visual_context(
+            effective_row,
+            media,
+            for_generation=bool(effective_row.get('enable_thinking', False)),
+        )
+        generated=[]; past=None; state=None; length=embeds.shape[1]
+        with self._visual_cross_attn_scope(vis_ctx):
+            for _ in range(max_new_tokens):
+                if length+len(generated)>=self.policy['max_sequence']: break
+                if past is None:
+                    output=self.spark.model(inputs_embeds=embeds,use_cache=True,return_dict=True)
+                else:
+                    output=self.spark.model(inputs_embeds=state,past_key_values=past,use_cache=True,return_dict=True)
+                past=output.past_key_values
+                logits=self.get_output_embeddings()(output.last_hidden_state[:,-1:])
+                token=_sample_next_token(
+                    logits,
+                    generated_ids=generated,
+                    do_sample=do_sample,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    repetition_penalty=repetition_penalty,
+                )
+                if token.item()==self.tokenizer.eos_token_id: break
+                generated.append(token.item()); state=self.get_input_embeddings()(token)
+        decoded = self.tokenizer.decode(generated,skip_special_tokens=True)
+        if bool(effective_row.get('enable_thinking', False)) and self.chat.layouts[True]['gen_user_to_bot'].endswith('<think>\n') and not decoded.lstrip().startswith('<think>'):
+            decoded = '<think>\n' + decoded
+        return decoded
+
     @torch.no_grad()
     def generate_audio(self,row,media,seconds=None,steps=50):
         hidden=self.hidden_states(self.prefix(row,media))
@@ -371,11 +1115,6 @@ class SparkNative(nn.Module):
 
     @torch.no_grad()
     def spoken_answer(self,row,media,max_new_tokens=128):
-        """Spark text decoding plus its native, state-conditioned speech head.
-
-        This inference composition is not evidence of paired audiovisual-dialogue
-        training. The generation head never receives a reference waveform.
-        """
         if media.get('target_audio') is not None: raise ValueError('Inference cannot consume a target waveform')
         text=self.answer(row,media,max_new_tokens=max_new_tokens)
         answer_ids=self.tokenizer(text,add_special_tokens=False,return_tensors='pt').input_ids.to(self.device)

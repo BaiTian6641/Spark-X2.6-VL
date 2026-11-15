@@ -1,10 +1,51 @@
-"""Small standard-library contracts shared by the formal runner and notebook."""
+"""Small standard-library contracts shared by the formal runner, workstation CLI, and notebook."""
 from __future__ import annotations
-import hashlib, json, os, re, shutil, time
+import hashlib, json, os, platform, re, shutil, subprocess, time
 from pathlib import Path
 
 HERE=Path(__file__).resolve().parent
 SCHEMA=1
+
+OPTIMIZER_PROFILES=(
+    'bf16_adamw',
+    'adamw8bit',
+    'apollo_merged',
+    'apollo_mini_merged',
+    'apollo_coat',
+    'apollo_coat_fp8_moments',
+)
+
+HARDWARE_PROFILES={
+    'colab_g4_96gb':{
+        'min_gpu_bytes':90_000_000_000,
+        'min_ram_bytes':60_000_000_000,
+        'capability':(12,0),
+    },
+    'rtx_pro_4000_blackwell_24gb':{
+        'min_gpu_bytes':22_000_000_000,
+        'min_ram_bytes':24_000_000_000,
+        'capability':(12,0),
+    },
+}
+
+_BOOT_ID_CACHE:str|None=None
+
+def runtime_boot_id()->str:
+    global _BOOT_ID_CACHE
+    if _BOOT_ID_CACHE is not None: return _BOOT_ID_CACHE
+    proc_boot=Path('/proc/sys/kernel/random/boot_id')
+    if proc_boot.is_file():
+        _BOOT_ID_CACHE=proc_boot.read_text().strip()
+        return _BOOT_ID_CACHE
+    try:
+        out=subprocess.check_output(['sysctl','-n','kern.bootsuuid'],stderr=subprocess.DEVNULL,text=True).strip()
+        if out:
+            _BOOT_ID_CACHE=out
+            return _BOOT_ID_CACHE
+    except Exception:
+        pass
+    _BOOT_ID_CACHE='host-'+hashlib.sha256(f'{platform.node()}:{platform.system()}:{platform.release()}'.encode()).hexdigest()[:32]
+    return _BOOT_ID_CACHE
 
 def canonical(x): return json.dumps(x,ensure_ascii=False,sort_keys=True,separators=(',',':')).encode()
 def identity(x): return hashlib.sha256(canonical(x)).hexdigest()
@@ -18,42 +59,60 @@ def write(path,x):
     tmp=path.with_name(path.name+'.partial'); tmp.write_bytes(canonical(x)+b'\n'); os.replace(tmp,path)
 def read(path): return json.loads(Path(path).read_text())
 def emit(event,**kw): print(json.dumps({'event':event,**kw},ensure_ascii=False),flush=True)
-def local(path):
+
+def local(path,execution_target='colab'):
     p=Path(path).resolve()
-    if not p.is_relative_to('/content') or any(x in {'drive','gdrive','MyDrive'} for x in p.parts):
+    if any(x in {'drive','gdrive','MyDrive'} for x in p.parts):
+        raise ValueError('Active work must stay outside mounted Drive')
+    if execution_target=='colab' and not p.is_relative_to('/content'):
         raise ValueError('Active work must be local /content, outside mounted Drive')
+    if execution_target not in ('colab','local_workstation'):
+        raise ValueError(f'Unknown execution_target {execution_target!r}')
     return p
 
-def disk_guard(root,pending=0,reserve=0):
+def disk_guard(root,pending=0,reserve=0,min_free_bytes=44_000_000_000):
     free=shutil.disk_usage(root).free
-    if free-pending-reserve < 44_000_000_000:
+    if free-pending-reserve < min_free_bytes:
         raise RuntimeError(f'Local free floor would be violated: free={free}, pending={pending}, reserved={reserve}')
     return free
 
 def validate_config(c):
     if c.get('schema_version')!=SCHEMA or not re.fullmatch(r'[a-zA-Z0-9_-]{3,64}',c.get('campaign_id','')): raise ValueError('Invalid campaign identity')
-    local(c['work_root'])
+    target=c.get('execution_target','colab')
+    local(c['work_root'],execution_target=target)
     if not re.fullmatch(r'TassP0lar/[A-Za-z0-9_.-]+',c['model_repo']): raise ValueError('Use an explicit model repository in the intended account')
     public_ok=c.get('allow_public_artifacts') is True
     if type(c['model_repo_private']) is not bool or type(c['checkpoint_repo_private']) is not bool:
         raise ValueError('Repository visibility must be an explicit boolean')
     if not c['model_repo_private'] and not public_ok:
         raise ValueError('Public model upload requires allow_public_artifacts=true and sanitized exports')
-    if c.get('checkpoint_backend')!='huggingface' or type(c['checkpoint_repo_private']) is not bool:
+    allowed_backends=('huggingface','local') if target=='local_workstation' else ('huggingface',)
+    if c.get('checkpoint_backend') not in allowed_backends or type(c['checkpoint_repo_private']) is not bool:
         raise ValueError('Formal checkpoints require the reviewed Hugging Face storage policy')
-    if not c['checkpoint_repo_private'] and not public_ok:
+    if c.get('checkpoint_backend')=='huggingface' and not c['checkpoint_repo_private'] and not public_ok:
         raise ValueError('Public checkpoints require allow_public_artifacts=true and sanitized snapshots')
     if not 0 < c['instructor_budget_usd'] <= 50 or not 0 < c['max_compute_units'] <= 1000: raise ValueError('Campaign exceeds the authorized budget')
     if c['cache_bytes_per_component']*10 > 24_000_000_000: raise ValueError('Global media cache exceeds its reservation')
     if c['checkpoint_slots']!=2 or c['drive_cap_bytes']>2_000_000_000_000: raise ValueError('Storage contract changed')
-    if c['gradient_accumulation']<1 or c['max_sequence']>4096: raise ValueError('Unqualified batch/sequence policy')
+    if c['gradient_accumulation']<1 or c['max_sequence']>8192: raise ValueError('Unqualified batch/sequence policy')
     microbatch=c.get('microbatch_size',1)
     if microbatch not in (1,2,4,8) or c['gradient_accumulation']%microbatch:
         raise ValueError('Microbatch must divide the effective eight-record optimizer batch')
     if not 0<=c.get('dataloader_workers',0)<=16 or not 1<=c.get('dataloader_prefetch',1)<=8:
         raise ValueError('Invalid DataLoader worker/prefetch policy')
-    if not 0<c.get('max_wall_hours',110)<=110 or not 0<=c.get('direct_wall_hours',0)<=24:
+    max_wall_cap=720 if target=='local_workstation' else 110
+    if not 0<c.get('max_wall_hours',110)<=max_wall_cap or not 0<=c.get('direct_wall_hours',0)<=max(24,max_wall_cap if target=='local_workstation' else 24):
         raise ValueError('Campaign wall budget is 110 hours; each Colab session is at most 24 hours')
+    if 'optimizer_profile' in c and c['optimizer_profile'] not in OPTIMIZER_PROFILES:
+        raise ValueError(f"Unknown optimizer_profile {c['optimizer_profile']!r}")
+    if 'hardware_profile' in c and c['hardware_profile'] not in HARDWARE_PROFILES:
+        raise ValueError(f"Unknown hardware_profile {c['hardware_profile']!r}")
+    if 'modalities' in c and c['modalities'] not in ('vision_text','omni'):
+        raise ValueError(f"Unknown modalities {c['modalities']!r}")
+    if 'visual_cross_attn_blocks' in c and c['visual_cross_attn_blocks'] not in (0,3,6):
+        raise ValueError('visual_cross_attn_blocks must be one of (0, 3, 6)')
+    if 'apollo_rank' in c and (type(c['apollo_rank']) is not int or c['apollo_rank']<1):
+        raise ValueError('apollo_rank must be a positive integer')
     if any(k in c for k in ('HF_TOKEN','OPENCODE_API_KEY','token','api_key')): raise ValueError('Secrets do not belong in configuration')
     return c
 
@@ -81,7 +140,7 @@ class ComputeBudget:
         return self.state
     def check(self,needed_seconds=0):
         self.tick(); s=self.state
-        if self.c.get('enforce_compute_budget') is False: return None
+        if self.c.get('enforce_compute_budget') is False or self.c.get('execution_target')=='local_workstation': return None
         if s['rate'] is None or s['observed_at'] is None: raise RuntimeError('A fresh Colab usage observation is required')
         elapsed=(time.time()-s['observed_at'])/3600
         if elapsed>self.c['balance_refresh_hours']: raise RuntimeError('Refresh the Colab CU balance/rate observation before continuing')

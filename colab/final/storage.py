@@ -1,8 +1,8 @@
-"""HF full checkpoints and small immutable Drive artifacts; local active I/O."""
+"""HF full checkpoints, local NVMe cold store, and small immutable Drive artifacts; local active I/O."""
 from __future__ import annotations
 import json, os, shutil, time
 from pathlib import Path
-from .common import canonical,identity,read,write,sha,disk_guard,emit
+from .common import canonical,identity,read,write,sha,disk_guard,emit,runtime_boot_id
 from colab.stage1.common import safe_relative
 from colab.stage1.drive_checkpoint import upload_file,project_usage
 from colab.preflight import download_verified,drive_metadata,validate_drive_id
@@ -30,6 +30,7 @@ class ColdStore:
     def __init__(self,root,config,binding,token=None):
         self.root=Path(root); self.c=config; self.binding=binding
         self.private=self.root/'private-upload-state'; self.private.mkdir(exist_ok=True,mode=0o700)
+        self.local_cold=self.root/'local-cold-store'
         self.service=None; self.parent=None
         if config.get('drive_project_folder'):
             self.service=drive_service(); self.parent=validate_drive_id(config['drive_project_folder'])
@@ -39,13 +40,46 @@ class ColdStore:
         if config.get('checkpoint_backend')=='huggingface':
             from .hf_checkpoints import HFCheckpointStore
             self.hf=HFCheckpointStore(root,config,binding,token)
+        if config.get('checkpoint_backend')=='local':
+            self.local_cold.mkdir(parents=True,exist_ok=True)
+    def _commit_local_cold(self,directory:Path,kind:str):
+        snapshot=manifest(directory); names={f['path'] for f in snapshot['files']}
+        if kind=='checkpoint' and not REQUIRED<=names: raise ValueError('Incomplete resumable checkpoint')
+        commit_hash=identity([kind,directory.name,self.binding,snapshot])
+        target_dir=self.local_cold/f'{kind}-{commit_hash[:16]}'
+        target_dir.mkdir(parents=True,exist_ok=True)
+        entries=[]
+        for f in snapshot['files']:
+            src_f=directory/f['path']; dst_f=target_dir/f['path']
+            dst_f.parent.mkdir(parents=True,exist_ok=True)
+            if not dst_f.exists(): shutil.copy2(src_f,dst_f)
+            if dst_f.stat().st_size!=f['bytes'] or sha(dst_f)!=f['sha256']:
+                raise ValueError('Local cold store copy verification failed')
+            entries.append(dict(f))
+        value={'schema_version':1,'status':'COMMITTED','kind':kind,'campaign_id':self.c['campaign_id'],
+               'binding':self.binding,'files':entries,'total_bytes':snapshot['total_bytes'],
+               'created_unix':time.time(),'runtime_boot_id':runtime_boot_id()}
+        marker=target_dir/'COMMITTED.json'; write(marker,value)
+        marker_sha=sha(marker)
+        receipt={'schema_version':1,'status':'COMMITTED','backend':'local_cold','kind':kind,
+                 'cold_directory':str(target_dir),'commit_sha256':marker_sha,
+                 'total_bytes':snapshot['total_bytes'],'created_unix':value['created_unix'],
+                 'runtime_boot_id':value['runtime_boot_id'],'verified':True,'binding':self.binding}
+        write(directory.with_name(directory.name+'.local-receipt.json'),receipt)
+        if kind=='checkpoint':
+            from .hf_checkpoints import receipt_path
+            write(receipt_path(directory),receipt)
+        emit('local_cold_committed',**receipt)
+        return receipt
     def commit(self,directory,kind='checkpoint'):
         directory=Path(directory).resolve()
         if not directory.is_relative_to(self.root.resolve()): raise ValueError('Only campaign-owned local artifacts may be uploaded')
+        if self.c.get('checkpoint_backend')=='local' and self.service is None:
+            return self._commit_local_cold(directory,kind)
         if kind!='checkpoint' and self.service is None:
             receipt={'schema_version':1,'status':'LOCAL','backend':'local','kind':kind,
                      'directory':str(directory),'created_unix':time.time(),
-                     'runtime_boot_id':Path('/proc/sys/kernel/random/boot_id').read_text().strip()}
+                     'runtime_boot_id':runtime_boot_id()}
             write(directory.with_name(directory.name+'.local-receipt.json'),receipt)
             emit('local_artifact_closed',**receipt)
             return receipt
@@ -83,7 +117,7 @@ class ColdStore:
             receipt=upload_file(self.service,directory/f['path'],folder,state/f'{i:05d}.json',f'{i:05d}--'+Path(f['path']).name)
             if receipt['sha256']!=f['sha256']: raise ValueError('Artifact mutated while uploading')
             entries.append({**f,'file_id':receipt['file_id']})
-        value={'schema_version':1,'status':'COMMITTED','kind':kind,'campaign_id':self.c['campaign_id'],'binding':self.binding,'files':entries,'total_bytes':snapshot['total_bytes'],'created_unix':time.time(),'runtime_boot_id':Path('/proc/sys/kernel/random/boot_id').read_text().strip()}
+        value={'schema_version':1,'status':'COMMITTED','kind':kind,'campaign_id':self.c['campaign_id'],'binding':self.binding,'files':entries,'total_bytes':snapshot['total_bytes'],'created_unix':time.time(),'runtime_boot_id':runtime_boot_id()}
         marker=state/'COMMITTED.json'; write(marker,value)
         result=upload_file(self.service,marker,folder,state/'commit-upload.json','COMMITTED.json')
         receipt={'folder_id':folder,'commit_file_id':result['file_id'],'commit_sha256':result['sha256'],'total_bytes':snapshot['total_bytes'],'seconds':time.monotonic()-started,'kind':kind}
@@ -94,6 +128,31 @@ class ColdStore:
             write(receipt_path(directory),receipt)
         emit('drive_committed',**receipt); return receipt
     def restore(self,receipt,destination):
+        if receipt.get('backend')=='local_cold':
+            cold_dir=Path(receipt['cold_directory'])
+            marker=cold_dir/'COMMITTED.json'
+            if not marker.is_file() or sha(marker)!=receipt['commit_sha256']:
+                raise ValueError('Local cold commit hash differs')
+            commit=read(marker)
+            if commit['status']!='COMMITTED' or commit['binding']!=self.binding or commit['campaign_id']!=self.c['campaign_id']:
+                raise ValueError('Cold artifact is incomplete or belongs to another campaign/source')
+            files=commit['files']; names=[str(safe_relative(f['path'])) for f in files]
+            if len(names)!=len(set(names)) or sum(f['bytes'] for f in files)!=commit['total_bytes']:
+                raise ValueError('Cold manifest accounting differs')
+            if commit['kind']=='checkpoint' and not REQUIRED<=set(names):
+                raise ValueError('Incomplete checkpoint')
+            destination=Path(destination); destination.mkdir(parents=True,exist_ok=True)
+            for f in files:
+                p=destination/f['path']
+                if not p.resolve().is_relative_to(destination.resolve()): raise ValueError('Unsafe restore path')
+                p.parent.mkdir(parents=True,exist_ok=True)
+                if not p.exists(): shutil.copy2(cold_dir/f['path'],p)
+                if p.stat().st_size!=f['bytes'] or sha(p)!=f['sha256']:
+                    raise ValueError('Restored checkpoint content differs')
+            if commit['kind']=='checkpoint':
+                from .hf_checkpoints import receipt_path
+                write(receipt_path(destination),{**receipt,'backend':'local_cold','verified':True,'binding':self.binding})
+            return commit
         if receipt.get('backend')=='huggingface_artifact':
             if self.hf is None: raise ValueError('HF durable artifact restore is not configured')
             return self.hf.restore_artifact(receipt,destination)
@@ -111,7 +170,7 @@ class ColdStore:
         if len(names)!=len(set(names)) or sum(f['bytes'] for f in files)!=commit['total_bytes']: raise ValueError('Cold manifest accounting differs')
         if commit['kind']=='checkpoint' and not REQUIRED<=set(names): raise ValueError('Incomplete checkpoint')
         pending=sum(f['bytes'] for f in files if not (destination/f['path']).exists())
-        disk_guard(self.root,pending=pending,reserve=max(commit['total_bytes'],self.c['initial_checkpoint_reservation_bytes']))
+        disk_guard(self.root,pending=pending,reserve=max(commit['total_bytes'],self.c['initial_checkpoint_reservation_bytes']),min_free_bytes=self.c.get('local_free_floor_bytes',44_000_000_000))
         for f in files:
             p=destination/f['path']
             if not p.resolve().is_relative_to(destination.resolve()): raise ValueError('Unsafe restore path')
@@ -139,6 +198,13 @@ class ColdStore:
                 latest=self.hf.latest()
                 items.extend(self.hf.discover_artifacts())
                 if latest: items.append({**latest,'name':'HF latest verified resumable checkpoint'})
+            if self.c.get('checkpoint_backend')=='local' and self.local_cold.exists():
+                for child in sorted(self.local_cold.iterdir()):
+                    marker=child/'COMMITTED.json'
+                    if child.is_dir() and marker.is_file():
+                        commit=read(marker)
+                        if commit.get('binding')==self.binding and commit.get('campaign_id')==self.c['campaign_id']:
+                            items.append({'backend':'local_cold','kind':commit['kind'],'cold_directory':str(child),'commit_sha256':sha(marker),'created_unix':commit['created_unix'],'commit':commit,'name':child.name})
             return items
         token=None
         while True:

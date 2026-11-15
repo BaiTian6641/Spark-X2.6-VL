@@ -61,6 +61,54 @@ def direct_doctor(root):
             'studio_backend_sha256':sha(backend.__file__),'direct_mode':True,'flash_attn_cute_backward':True}
     write(Path(root)/'ENVIRONMENT.json',report); emit('environment_ready',**report); return report
 
+def workstation_doctor(root,config):
+    """Verify local Blackwell SM120 24 GB workstation runtime + COAT FP8 kernels without Colab/Studio lock-in."""
+    import importlib.metadata,psutil,torch
+    from .coat_spark import qualify_coat_kernels
+    from .common import HARDWARE_PROFILES
+    if torch.version.hip or not torch.cuda.is_available():
+        raise RuntimeError('Workstation mode requires an NVIDIA CUDA GPU')
+    if not torch.cuda.is_bf16_supported():
+        raise RuntimeError('Native BF16 support is required')
+    hw_name=config.get('hardware_profile','rtx_pro_4000_blackwell_24gb')
+    hw=HARDWARE_PROFILES[hw_name]
+    cap=tuple(torch.cuda.get_device_capability(0))
+    if cap!=tuple(hw['capability']):
+        raise RuntimeError(f'GPU capability {cap} does not match target {hw_name} capability {hw["capability"]}')
+    prop=torch.cuda.get_device_properties(0)
+    if prop.total_memory<hw['min_gpu_bytes']:
+        raise RuntimeError(f'{hw_name} requires at least {hw["min_gpu_bytes"]/1e9:.1f} GB GPU memory; found {prop.total_memory/1e9:.2f} GB')
+    ram_total=psutil.virtual_memory().total
+    if ram_total<hw['min_ram_bytes']:
+        raise RuntimeError(f'{hw_name} requires at least {hw["min_ram_bytes"]/1e9:.1f} GB system RAM; found {ram_total/1e9:.2f} GB')
+    q=torch.randn(1,4,32,128,device='cuda',dtype=torch.bfloat16,requires_grad=True)
+    result=torch.nn.functional.scaled_dot_product_attention(q,q,q)
+    result.float().square().mean().backward()
+    if not torch.isfinite(q.grad).all() or not q.grad.abs().sum():
+        raise RuntimeError('CUDA SDPA attention gradient check failed')
+    coat_report=qualify_coat_kernels('cuda')
+    versions={}
+    for pkg in ('torch','transformers','safetensors','accelerate','synccraft'):
+        try: versions[pkg]=importlib.metadata.version(pkg)
+        except importlib.metadata.PackageNotFoundError: versions[pkg]=None
+    report={
+        'python':sys.version.split()[0],
+        'torch':torch.__version__,
+        'cuda':torch.version.cuda,
+        'gpu':prop.name,
+        'gpu_bytes':int(prop.total_memory),
+        'ram_bytes':int(ram_total),
+        'capability':list(cap),
+        'hardware_profile':hw_name,
+        'bf16':True,
+        'actual_cuda_sdpa_backward':True,
+        'coat_kernels':coat_report,
+        'versions':versions,
+        'execution_target':'local_workstation',
+    }
+    write(Path(root)/'ENVIRONMENT.json',report); emit('environment_ready',**report); return report
+
+
 DIRECT_QUALIFICATION_EXIT=10
 DIRECT_SESSION_EXIT=3
 
@@ -74,10 +122,20 @@ def directory_bytes(root):
     return total
 
 def storage_envelope(root,config,slot_bytes):
-    """Conservative 230-GB envelope; existing reservations are not charged twice."""
+    """Conservative 230-GB Colab envelope, or local NVMe free-space envelope for workstations."""
     root=Path(root);other=directory_bytes(root)
     checkpoints=directory_bytes(root/'checkpoints') if (root/'checkpoints').exists() else 0
     cache=directory_bytes(root/'media-cache') if (root/'media-cache').exists() else 0
+    if config.get('execution_target')=='local_workstation':
+        cache_cap=2*config['cache_bytes_per_component']
+        free_floor=int(config.get('local_free_floor_bytes',20_000_000_000))
+        additional=max(0,2*slot_bytes-checkpoints)+max(0,cache_cap-cache)+free_floor
+        reserved=2*slot_bytes+cache_cap+free_floor; used=other+checkpoints+cache
+        usage=__import__('shutil').disk_usage(root)
+        if usage.free<additional:
+            raise RuntimeError(f'Local workstation NVMe envelope failed: used={used/1e9:.1f} GB, additional={additional/1e9:.1f} GB, free={usage.free/1e9:.1f} GB')
+        emit('local_storage_envelope',used_gb=round(used/1e9,2),reserved_gb=round(reserved/1e9,2),additional_required_gb=round(additional/1e9,2),checkpoint_allocated_gb=round(checkpoints/1e9,2),cache_allocated_gb=round(cache/1e9,2),checkpoint_slot_gb=round(slot_bytes/1e9,2),capacity_gb=round(usage.total/1e9,1))
+        return
     cache_cap=10*config['cache_bytes_per_component'];fixed=4_000_000_000+44_000_000_000
     additional=max(0,2*slot_bytes-checkpoints)+max(0,cache_cap-cache)+fixed
     reserved=2*slot_bytes+cache_cap+fixed;used=other+checkpoints+cache
@@ -87,7 +145,7 @@ def storage_envelope(root,config,slot_bytes):
     emit('local_storage_envelope',used_gb=round(used/1e9,2),reserved_gb=round(reserved/1e9,2),additional_required_gb=round(additional/1e9,2),checkpoint_allocated_gb=round(checkpoints/1e9,2),cache_allocated_gb=round(cache/1e9,2),checkpoint_slot_gb=round(slot_bytes/1e9,2),capacity_gb=230)
 
 def _latest_artifact(items,kind,bound):
-    candidates=[item for item in items if item.get('backend')=='huggingface_artifact'
+    candidates=[item for item in items if item.get('backend') in ('huggingface_artifact','local_cold_artifact')
                 and item.get('kind')==kind and item.get('commit',{}).get('binding')==bound]
     return max(candidates,key=lambda item:item['created_unix']) if candidates else None
 
@@ -116,7 +174,8 @@ def _valid_recovery_proof(proof,profile):
 def direct(config,token,key,source_sha):
     phase=config.get('run_phase','full')
     if phase not in ('full','train','rsi','audit'): raise ValueError('Expected run_phase full, train, rsi or audit')
-    if phase in ('full','rsi') and not key: raise ValueError('OPENCODE_API_KEY is required for instructor rounds')
+    needs_instructor=(phase=='rsi') or (phase=='full' and int(config.get('instructor_rounds',0))>0)
+    if needs_instructor and not key: raise ValueError('OPENCODE_API_KEY is required for instructor rounds')
     from .teacher import eligibility
     eligibility(config)
     from .assets import prepare_assets,prepare_data
@@ -128,7 +187,10 @@ def direct(config,token,key,source_sha):
     if config['observed_compute_balance'] and config['observed_cu_per_hour']:
         early.observe(config['observed_compute_balance'],config['observed_cu_per_hour'])
     write(root/'compute-budget.json',early.state)
-    direct_doctor(root)
+    if config.get('execution_target')=='local_workstation':
+        workstation_doctor(root,config)
+    else:
+        direct_doctor(root)
     emit('direct_assets_start',download_weights=True,full_dataset=True)
     paths=prepare_assets(root,token,config,download_weights=True)
     report=prepare_data(root,token,config)
@@ -139,7 +201,7 @@ def direct(config,token,key,source_sha):
     items=[];latest=None
     if not profile_path.exists() or not proof_path.exists() or not state_path.exists():
         items=campaign.store.discover()
-        latest=next((item for item in items if item.get('backend')=='huggingface' and item.get('kind')=='checkpoint'),None)
+        latest=next((item for item in items if item.get('backend') in ('huggingface','local_cold') and item.get('kind')=='checkpoint'),None)
     if not profile_path.exists():
         receipt=_latest_artifact(items,'qualification-profile',campaign.bound)
         if receipt:
@@ -190,7 +252,7 @@ def direct(config,token,key,source_sha):
     return 0
 
 def main(secrets=None):
-    p=argparse.ArgumentParser(description=__doc__); p.add_argument('mode',choices=('cpu','doctor','direct','qualify','discover','upload-checkpoint','recover','train','resume')); p.add_argument('--config',required=True);p.add_argument('--source-sha',required=True); p.add_argument('--profile-receipt');p.add_argument('--resume-receipt');p.add_argument('--checkpoint-directory');a=p.parse_args()
+    p=argparse.ArgumentParser(description=__doc__); p.add_argument('mode',choices=('cpu','doctor','direct','ablate','qualify','discover','upload-checkpoint','recover','train','resume')); p.add_argument('--config',required=True);p.add_argument('--source-sha',required=True); p.add_argument('--profile-receipt');p.add_argument('--resume-receipt');p.add_argument('--checkpoint-directory');a=p.parse_args()
     if not re.fullmatch('[0-9a-f]{64}',a.source_sha): raise ValueError('Source archive SHA256 is required')
     config=validate_config(read(a.config)); root=Path(config['work_root']); root.mkdir(parents=True,exist_ok=True)
     # Training, restore, retry-upload and cleanup share the same local slots.
@@ -205,25 +267,46 @@ def dispatch(a,config,secrets):
     os.environ.update(HF_HOME=str(root/'hf-metadata-cache'),HF_HUB_DISABLE_TELEMETRY='1',HF_HUB_DISABLE_XET='1',TORCH_HOME=str(root/'torch-metadata-cache'),TOKENIZERS_PARALLELISM='false',UNSLOTH_COMPILE_DISABLE='1')
     if secrets is None: secrets=json.loads(sys.stdin.readline())
     token=secrets.get('HF_TOKEN'); key=secrets.get('OPENCODE_API_KEY')
-    if not token: raise ValueError('HF_TOKEN is unavailable')
+    is_local_ws=(config.get('execution_target')=='local_workstation' and config.get('checkpoint_backend')=='local')
+    if not token and not is_local_ws: raise ValueError('HF_TOKEN is unavailable')
+    run_doc=(lambda: workstation_doctor(root,config)) if config.get('execution_target')=='local_workstation' else (lambda: doctor(root))
     if a.mode=='cpu':
         from .preflight import run
         run(config,token,a.source_sha); return
-    if a.mode=='doctor': doctor(root);return
+    if a.mode=='doctor': run_doc();return
     if a.mode=='direct':
         return direct(config,token,key,a.source_sha)
     from .engine import Campaign
     receipt=read(root/'asset-receipt.json') if (root/'asset-receipt.json').exists() else None
     preflight=read(root/'PREFLIGHT.json') if (root/'PREFLIGHT.json').exists() else {}
     if not receipt: raise RuntimeError('Prepare the bound component assets before checkpoint operations')
-    if a.mode not in ('discover','upload-checkpoint') and (not preflight.get('passed') or preflight.get('source_archive_sha256')!=a.source_sha):
+    if a.mode not in ('discover','upload-checkpoint','ablate') and not is_local_ws and (not preflight.get('passed') or preflight.get('source_archive_sha256')!=a.source_sha):
         raise RuntimeError('Run a successful CPU preflight for this source release on this VM before GPU work')
     paths={k:Path(v) for k,v in receipt['paths'].items()}
+    if a.mode=='ablate':
+        run_doc()
+        from .model import SparkNative
+        from .qualify import qualify_matched_profiles
+        campaign=Campaign(config,paths,a.source_sha,token,key)
+        sample_ids=[r[0] for r in campaign.catalogue.select('train')[:8]]
+        examples=[campaign.media(rid) for rid in sample_ids]
+        report=qualify_matched_profiles(
+            lambda cfg: SparkNative(paths,cfg,device='cuda',pretrained=True),
+            examples,
+            config,
+            device='cuda',
+            microbatch_size=int(config.get('microbatch_size',1)),
+            accumulation_steps=max(1,int(config.get('gradient_accumulation',8))//max(1,int(config.get('microbatch_size',1)))),
+            num_updates=3,
+        )
+        write(root/'ABLATION_PROFILES.json',report)
+        emit('ablation_profiles_complete',profiles=list(report['profiles'].keys()))
+        return
     if a.mode=='qualify':
-        doctor(root)
+        run_doc()
         from .assets import prepare_assets
         paths=prepare_assets(root,token,config,download_weights=True)
-    elif a.mode not in ('discover','upload-checkpoint'): doctor(root)
+    elif a.mode not in ('discover','upload-checkpoint'): run_doc()
     campaign=Campaign(config,paths,a.source_sha,token,key)
     if a.mode=='discover': emit('drive_artifacts',commits=campaign.store.discover()); return
     if a.mode=='upload-checkpoint':

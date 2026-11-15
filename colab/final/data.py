@@ -1,13 +1,50 @@
-"""Variant-aware source splits and leased, bounded local TAR streaming."""
+"""Variant-aware source splits, explicit visual-input contracts, RGBA preservation, and bounded TAR streaming."""
 from __future__ import annotations
 import gzip, hashlib, io, json, math, random, re, sqlite3
 from collections import Counter, defaultdict, deque
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 from .common import HERE, canonical, identity, read, sha, write
 from colab.formal.rolling_cache import DatasetContract, HFHTTPTransport, RollingShardCache
 
 FAMILIES=('image','video','audiovisual','speech_in','sound_in','speech_out','sound_out','text')
+
+VISUAL_KINDS=(
+    'independent_image',
+    'multiview_render',
+    'uv_atlas',
+    'state_pair',
+    'temporal_frame',
+)
+
+VISUAL_KIND_TO_INDEX={name:idx for idx,name in enumerate(VISUAL_KINDS)}
+
+VIEW_IDS=(
+    'single',
+    'front',
+    'south',
+    'right',
+    'top',
+    'iso',
+    'uv_vanilla',
+    'uv_pbr',
+    'before',
+    'after',
+    'frame',
+)
+
+VIEW_ID_TO_INDEX={name:idx for idx,name in enumerate(VIEW_IDS)}
+
+TEMPORAL_TASKS={
+    'video_caption',
+    'video_box_tracking',
+    'region_dense_video_caption',
+    'temporal_order',
+    'capture_elapsed',
+    'source_capture_elapsed',
+    'synccraft_behavior_animation',
+}
 
 def variants(packet):
     rows=packet.get('task_variants',[packet])
@@ -35,6 +72,27 @@ def training_views(row):
         output.append(view)
     return output
 
+def infer_visual_kind(row:dict[str,Any])->str:
+    """Resolve explicit visual input kind without turning static multiviews into video."""
+    explicit=row.get('visual_kind')
+    if explicit is not None:
+        if explicit not in VISUAL_KINDS:
+            raise ValueError(f'Unknown visual_kind {explicit!r}; expected one of {VISUAL_KINDS}')
+        return explicit
+    if row.get('video') or row.get('media_kind')=='video_frames':
+        return 'temporal_frame'
+    task=str(row.get('task',''))
+    frames=row.get('frames',[])
+    if task in TEMPORAL_TASKS or task.startswith('video_'):
+        return 'temporal_frame'
+    if len(frames)>1:
+        times=row.get('media_times_s') or []
+        captures=row.get('capture_times_s') or []
+        if any(float(t)!=0.0 for t in times) or any(c is not None for c in captures):
+            return 'temporal_frame'
+        return 'multiview_render'
+    return 'independent_image'
+
 def family(row):
     target=row.get('target',{}); direction=row.get('audio_direction'); role=row.get('media_role')
     output=direction=='text_to_audio' or role=='target' or target.get('kind')=='waveform'
@@ -44,7 +102,8 @@ def family(row):
         if target['path'] not in row.get('audio',[]): raise ValueError('Output target is not in paired audio members')
         return 'speech_out' if row['task']=='speech_synthesis' else 'sound_out'
     if direction not in (None,'audio_to_text') or role not in (None,'input'): raise ValueError('Unrecognized media direction')
-    if row.get('video') or len(row.get('frames',[]))>1:
+    vkind=infer_visual_kind(row) if (row.get('video') or row.get('frames')) else None
+    if row.get('video') or (len(row.get('frames',[]))>1 and vkind=='temporal_frame'):
         return 'audiovisual' if row.get('audio') else 'video'
     if row.get('audio'): return 'speech_in' if row['task']=='speech_recognition' else 'sound_in'
     if row.get('frames'): return 'image'
@@ -66,7 +125,7 @@ class Union:
         a,b=self.find(a),self.find(b)
         if a!=b: self.p[max(a,b)]=min(a,b)
 
-def group_keys(packet,transport):
+def group_keys(packet,transport,allow_research_nc=False):
     keys={packet['source_group']}
     for row in variants(packet):
         keys.add(row['source_group']); m=row.get('metadata',{})
@@ -79,6 +138,13 @@ def group_keys(packet,transport):
         for value in [m.get('flickr_url',''),m.get('source_url',''),m.get('source_provenance',{}).get('flickr_url','')]:
             match=re.search(r'flickr\.com/(?:photos/[^/]+/|.*?)([0-9]{5,})',str(value))
             if match: keys.add('flickr:'+match[1])
+        if row.get('provenance') or m.get('provenance') or str(row.get('task','')).startswith('synccraft_'):
+            from .synccraft_bridge import synccraft_group_keys,validate_synccraft_license_record
+            validate_synccraft_license_record(row,allow_research_nc=allow_research_nc)
+            keys.update(synccraft_group_keys(row))
+        elif m.get('asset_id') or m.get('family_id'):
+            from .synccraft_bridge import synccraft_group_keys
+            keys.update(synccraft_group_keys(row))
     if transport and transport['media']:
         # Whole media sets also join reversed/translated packet variants, without
         # joining unrelated synthetic sequences through a shared blank frame.
@@ -94,9 +160,10 @@ def build_database(catalogue,db_path,config):
     CREATE TABLE rows(rid TEXT PRIMARY KEY,pid INTEGER,variant INTEGER,unit INTEGER,family TEXT,language TEXT,task TEXT,split TEXT,group_id TEXT);
     ''')
     u=Union(); packet_keys={}; total=0; original_total=0
+    allow_nc=bool(config.get('allow_synccraft_research_nc',False))
     with gzip.open(catalogue,'rt') as stream:
         for pid,line in enumerate(stream,1):
-            x=json.loads(line); packet=x['record']; t=x['transport']; keys=group_keys(packet,t)
+            x=json.loads(line); packet=x['record']; t=x['transport']; keys=group_keys(packet,t,allow_research_nc=allow_nc)
             for key in keys[1:]: u.join(keys[0],key)
             packet_keys[pid]=keys[0]
             db.execute('INSERT INTO packets VALUES(?,?,?,?,NULL)',(pid,x['component'],t['shard'] if t else 'text',json.dumps(x,ensure_ascii=False,separators=(',',':'))))
@@ -144,7 +211,7 @@ def build_database(catalogue,db_path,config):
             'groups':len(assigned),'counts':[dict(zip(('split','family','language','rows'),x)) for x in db.execute('SELECT split,family,language,COUNT(*) FROM rows GROUP BY split,family,language')],
             'split_membership_sha256':identity(list(db.execute('SELECT rid,split,group_id FROM rows ORDER BY rid'))),
             'independent_group_counts':[dict(zip(('split','family','language','groups'),x)) for x in db.execute('SELECT split,family,language,COUNT(DISTINCT group_id) FROM rows GROUP BY split,family,language')],
-            'policy':'Source groups, declared grouping keys, shared Wikipedia article identity, known Flickr identity and exact whole-media sets connected before split; pretraining overlap and unprovided perceptual duplicates remain unknown.',
+            'policy':'Source groups, declared grouping keys, SyncCraft asset/family lineage, shared Wikipedia article identity, known Flickr identity and exact whole-media sets connected before split; pretraining overlap and unprovided perceptual duplicates remain unknown.',
             'evaluation_scope':'New internal source-held-out diagnosis/promotion/audit; not a clean official public benchmark. Prior local DOCCI/COCO exposure is recorded in source metadata.'}
     db.close(); write(db_path.with_suffix('.report.json'),report); return report
 
@@ -186,7 +253,7 @@ class Catalogue:
             queues={key:deque(windows) for key,windows in queues.items()}
             # Interleave sources while finishing each source's current shard.
             # Randomizing all shard windows globally would redownload gigabytes
-            # for each128 rows with a small cache, wasting GPU rental time.
+            # for each 128 rows with a small cache, wasting GPU rental time.
             while queues:
                 component=rng.choice(sorted(queues)); order.extend(queues[component].popleft())
                 if not queues[component]: del queues[component]
@@ -243,17 +310,19 @@ def cursor_dataset(order,cursor):
 class MediaReader:
     def __init__(self,root,handoff,config,token=None,reserve=0):
         self.root=Path(root); self.config=config; self.checkpoint_slot_bytes=config['initial_checkpoint_reservation_bytes']; self.caches={}; self.contracts={}
+        free_floor=config.get('local_free_floor_bytes',44_000_000_000)
         for c in handoff['components']:
             contract=DatasetContract(self.root/'indices'/c['id']/'RELEASE.json',repo_id=handoff['repo_id'],commit=handoff['revision'],index_sha256=c['release_sha256'],prefix=c['prefix'])
             self.contracts[c['id']]=contract
-            self.caches[c['id']]=RollingShardCache(contract,HFHTTPTransport(contract,token),root=self.root/'media-cache'/c['id'],max_bytes=config['cache_bytes_per_component'],reserve_free_bytes=44_000_000_000+reserve,lookahead=0)
+            self.caches[c['id']]=RollingShardCache(contract,HFHTTPTransport(contract,token),root=self.root/'media-cache'/c['id'],max_bytes=config['cache_bytes_per_component'],reserve_free_bytes=free_floor+reserve,lookahead=0)
     @contextmanager
     def packet(self,x):
         if not x['transport']:
             yield lambda name: (_ for _ in ()).throw(ValueError('Text has no media')); return
         component=x['component']; t=x['transport']; c=self.contracts[component]
         allocated=sum(p.stat().st_size for p in (self.root/'checkpoints').rglob('*') if p.is_file()) if (self.root/'checkpoints').exists() else 0
-        self.caches[component].reserve_free_bytes=44_000_000_000+max(0,2*self.checkpoint_slot_bytes-allocated)
+        free_floor=self.config.get('local_free_floor_bytes',44_000_000_000)
+        self.caches[component].reserve_free_bytes=free_floor+max(0,2*self.checkpoint_slot_bytes-allocated)
         with self.caches[component].lease(t['shard']) as lease:
             members={v['member']:v for v in t['media']}
             def get(name):
@@ -291,13 +360,98 @@ def decode_video(payload,count,origin_seconds=None):
     origin=pts[0] if origin_seconds is None else float(origin_seconds)
     return [frames[i] for i in ids],[pts[i]-origin for i in ids]
 
-def prepare_media(row,get,config):
+def decode_visual_image(payload:bytes):
+    """Decode an image while preserving RGBA/alpha channels whenever present."""
+    import numpy as np
     from PIL import Image
-    conditioning_members(row); result={'images':[],'times':[],'capture_times':None,'audio':None,'target_audio':None,'motion':None,'motion_times':None}
+    raw=Image.open(io.BytesIO(payload))
+    has_alpha=raw.mode in ('RGBA','LA') or ('transparency' in raw.info)
+    if has_alpha:
+        rgba=raw.convert('RGBA')
+        alpha=np.asarray(rgba.getchannel('A'),dtype=np.float32)/255.0
+        return rgba,alpha
+    rgb=raw.convert('RGB')
+    return rgb,None
+
+def extract_image_rgb_and_alpha(image):
+    """Split a PIL RGB or RGBA image into an RGB PIL image plus float32 alpha array `[H, W]` (or None)."""
+    import numpy as np
+    if image.mode in ('RGBA','LA') or ('transparency' in getattr(image,'info',{})):
+        rgba=image.convert('RGBA')
+        rgb=Image.merge('RGB',rgba.split()[:3]) if False else rgba.convert('RGB')
+        alpha=np.asarray(rgba.getchannel('A'),dtype=np.float32)/255.0
+        return rgb,alpha
+    return image.convert('RGB'),None
+
+def normalize_visual_units(row:dict[str,Any],n_images:int,times:list[float],capture_times:list[float|None]|None)->list[dict[str,Any]]:
+    """Build explicit per-image metadata (`visual_kind`, `view_id`, camera basis, timestamps, UV flag)."""
+    if n_images==0: return []
+    vkind=infer_visual_kind(row)
+    declared=row.get('visual_units') or []
+    units=[]
+    default_multiview=('south','right','top','iso')
+    for idx in range(n_images):
+        raw=declared[idx] if idx<len(declared) and isinstance(declared[idx],dict) else {}
+        ukind=raw.get('visual_kind',vkind)
+        if ukind not in VISUAL_KINDS:
+            raise ValueError(f'Invalid unit visual_kind {ukind!r}')
+        default_view=(
+            'frame' if ukind=='temporal_frame'
+            else ('before' if ukind=='state_pair' and idx==0 else ('after' if ukind=='state_pair' else (
+                'uv_vanilla' if ukind=='uv_atlas' and idx==0 else (
+                    default_multiview[idx] if ukind=='multiview_render' and idx<len(default_multiview) else 'single'
+                )
+            )))
+        )
+        view_id=raw.get('view_id',default_view)
+        if view_id not in VIEW_ID_TO_INDEX:
+            view_id='single'
+        cam_r=list(raw.get('camera_right',(1.0,0.0,0.0)))[:3]
+        cam_u=list(raw.get('camera_up',(0.0,1.0,0.0)))[:3]
+        while len(cam_r)<3: cam_r.append(0.0)
+        while len(cam_u)<3: cam_u.append(0.0)
+        t_val=float(raw['timestamp_s']) if 'timestamp_s' in raw else (float(times[idx]) if idx<len(times) else 0.0)
+        has_ts=bool(raw.get('has_timestamp',ukind=='temporal_frame' or t_val!=0.0))
+        cap_val=capture_times[idx] if capture_times is not None and idx<len(capture_times) else None
+        is_atlas=bool(raw.get('is_pixel_art_atlas',view_id in ('uv_vanilla','uv_pbr')))
+        units.append({
+            'visual_kind':ukind,
+            'visual_kind_index':VISUAL_KIND_TO_INDEX[ukind],
+            'view_id':view_id,
+            'view_id_index':VIEW_ID_TO_INDEX[view_id],
+            'camera_right':[float(x) for x in cam_r],
+            'camera_up':[float(x) for x in cam_u],
+            'ortho_scale':float(raw.get('ortho_scale',1.0)),
+            'timestamp_s':t_val if has_ts else 0.0,
+            'has_timestamp':has_ts,
+            'capture_s':None if cap_val is None else float(cap_val),
+            'is_pixel_art_atlas':is_atlas,
+        })
+    return units
+
+def prepare_media(row,get,config):
+    conditioning_members(row)
+    result={
+        'images':[],
+        'alphas':[],
+        'visual_kind':None,
+        'visual_units':[],
+        'times':[],
+        'capture_times':None,
+        'audio':None,
+        'target_audio':None,
+        'motion':None,
+        'motion_times':None,
+    }
     if row['_family'].endswith('_out'):
         result['target_audio']=decode_audio(get(row['target']['path'])); return result
-    result['images']=[Image.open(io.BytesIO(get(p))).convert('RGB') for p in row.get('frames',[])]
-    result['times']=row.get('media_times_s',[0.]*len(result['images'])); result['capture_times']=row.get('capture_times_s')
+
+    decoded=[decode_visual_image(get(p)) for p in row.get('frames',[])]
+    result['images']=[im for im,_ in decoded]
+    result['alphas']=[al for _,al in decoded]
+    result['times']=list(row.get('media_times_s',[0.]*len(result['images'])))
+    result['capture_times']=row.get('capture_times_s')
+
     if row.get('video'):
         if len(row['video'])!=1: raise ValueError('Only one paired video is qualified per record')
         origin=None
@@ -306,12 +460,25 @@ def prepare_media(row,get,config):
             if 'waveform_origin_on_media_clock_seconds' not in clock: raise ValueError('Audiovisual waveform/media clock origin is unknown')
             origin=clock['waveform_origin_on_media_clock_seconds']
         frames,times=decode_video(get(row['video'][0]),config['motion_frames'],origin_seconds=origin)
-        result['motion']=frames; result['motion_times']=times
+        if config.get('modalities','omni')=='omni':
+            result['motion']=frames; result['motion_times']=times
         ids=[round(i*(len(frames)-1)/(config['video_semantic_frames']-1)) for i in range(config['video_semantic_frames'])]
-        result['images']=[frames[i] for i in ids]; result['times']=[times[i] for i in ids]
+        result['images']=[frames[i] for i in ids]
+        result['alphas']=[None]*len(result['images'])
+        result['times']=[times[i] for i in ids]
         result['capture_times']=None  # No invented capture clock for a derivative.
-    elif len(result['images'])>1:
-        result['motion']=result['images']; result['motion_times']=result['times']
+    else:
+        vkind=infer_visual_kind(row) if result['images'] else None
+        # Only genuine temporal_frame sequences enter the motion tower, and only in omni mode.
+        # Static multiview renders, UV atlases, and before/after state pairs NEVER become video!
+        if len(result['images'])>1 and vkind=='temporal_frame' and config.get('modalities','omni')=='omni':
+            result['motion']=[im.convert('RGB') for im in result['images']]
+            result['motion_times']=result['times']
+
+    if result['images']:
+        result['visual_kind']=infer_visual_kind(row)
+        result['visual_units']=normalize_visual_units(row,len(result['images']),result['times'],result['capture_times'])
+
     if row.get('audio'):
         if len(row['audio'])!=1: raise ValueError('Only one explicitly paired input waveform is qualified')
         result['audio']=decode_audio(get(row['audio'][0]))

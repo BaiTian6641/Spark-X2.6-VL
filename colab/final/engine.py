@@ -1,9 +1,9 @@
-"""Full-parameter campaign driven by the installed Unsloth Studio SFT backend."""
+"""Full-parameter & staged campaign engine supporting native APOLLO + COAT + merged-gradient training and Studio SFT."""
 from __future__ import annotations
 import contextlib, gc, importlib.metadata, math, os, random, shutil, signal, time
 from collections import Counter,defaultdict
 from pathlib import Path
-from .common import HERE,canonical,identity,read,write,sha,disk_guard,emit,ComputeBudget
+from .common import HERE,OPTIMIZER_PROFILES,canonical,identity,read,write,sha,disk_guard,emit,ComputeBudget,runtime_boot_id
 from .data import Catalogue,CommittedCursor,MediaReader,prepare_media,FAMILIES,cursor_dataset
 from .checkpoint_cache import acknowledged,prune,rebind_assets
 from .hf_checkpoints import receipt_path
@@ -12,10 +12,15 @@ from .hf_checkpoints import receipt_path
 def rng_state():
     import numpy as np,torch
     s=np.random.get_state()
-    return {'python':random.getstate(),'numpy':[s[0],s[1].tolist(),s[2],s[3],s[4]],'torch':torch.get_rng_state(),'cuda':torch.cuda.get_rng_state_all()}
+    cuda_rng=torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []
+    return {'python':random.getstate(),'numpy':[s[0],s[1].tolist(),s[2],s[3],s[4]],'torch':torch.get_rng_state(),'cuda':cuda_rng}
+
 def set_rng(s):
     import numpy as np,torch
-    random.setstate(s['python']); n=s['numpy']; np.random.set_state((n[0],np.asarray(n[1],dtype=np.uint32),n[2],n[3],n[4])); torch.set_rng_state(s['torch']); torch.cuda.set_rng_state_all(s['cuda'])
+    random.setstate(s['python']); n=s['numpy']; np.random.set_state((n[0],np.asarray(n[1],dtype=np.uint32),n[2],n[3],n[4])); torch.set_rng_state(s['torch'])
+    if torch.cuda.is_available() and s.get('cuda'):
+        torch.cuda.set_rng_state_all(s['cuda'])
+
 def sample_parameters(model):
     return {n:p.detach().flatten()[:16].float().cpu().tolist() for n,p in model.named_parameters()}
 def sample_hash(model): return identity(sample_parameters(model))
@@ -35,36 +40,125 @@ def loss_weights(catalogue,order,config):
     counts=Counter(classes[rid] for rid in order); n=len(order)
     return {key:min(config['max_loss_weight'],n/(len(counts)*count)) for key,count in counts.items()}
 
+def _lr_for_group_and_name(group:str,name:str,config:dict)->float:
+    base_lr=float(config.get('backbone_lr',config.get('learning_rate',1e-4)))
+    conn_lr=float(config.get('adapter_lr',config.get('connector_learning_rate',base_lr)))
+    vis_lr=float(config.get('vision_lr',base_lr*0.5))
+    out_lr=float(config.get('output_lr',config.get('audio_output_learning_rate',base_lr)))
+    if group in ('connectors','visual_adapters') or '.bridge.' in name or 'default_voice' in name or 'visual_cross_attn' in name:
+        return conn_lr
+    if group in ('speech_output','sound_output'):
+        return out_lr
+    if group in ('vision','motion','speech_in','sound_in'):
+        return vis_lr
+    return base_lr
+
 def optimizer_for(model,config,alignment=False):
-    import bitsandbytes as bnb
-    buckets=defaultdict(list); seen=set()
-    for group,name,p in model.named_groups():
-        if not p.requires_grad or id(p) in seen: continue
-        seen.add(id(p)); lr=config['connector_learning_rate'] if group=='connectors' or '.bridge.' in name or 'default_voice' in name else (config['audio_output_learning_rate'] if group in ('speech_output','sound_output') else config['learning_rate'])
-        buckets[lr].append(p)
-    optimizer=bnb.optim.AdamW8bit([{'params':v,'lr':lr,'weight_decay':config['weight_decay']} for lr,v in buckets.items()],betas=(.9,.95),eps=1e-8)
+    """Build the configured optimizer profile without ever applying stock CoatAdamW to APOLLO matrices."""
+    import torch
+    from .optimizer import ApolloMergedOptimizer, build_apollo_param_groups
+
+    profile=config.get('optimizer_profile','adamw8bit')
+    if profile not in OPTIMIZER_PROFILES:
+        raise ValueError(f'Unknown optimizer_profile {profile!r}; expected one of {OPTIMIZER_PROFILES}')
+
     expected={id(p) for p in model.parameters() if p.requires_grad}
+
+    if profile in ('apollo_merged','apollo_mini_merged','apollo_coat','apollo_coat_fp8_moments'):
+        is_mini=(profile=='apollo_mini_merged')
+        moment_codec='coat_fp8' if (profile=='apollo_coat_fp8_moments' or config.get('coat_moment_fp8',False)) else 'fp32'
+        rank=1 if is_mini else int(config.get('apollo_rank',64))
+        scale=float(config.get('apollo_mini_scale',128.0)) if is_mini else float(config.get('apollo_scale',1.0))
+        cfg_apollo={
+            **config,
+            'apollo_scale':scale,
+            'apollo_min_dim':int(config.get('apollo_min_dim',config.get('apollo_min_2d_dim',128))),
+        }
+        param_groups=build_apollo_param_groups(
+            model,
+            cfg_apollo,
+            rank=rank,
+            scale_type='tensor' if is_mini else 'channel',
+            moment_codec=moment_codec,
+        )
+        optimizer=ApolloMergedOptimizer(
+            param_groups,
+            seed=int(config.get('seed',39526)),
+            coat_group_size=int(config.get('coat_moment_group_size',128)),
+        )
+    elif profile=='bf16_adamw':
+        buckets=defaultdict(list); seen=set()
+        for group,name,p in model.named_groups():
+            if not p.requires_grad or id(p) in seen: continue
+            seen.add(id(p))
+            buckets[_lr_for_group_and_name(group,name,config)].append(p)
+        optimizer=torch.optim.AdamW(
+            [{'params':v,'lr':lr,'weight_decay':config['weight_decay']} for lr,v in buckets.items()],
+            betas=(.9,.95),
+            eps=1e-8,
+            foreach=False,
+        )
+    else:
+        import bitsandbytes as bnb
+        buckets=defaultdict(list); seen=set()
+        for group,name,p in model.named_groups():
+            if not p.requires_grad or id(p) in seen: continue
+            seen.add(id(p))
+            buckets[_lr_for_group_and_name(group,name,config)].append(p)
+        optimizer=bnb.optim.AdamW8bit(
+            [{'params':v,'lr':lr,'weight_decay':config['weight_decay']} for lr,v in buckets.items()],
+            betas=(.9,.95),
+            eps=1e-8,
+        )
+
     actual={id(p) for g in optimizer.param_groups for p in g['params']}
     if actual!=expected: raise AssertionError('Optimizer omits or adds trainable parameters')
     return optimizer
 
+def ensure_coat_for_model(model,config):
+    """Install Spark COAT activation compression when configured; return controller or None."""
+    profile=config.get('optimizer_profile','adamw8bit')
+    want_coat=profile in ('apollo_coat','apollo_coat_fp8_moments') and bool(config.get('coat_activation_fp8',True))
+    existing=getattr(model,'_coat_controller',None)
+    if not want_coat:
+        if existing is not None:
+            existing.enabled=False
+        return existing
+    if existing is not None:
+        existing.enabled=True
+        return existing
+    from .coat_spark import install_spark_coat
+    ctrl=install_spark_coat(
+        model.spark,
+        group_size=int(config.get('coat_activation_group_size',16)),
+        min_features=int(config.get('apollo_min_dim',64)),
+        use_fp8_matmul=bool(config.get('coat_fp8_linear_forward',False)),
+    )
+    model._coat_controller=ctrl
+    return ctrl
+
 def copy_reload_assets(model,destination):
     destination=Path(destination); out=destination/'reload-assets'
+    is_omni=(getattr(model,'modalities','omni')=='omni')
     for key,raw in model.paths.items():
         if key in ('motion','motion_source'): continue
+        if not is_omni and key not in ('spark','vision'): continue
         root=Path(raw)
+        if not root.exists(): continue
         for path in root.rglob('*'):
             if not path.is_file(): continue
             rel=path.relative_to(root)
             weight=path.suffix in ('.safetensors','.bin','.pt')
             if weight and not (key=='speech_out' and str(rel).startswith('speech_tokenizer/')): continue
             dest=out/key/rel; dest.parent.mkdir(parents=True,exist_ok=True); shutil.copy2(path,dest)
-    vendor=out/'motion-source.zip'; vendor.parent.mkdir(parents=True,exist_ok=True); shutil.copy2(HERE/'vendor/vjepa2-source.zip',vendor)
+    if is_omni and (HERE/'vendor/vjepa2-source.zip').is_file():
+        vendor=out/'motion-source.zip'; vendor.parent.mkdir(parents=True,exist_ok=True); shutil.copy2(HERE/'vendor/vjepa2-source.zip',vendor)
     # Every saved package carries the reviewed inference/runtime source and lock.
     runtime=destination/'runtime'
     release=HERE.parents[1]
     include=[p for p in (release/'colab').rglob('*.py') if '__pycache__' not in p.parts and (p.parent==HERE or p.name=='__init__.py' or p.relative_to(release).as_posix() in ('colab/preflight.py','colab/stage1/common.py','colab/stage1/drive_checkpoint.py','colab/stage1/requirements.in','colab/formal/rolling_cache.py','colab/formal/shard_dataset.py','colab/formal/local_storage.py','colab/formal/teacher_readiness.py'))]
-    include += [HERE/'components.lock.json',HERE/'dataset.lock.json',HERE/'bootstrap.lock.json',HERE/'requirements.lock',HERE/'requirements-preflight.lock',HERE/'requirements.in',HERE/'requirements-preflight.in',HERE/'requirements-flash-attn.in',HERE/'requirements-flash-attn.lock',HERE.parent/'stage1/requirements.in',HERE.parent/'formal/HF_FULL_DATASET_HANDOFF.json']
+    lock_candidates=[HERE/'components.lock.json',HERE/'dataset.lock.json',HERE/'bootstrap.lock.json',HERE/'requirements.lock',HERE/'requirements-preflight.lock',HERE/'requirements.in',HERE/'requirements-preflight.in',HERE/'requirements-flash-attn.in',HERE/'requirements-flash-attn.lock',HERE.parent/'stage1/requirements.in',HERE.parent/'formal/HF_FULL_DATASET_HANDOFF.json']
+    include += [p for p in lock_candidates if p.is_file()]
     for src in include:
         dest=runtime/src.relative_to(release); dest.parent.mkdir(parents=True,exist_ok=True); shutil.copy2(src,dest)
 
@@ -90,17 +184,115 @@ def deferred_checkpoint_receipt(directory,bound):
     receipt={'backend':'local_deferred','directory':str(directory),'kind':'checkpoint',
              'commit_sha256':identity(snapshot),'total_bytes':snapshot['total_bytes'],
              'verified':False,'binding':bound,
-             'runtime_boot_id':Path('/proc/sys/kernel/random/boot_id').read_text().strip()}
+             'runtime_boot_id':runtime_boot_id()}
     write(receipt_path(directory),receipt)
     return receipt
 
 
+def _save_model_safetensors(model, path):
+    try:
+        from safetensors.torch import save_model
+        save_model(model, str(path))
+        return
+    except ModuleNotFoundError:
+        pass
+    import json, struct, torch
+    dtype_map = {
+        torch.float32: 'F32',
+        torch.bfloat16: 'BF16',
+        torch.float16: 'F16',
+        torch.int64: 'I64',
+        torch.int32: 'I32',
+        torch.uint8: 'U8',
+        torch.bool: 'BOOL',
+    }
+    state = model.state_dict()
+    seen_ptrs = set()
+    header = {}
+    blobs = []
+    offset = 0
+    for name, tensor in state.items():
+        ptr = tensor.untyped_storage().data_ptr()
+        if (ptr, tensor.shape, tensor.stride()) in seen_ptrs:
+            continue
+        seen_ptrs.add((ptr, tensor.shape, tensor.stride()))
+        cpu_t = tensor.detach().contiguous().cpu()
+        dt = dtype_map[cpu_t.dtype]
+        raw = bytes(cpu_t.view(torch.uint8).reshape(-1).numpy())
+        end = offset + len(raw)
+        header[name] = {'dtype': dt, 'shape': list(cpu_t.shape), 'data_offsets': [offset, end]}
+        blobs.append(raw)
+        offset = end
+    header_bytes = json.dumps(header, separators=(',', ':')).encode('utf-8')
+    pad = (8 - (len(header_bytes) % 8)) % 8
+    header_bytes += b' ' * pad
+    with Path(path).open('wb') as f:
+        f.write(struct.pack('<Q', len(header_bytes)))
+        f.write(header_bytes)
+        for raw in blobs:
+            f.write(raw)
+
+
+def _load_model_safetensors(model, path, *, strict=True, device='cpu'):
+    try:
+        from safetensors.torch import load_model
+        load_model(model, str(path), strict=strict, device=device)
+        return
+    except ModuleNotFoundError:
+        pass
+    import json, struct, torch
+    rev_dtype = {
+        'F32': torch.float32,
+        'BF16': torch.bfloat16,
+        'F16': torch.float16,
+        'I64': torch.int64,
+        'I32': torch.int32,
+        'U8': torch.uint8,
+        'BOOL': torch.bool,
+    }
+    raw_all = Path(path).read_bytes()
+    (header_len,) = struct.unpack('<Q', raw_all[:8])
+    header = json.loads(raw_all[8:8 + header_len].decode('utf-8'))
+    body = memoryview(raw_all)[8 + header_len:]
+    state = {}
+    for name, meta in header.items():
+        if name == '__metadata__':
+            continue
+        start, end = meta['data_offsets']
+        dt = rev_dtype[meta['dtype']]
+        chunk = bytes(body[start:end])
+        t = torch.frombuffer(bytearray(chunk), dtype=dt).reshape(meta['shape']).to(device=device) if len(chunk) > 0 else torch.empty(meta['shape'], dtype=dt, device=device)
+        state[name] = t
+    model.load_state_dict(state, strict=strict)
+
+
+def _build_scheduler(optimizer, kind='cosine', num_warmup_steps=0, num_training_steps=1):
+    import torch
+    try:
+        if kind == 'constant':
+            from transformers import get_constant_schedule
+            return get_constant_schedule(optimizer)
+        from transformers import get_cosine_schedule_with_warmup
+        return get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=max(1, num_training_steps))
+    except ModuleNotFoundError:
+        if kind == 'constant':
+            return torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _step: 1.0)
+        total = max(1, int(num_training_steps))
+        warm = max(0, int(num_warmup_steps))
+        def _lr_lambda(step: int) -> float:
+            if step < warm:
+                return float(step) / float(max(1, warm))
+            progress = float(step - warm) / float(max(1, total - warm))
+            return max(0.0, 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress))))
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
+
+
 def checkpoint(model,optimizer,scheduler,state,root,config,bound,store,defer_upload=False):
     import torch
-    from safetensors.torch import save_model
     root=Path(root); name=f"{state['stage']}-{state.get('updates',0):08d}"; directory=root/'checkpoints'/name
     if not (root/'compute-budget.json').is_file(): raise RuntimeError('Missing compute-budget.json; persist campaign compute accounting before checkpointing')
     estimate=max(state.get('qualified_checkpoint_reservation_bytes',config['initial_checkpoint_reservation_bytes']),int(state.get('checkpoint_bytes',0)))
+    free_floor=config.get('local_free_floor_bytes',44_000_000_000)
     if directory.exists():
         names={p.relative_to(directory).as_posix() for p in directory.rglob('*') if p.is_file()}
         required={'model.safetensors','optimizer.pt','scheduler.pt','rng.pt','STATE.json','config.json','BINDING.json','PARAMETERS.json','CLOSED.json','COMPUTE_BUDGET.json'}
@@ -121,15 +313,14 @@ def checkpoint(model,optimizer,scheduler,state,root,config,bound,store,defer_upl
             return result
         intent=directory/'INTENT.json'
         if not intent.exists() or read(intent).get('binding')!=bound: raise RuntimeError('Unknown incomplete local artifact; no automatic overwrite')
-        # A writer-owned snapshot lacking required optimizer/state files cannot
-        # be resumed. The current in-memory optimizer state is still authoritative.
         shutil.rmtree(directory)
     # Reserve the second complete slot before writing a new closed snapshot.
     prune(root,bound,[state.get('last_checkpoint_local')],incoming=directory)
     existing=[p for p in (root/'checkpoints').glob('*') if p.is_dir()]
-    disk_guard(root,pending=estimate,reserve=estimate if not existing else 0)
+    disk_guard(root,pending=estimate,reserve=estimate if not existing else 0,min_free_bytes=free_floor)
     directory.mkdir(parents=True); write(directory/'INTENT.json',{'binding':bound,'stage':state['stage'],'updates':state.get('updates',0)}); started=time.monotonic()
-    torch.cuda.synchronize(); save_model(model,str(directory/'model.safetensors'))
+    if torch.cuda.is_available(): torch.cuda.synchronize()
+    _save_model_safetensors(model, directory/'model.safetensors')
     torch.save(optimizer.state_dict(),directory/'optimizer.pt'); torch.save(scheduler.state_dict(),directory/'scheduler.pt'); torch.save(rng_state(),directory/'rng.pt')
     write(directory/'STATE.json',state); write(directory/'config.json',config); write(directory/'BINDING.json',bound); write(directory/'PARAMETERS.json',{'sample_sha256':sample_hash(model),'census':census(model)})
     copy_reload_assets(model,directory)
@@ -147,15 +338,17 @@ def checkpoint(model,optimizer,scheduler,state,root,config,bound,store,defer_upl
     receipt=deferred_checkpoint_receipt(directory,bound) if defer_upload else store.commit(directory)
     state['checkpoint_bytes']=local_bytes;state['last_checkpoint']=receipt;state['last_checkpoint_local']=str(directory)
     emit('checkpoint_measured',bytes=local_bytes,write_seconds=time.monotonic()-started,receipt=receipt)
-    # Future snapshot copies must use the newly retained preprocessing/codec
-    # assets, not a restored directory that is about to be reclaimed.
     rebind_assets(model,directory)
     if not defer_upload: prune(root,bound,[directory])
     return receipt
 
-def reload_paths(directory):
+def reload_paths(directory,config=None):
     import zipfile
-    directory=Path(directory); assets=directory/'reload-assets'; source=directory/'vendor'
+    directory=Path(directory); assets=directory/'reload-assets'
+    cfg=config or (read(directory/'config.json') if (directory/'config.json').is_file() else {})
+    if cfg.get('modalities','omni')=='vision_text' and not (assets/'motion-source.zip').exists():
+        return {'spark':assets/'spark','vision':assets/'vision'}
+    source=directory/'vendor'
     source.mkdir(exist_ok=True)
     archive=assets/'motion-source.zip'
     if sha(archive)!=read(HERE/'components.lock.json')['motion']['source_archive']['sha256']: raise ValueError('Saved motion source differs')
@@ -165,23 +358,36 @@ def reload_paths(directory):
         z.extractall(source); prefix=z.namelist()[0].split('/')[0]
     return {**{k:assets/k for k in ('spark','vision','speech_in','sound_in','speech_out','sound_out')},'motion_source':source/prefix,'motion':None}
 
-def load_checkpoint(directory,config,bound,model=None,load_optimizer=True):
+def load_checkpoint(directory,config,bound,model=None,load_optimizer=True,device='cuda'):
     import torch
-    from safetensors.torch import load_model
     from .model import SparkNative
     directory=Path(directory)
     if read(directory/'BINDING.json')!=bound: raise ValueError('Checkpoint source/data/policy binding differs')
     state=read(directory/'STATE.json')
-    if model is None: model=SparkNative(reload_paths(directory),config,pretrained=False)
-    model.set_stage(state.get('alignment_only',False)); load_model(model,str(directory/'model.safetensors'),strict=True,device='cpu')
+    if model is None:
+        eff_device=device if (device!='cuda' or torch.cuda.is_available()) else 'cpu'
+        model=SparkNative(reload_paths(directory,config=config),config,device=eff_device,pretrained=False)
+    model.set_stage(
+        state.get('alignment_only',False),
+        stage_mode=state.get('stage_mode'),
+        unfreeze_vision_last_n_layers=int(state.get('unfreeze_vision_last_n_layers',0)),
+    )
+    has_tie=hasattr(getattr(model,'spark',None),'tie_weights')
+    _load_model_safetensors(model, directory/'model.safetensors', strict=not has_tie, device='cpu')
+    if has_tie: model.spark.tie_weights()
+    # Rebuild any cached COAT FP8 weights immediately after loading model weights!
+    coat_ctrl=ensure_coat_for_model(model,config)
+    if coat_ctrl is not None:
+        coat_ctrl.rebuild_weight_caches()
     rebind_assets(model,directory)
     if sample_hash(model)!=read(directory/'PARAMETERS.json')['sample_sha256']: raise ValueError('Reloaded parameter samples differ')
     optimizer=optimizer_for(model,config)
-    from transformers import get_cosine_schedule_with_warmup
-    if state.get('scheduler_kind')=='constant':
-        from transformers import get_constant_schedule
-        scheduler=get_constant_schedule(optimizer)
-    else: scheduler=get_cosine_schedule_with_warmup(optimizer,num_warmup_steps=state.get('warmup_steps',0),num_training_steps=max(1,state.get('planned_updates',1)))
+    scheduler=_build_scheduler(
+        optimizer,
+        kind=state.get('scheduler_kind','cosine'),
+        num_warmup_steps=state.get('warmup_steps',0),
+        num_training_steps=max(1,state.get('planned_updates',1)),
+    )
     if load_optimizer:
         optimizer.load_state_dict(torch.load(directory/'optimizer.pt',map_location='cpu',weights_only=True)); scheduler.load_state_dict(torch.load(directory/'scheduler.pt',map_location='cpu',weights_only=True))
     set_rng(torch.load(directory/'rng.pt',map_location='cpu',weights_only=True))
@@ -191,7 +397,8 @@ class MediaCollator:
     """Open independent catalogue/cache handles in each DataLoader process."""
     def __init__(self,campaign):
         self.root=campaign.root; self.config=campaign.c; self.token=campaign._hf_token
-        self.handoff=read(HERE.parent/'formal/HF_FULL_DATASET_HANDOFF.json')
+        local_handoff=self.root/'metadata/HANDOFF.json'
+        self.handoff=read(local_handoff) if local_handoff.is_file() else read(HERE.parent/'formal/HF_FULL_DATASET_HANDOFF.json')
         self.slot=campaign.reader.checkpoint_slot_bytes; self.worker=None
     def __call__(self,rows):
         import torch
@@ -215,7 +422,9 @@ class Campaign:
         self.c=config; self.root=Path(config['work_root']); self.paths=paths; self.bound=binding(config,source_sha)
         from .storage import ColdStore
         self.store=ColdStore(self.root,config,self.bound,token); self.catalogue=Catalogue(self.root/'metadata/corpus.sqlite')
-        self.reader=MediaReader(self.root,read(HERE.parent/'formal/HF_FULL_DATASET_HANDOFF.json'),config,token,reserve=2*config['initial_checkpoint_reservation_bytes'])
+        local_handoff=self.root/'metadata/HANDOFF.json'
+        handoff_doc=read(local_handoff) if local_handoff.is_file() else read(HERE.parent/'formal/HF_FULL_DATASET_HANDOFF.json')
+        self.reader=MediaReader(self.root,handoff_doc,config,token,reserve=2*config['initial_checkpoint_reservation_bytes'])
         self.key=key; self._hf_token=token; self.model=None; self.state={'stage':'initial','updates':0,'completed_stages':[],'rsi_rounds':[]}
         self.deferred_uploads=[];self.deferred_receipts={}
         self.budget=ComputeBudget(config,read(self.root/'compute-budget.json') if (self.root/'compute-budget.json').exists() else None)
@@ -233,7 +442,7 @@ class Campaign:
         self.budget.tick(); limit=self.c.get('max_wall_hours',110)*3600
         remaining=limit-self.budget.state['active_seconds']
         if seconds>remaining:
-            raise RuntimeError(f'The measured curriculum needs {seconds/3600:.2f} h but only {max(0,remaining)/3600:.2f} h remains of the 110 h wall budget; no stage or epoch will be shortened')
+            raise RuntimeError(f'The measured curriculum needs {seconds/3600:.2f} h but only {max(0,remaining)/3600:.2f} h remains of the {self.c.get("max_wall_hours",110)} h wall budget; no stage or epoch will be shortened')
         return remaining
     def budget_check(self,seconds=0):
         try:
@@ -273,11 +482,215 @@ class Campaign:
             self.budget.merge_checkpoint(read(directory/'COMPUTE_BUDGET.json'))
             write(self.root/'compute-budget.json',self.budget.state)
         prune(self.root,self.bound,[directory])
-        foreign=commit['runtime_boot_id']!=Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+        foreign=commit['runtime_boot_id']!=runtime_boot_id()
         proof={'schema_version':1,'passed':True,'fresh_vm':foreign,'parameter_samples_match':True,'optimizer_restored':True,'scheduler_restored':True,'rng_restored':True,'receipt':receipt,'binding':self.bound}
         write(self.root/'RESTORE_PROOF.json',proof); self.store.small_file(self.root/'RESTORE_PROOF.json','restore-proof')
         return optimizer,scheduler,proof
+
+    def train_order_native(self,stage,order,resume=False):
+        """Native PyTorch APOLLO + COAT + merged-gradient training loop for 24 GB SM120 workstations and Colab."""
+        import torch
+        from torch.utils.data import DataLoader
+        from .optimizer import MergedGradientAccumulator
+
+        stage_mode=stage.get('stage_mode')
+        unfreeze_vis=int(stage.get('unfreeze_vision_last_n_layers',0))
+        self.model.set_stage(
+            stage.get('alignment_only',False),
+            stage_mode=stage_mode,
+            unfreeze_vision_last_n_layers=unfreeze_vis,
+        )
+        self.model.train()
+        coat_ctrl=ensure_coat_for_model(self.model,self.c)
+
+        microbatch=self.c['microbatch_size']; accumulation=self.c['gradient_accumulation']//microbatch
+        cursor=CommittedCursor(order,self.state.get('cursor') if resume else None)
+        planned=math.ceil(len(order)/(microbatch*accumulation))
+        remaining=math.ceil((len(order)-cursor.committed)/(microbatch*accumulation))
+        if remaining==0:
+            self.state['cursor']=None
+            if stage['name'] not in self.state['completed_stages']: self.state['completed_stages'].append(stage['name'])
+            return
+
+        warmup=round(planned*self.c['warmup_ratio'])
+        optimizer=optimizer_for(self.model,self.c)
+        scheduler=_build_scheduler(optimizer,kind='cosine',num_warmup_steps=warmup,num_training_steps=planned)
+        if stage.get('inherit_parent_optimizer') and not resume:
+            lrs=[g['lr'] for g in optimizer.param_groups]
+            saved=Path(self.state['last_checkpoint_local'])
+            optimizer.load_state_dict(torch.load(saved/'optimizer.pt',map_location='cpu',weights_only=True))
+            for group,lr in zip(optimizer.param_groups,lrs): group['lr']=lr; group['initial_lr']=lr
+        if resume:
+            saved=Path(self.state['last_checkpoint_local'])
+            optimizer.load_state_dict(torch.load(saved/'optimizer.pt',map_location='cpu',weights_only=True))
+            scheduler.load_state_dict(torch.load(saved/'scheduler.pt',map_location='cpu',weights_only=True))
+            set_rng(torch.load(saved/'rng.pt',map_location='cpu',weights_only=True))
+
+        self.state.update(
+            stage=stage['name'],
+            alignment_only=stage.get('alignment_only',False),
+            stage_mode=stage_mode,
+            unfreeze_vision_last_n_layers=unfreeze_vis,
+            planned_updates=planned,
+            warmup_steps=warmup,
+            scheduler_kind='cosine',
+            optimizer_profile=self.c.get('optimizer_profile','apollo_coat'),
+            order_sha256=cursor.order_sha256,
+        )
+        weights=stage.get('fixed_loss_weights') or loss_weights(self.catalogue,order,self.c)
+        self.state['loss_weights']=weights
+        offset=self.state.get('updates',0)
+
+        buf_policy='fp32' if stage.get('alignment_only',False) else 'bf16_apollo_fp32_small'
+        accumulator=MergedGradientAccumulator(
+            self.model,
+            accum_mode=buf_policy,
+            min_bf16_accum_dim=int(self.c.get('apollo_min_dim',128)),
+        )
+        norm_mode=str(self.c.get('merged_grad_norm_mode','per_example'))
+
+        workers=int(self.c.get('dataloader_workers',0))
+        loader_kwargs={'prefetch_factor':int(self.c.get('dataloader_prefetch',2)),'persistent_workers':True} if workers>0 else {}
+        loader=DataLoader(
+            cursor_dataset(order,cursor),
+            batch_size=microbatch,
+            num_workers=workers,
+            collate_fn=MediaCollator(self),
+            pin_memory=False,
+            **loader_kwargs,
+        )
+
+        use_cuda_amp=torch.cuda.is_available() and str(self.model.device).startswith('cuda')
+        amp_ctx=(lambda: torch.autocast('cuda',dtype=torch.bfloat16)) if use_cuda_amp else contextlib.nullcontext
+        coat_ctx=(lambda: coat_ctrl.activation_context(training=True)) if (coat_ctrl is not None and coat_ctrl.enabled) else contextlib.nullcontext
+        inv_fn=(coat_ctrl.invalidate_weight_caches if (coat_ctrl is not None and coat_ctrl.enabled) else None)
+
+        window_microbatches=0
+        window_records=0
+        window_tokens=0
+        step_index=0
+        exposure=Counter(self.state.get('exposure',{}))
+        losses_by_stratum=defaultdict(lambda:[0.,0])
+
+        try:
+            batches_iter=iter(loader)
+            while True:
+                try:
+                    batch=next(batches_iter)
+                except StopIteration:
+                    batch=None
+
+                if batch is not None:
+                    with amp_ctx(), coat_ctx():
+                        result=self.model(examples=batch['examples'])
+                        per=result.get('per_example_loss')
+                        if per is None or len(per)!=len(batch['examples']):
+                            raise ValueError('Per-record loss count differs from the source microbatch')
+                        weighted=[]
+                        for raw_index,(row,_),loss in zip(batch['source_indices'],batch['examples'],per):
+                            cursor.record_computed(int(raw_index))
+                            window_records+=1
+                            exposure[row['_family']]+=1
+                            key=row['_family']+':'+row['language']
+                            losses_by_stratum[key][0]+=float(loss.detach())
+                            losses_by_stratum[key][1]+=1
+                            weighted.append(loss*weights[key])
+                        micro_loss_sum=torch.stack(weighted).sum()
+
+                    if not torch.isfinite(micro_loss_sum):
+                        accumulator.zero_buffers()
+                        raise RuntimeError('Nonfinite microbatch loss encountered; rolled back merged gradient buffer before step')
+
+                    mb_units=max(1,int(result.get('supervised_units',len(batch['examples']))))
+                    window_tokens+=mb_units
+                    mb_weight=(mb_units/max(1,len(batch['examples']))) if norm_mode=='per_token' else 1.0
+                    with accumulator.microbatch(weight=mb_weight,supervised_units=mb_units):
+                        micro_loss_sum.backward()
+                    window_microbatches+=1
+
+                should_step=(
+                    (batch is not None and window_microbatches>=accumulation)
+                    or (batch is None and window_microbatches>0)
+                )
+                if not should_step:
+                    if batch is None:
+                        break
+                    continue
+
+                if not stage.get('alignment_only',False):
+                    spark_buf_norm=0.0
+                    for group,_name,p in self.model.named_groups():
+                        if group=='spark' and id(p) in accumulator.buffers:
+                            spark_buf_norm+=float(accumulator.buffers[id(p)].detach().float().norm())
+                    if spark_buf_norm<=0.0:
+                        accumulator.zero_buffers()
+                        raise RuntimeError('Spark full-parameter gradient path is absent')
+
+                denom=float(max(1,window_tokens if norm_mode=='per_token' else window_records))
+                step_stats=accumulator.step(
+                    optimizer,
+                    scheduler,
+                    max_grad_norm=float(self.c['clip_norm']),
+                    post_scale=1.0/denom,
+                    invalidate_caches_fn=inv_fn,
+                )
+                if not step_stats.finite or not step_stats.applied:
+                    raise RuntimeError('Nonfinite merged gradient norm detected; optimizer step aborted cleanly')
+
+                # Commit cursor ONLY at completed optimizer step boundaries!
+                cursor.commit(window_records)
+                window_records=0
+                window_tokens=0
+                window_microbatches=0
+                step_index+=1
+                self.state.update(
+                    updates=offset+step_index,
+                    cursor=cursor.state(),
+                    exposure=dict(exposure),
+                    last_grad_norm=step_stats.grad_norm,
+                )
+                self.budget_check()
+                if self.direct_deadline and time.monotonic()>self.direct_deadline:
+                    self.stop_reason='direct_wall_hours'
+                if step_index%10==0 or batch is None or self.stop_reason:
+                    emit(
+                        'training',
+                        stage=stage['name'],
+                        update=offset+step_index,
+                        cursor=cursor.committed,
+                        records=len(order),
+                        grad_norm=round(step_stats.grad_norm,5),
+                        raw_stratum_losses={k:v[0]/v[1] for k,v in losses_by_stratum.items() if v[1]>0},
+                    )
+                    losses_by_stratum.clear()
+                if self.stop_reason or time.monotonic()-self.last_checkpoint>self.effective_checkpoint_minutes*60:
+                    self.save(optimizer,scheduler,cursor)
+                if self.stop_reason or batch is None:
+                    break
+        finally:
+            accumulator.close()
+
+        self.save(optimizer,scheduler,cursor)
+        if cursor.committed!=len(order):
+            if self.stop_reason: return
+            raise RuntimeError('Resumable stop: '+str(self.stop_reason or 'incomplete curriculum'))
+        self.state['cursor']=None
+        if stage['name'] not in self.state.setdefault('completed_stages',[]):
+            self.state['completed_stages'].append(stage['name'])
+        write(self.root/'CAMPAIGN.json',self.state)
+        del optimizer,scheduler; gc.collect()
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
+
     def train_order(self,stage,order,resume=False):
+        profile=self.c.get('optimizer_profile','adamw8bit')
+        use_native=(
+            self.c.get('trainer_backend')=='native_merged'
+            or self.c.get('execution_target')=='local_workstation'
+            or profile!='adamw8bit'
+        )
+        if use_native:
+            return self.train_order_native(stage,order,resume=resume)
+
         import torch,unsloth
         import studio.backend.core.training.trainer as backend
         from transformers import TrainerCallback,get_cosine_schedule_with_warmup
@@ -320,7 +733,7 @@ class Campaign:
                     weighted.append(loss*weights[key])
                 value=torch.stack(weighted).mean()
                 return (value,{**result,'loss':value}) if return_outputs else value
-            def _prepare_inputs(self,inputs): return inputs  # PIL/arrays are intentionally CPU until the native router.
+            def _prepare_inputs(self,inputs): return inputs
         class Audit(TrainerCallback):
             def on_pre_optimizer_step(self,args,state,control,model=None,**kwargs):
                 norms=defaultdict(float)
@@ -342,7 +755,6 @@ class Campaign:
                 if logs:
                     emit('training',stage=stage['name'],update=offset+state.global_step,cursor=cursor.committed,records=len(order),raw_stratum_losses={k:v[0]/v[1] for k,v in processed['losses'].items()},**{k:v for k,v in logs.items() if isinstance(v,(int,float))})
                     processed['losses'].clear()
-        # Unsloth's generated SFT config must retain BF16 AMP with FP32 params.
         os.environ.update(UNSLOTH_MIXED_PRECISION='float32',ACCELERATE_MIXED_PRECISION='bf16')
         self.model._unsloth_full_finetuning=True
         self.model._unsloth_forced_float32=False; self.model._unsloth_user_float32=False
@@ -379,7 +791,6 @@ class Campaign:
         write(self.root/'CAMPAIGN.json',self.state)
         return report
     def sync_instructor_ledger(self):
-        # Reconcile the newest committed intent OR receipt across VM loss.
         from colab.preflight import download_verified
         entries=self.store.discover(); latest=None; folder=self.root/'ledger-reconciliation'; folder.mkdir(exist_ok=True)
         for item in entries:
@@ -468,12 +879,13 @@ class Campaign:
         if (self.root/'INSTRUCTOR_FORMAT_PROBE.json').exists(): return
         self.sync_instructor_ledger(); teacher=Instructor(self.key,self.root/'instructor',self.c,self.store)
         self.model.eval(); reviewed=[]
-        for fam,lang in [('image','en'),('speech_in','zh')]:
+        probe_pairs=[('image','en')] if self.c.get('modalities')=='vision_text' else [('image','en'),('speech_in','zh')]
+        for fam,lang in probe_pairs:
             rowid=self.catalogue.select('train',[fam],lang)[0][0]
             row,media=self.media(rowid); row['_parent_checkpoint']=self.state.get('last_checkpoint',{}).get('commit_sha256','direct-initial')
             with torch.no_grad(),torch.autocast('cuda',dtype=torch.bfloat16): student=self.model.answer(row,media,32)
             decision=teacher.review(row,media,student,0); reviewed.append({'id':rowid,'family':fam,'language':lang,'decision':decision})
-        result={'passed':True,'requests':2,'scope':'Current provider key/model and actual image/audio request schema/accounting only; teacher competence and route eligibility remain separate','reviewed_training_records':reviewed}
+        result={'passed':True,'requests':len(reviewed),'scope':'Current provider key/model and actual image/audio request schema/accounting only; teacher competence and route eligibility remain separate','reviewed_training_records':reviewed}
         write(self.root/'INSTRUCTOR_FORMAT_PROBE.json',result); self.store.small_file(self.root/'INSTRUCTOR_FORMAT_PROBE.json','instructor-format-probe')
     def run_formal(self,profile,require_recovery=True):
         from .teacher import eligibility
@@ -489,14 +901,10 @@ class Campaign:
         if self.model is None: raise RuntimeError('Restore the reviewed initial or resumable campaign checkpoint first')
         slot=math.ceil(profile['complete_checkpoint_bytes']*1.10)
         self.reader.checkpoint_slot_bytes=slot; self.state['qualified_checkpoint_reservation_bytes']=slot
-        # Full snapshots live in HF commit history. Drive holds only reports,
-        # ledgers and receipt indexes, each checked against its cap on upload.
-        # HF quota errors preserve the local fallback and stop; no remote
-        # history is squashed because old revisions are needed for RSI/recovery.
         transfer_minutes=math.ceil(profile['qualification_complete_receipt'].get('seconds',0)*1.2*4/60/10)*10
         self.effective_checkpoint_minutes=max(self.c['checkpoint_minutes'],transfer_minutes)
         if self.effective_checkpoint_minutes>self.c['max_checkpoint_minutes']: raise RuntimeError('Measured checkpoint transfer overhead exceeds the reviewed maximum interval')
-        write(self.root/'STORAGE_PROFILE.json',{'checkpoint_backend':'huggingface','checkpoint_repo':self.c['checkpoint_repo'],'measured_checkpoint_bytes':profile['complete_checkpoint_bytes'],'slot_with_margin':slot,'effective_checkpoint_minutes':self.effective_checkpoint_minutes,'requested_checkpoint_minutes':self.c['checkpoint_minutes'],'transfer_overhead_minutes_requirement':transfer_minutes,'drive_small_artifacts_cap_bytes':self.c['drive_cap_bytes'],'local_retained_after_commit':1,'local_peak_checkpoint_slots':2,'remote_history_squashed':False})
+        write(self.root/'STORAGE_PROFILE.json',{'checkpoint_backend':self.c.get('checkpoint_backend','huggingface'),'checkpoint_repo':self.c['checkpoint_repo'],'measured_checkpoint_bytes':profile['complete_checkpoint_bytes'],'slot_with_margin':slot,'effective_checkpoint_minutes':self.effective_checkpoint_minutes,'requested_checkpoint_minutes':self.c['checkpoint_minutes'],'transfer_overhead_minutes_requirement':transfer_minutes,'drive_small_artifacts_cap_bytes':self.c['drive_cap_bytes'],'local_retained_after_commit':1,'local_peak_checkpoint_slots':2,'remote_history_squashed':False})
         emit('storage_profile',**read(self.root/'STORAGE_PROFILE.json'))
         if not self.state.get('completed_stages') and self.state['stage']=='initial':
             self.budget.check(profile['projected_hours']*3600)
@@ -516,6 +924,7 @@ class Campaign:
                 if stage['name'] in self.state.get('completed_stages',[]): continue
                 order=self.catalogue.plan(stage,self.c['seed']+i)
                 resume=self.state.get('stage')==stage['name'] and self.state.get('cursor') is not None
+                parent_receipt=self.state.get('last_checkpoint')
                 self.train_order(stage,order,resume=resume)
                 if self.stop_reason:
                     self.state.update(training_complete=False,stopped_reason=self.stop_reason)
@@ -524,7 +933,20 @@ class Campaign:
                          curriculum_complete=False,capability_promoted=False)
                     return {'stopped':True,'reason':self.stop_reason,'stage':stage['name'],
                             'last_checkpoint':self.state.get('last_checkpoint')}
-                self.evaluate('dev',stage['name'],generate=False)
+                stage_eval=self.evaluate('dev',stage['name'],generate=False)
+                # Best-checkpoint promotion guard: never silently overwrite a better parent checkpoint on regression.
+                if self.c.get('enforce_stage_promotion_gate') and parent_receipt and isinstance(stage_eval,dict) and (self.root/'BASELINE.json').exists():
+                    from .evaluate import promotion
+                    prev_eval=self.state.get('best_dev_eval') or read(self.root/'BASELINE.json')
+                    if isinstance(prev_eval,dict) and 'by_stratum' in prev_eval and 'by_stratum' in stage_eval:
+                        gate=promotion(prev_eval,stage_eval,self.c)
+                        if gate['accepted']:
+                            self.state['best_checkpoint']=self.state.get('last_checkpoint')
+                            self.state['best_dev_eval']=stage_eval
+                        else:
+                            emit('stage_checkpoint_rejected',stage=stage['name'],reasons=gate['reasons'],restoring_best=True)
+                            opt,sched,_=self.restore(self.state.get('best_checkpoint') or parent_receipt)
+                            del opt,sched
         if phase in ('full','rsi'):
             for round_no in range(1,self.c['instructor_rounds']+1):
                 if any(r['round']==round_no for r in self.state.get('rsi_rounds',[])): continue

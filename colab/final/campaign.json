@@ -1,11 +1,13 @@
 {
   "schema_version": 1,
-  "campaign_id": "spark-mm-g4-v2",
+  "campaign_id": "spark-x26-vl-synccraft-v1",
   "work_root": "/content/spark-formal",
-  "model_repo": "TassP0lar/SparkX2.6-MM",
+  "execution_target": "colab",
+  "modalities": "vision_text",
+  "model_repo": "TassP0lar/SparkX2.6-VL-SyncCraft",
   "model_repo_private": true,
   "checkpoint_backend": "huggingface",
-  "checkpoint_repo": "TassP0lar/SparkX2.6-MM-checkpoints",
+  "checkpoint_repo": "TassP0lar/SparkX2.6-VL-SyncCraft-checkpoints",
   "checkpoint_repo_private": true,
   "drive_project_folder": "1ELmWWHxpCb3IGM2LZDQV-u7NiLxK12T_",
   "drive_cap_bytes": 2000000000000,
@@ -25,14 +27,43 @@
   "microbatch_size": 2,
   "max_wall_hours": 110,
   "direct_wall_hours": 22,
-  "max_sequence": 2048,
-  "max_answer_tokens": 2048,
+  "max_sequence": 8192,
+  "max_answer_tokens": 4096,
   "learning_rate": 1e-05,
   "connector_learning_rate": 0.0001,
   "audio_output_learning_rate": 5e-06,
   "weight_decay": 0.01,
   "warmup_ratio": 0.03,
   "clip_norm": 1.0,
+  "optimizer_profile": "apollo_coat",
+  "optimizer_ablation_profiles": [
+    "bf16_adamw",
+    "apollo_merged",
+    "apollo_coat",
+    "apollo_coat_fp8_moments"
+  ],
+  "apollo_rank": 64,
+  "apollo_rank_candidates": [
+    64,
+    32
+  ],
+  "apollo_scale": 1.0,
+  "apollo_update_proj_gap": 200,
+  "apollo_proj_method": "random",
+  "apollo_min_2d_dim": 256,
+  "coat_activation_fp8": true,
+  "coat_activation_group_size": 16,
+  "coat_moment_fp8": false,
+  "coat_fp8_linear_forward": false,
+  "merged_grad_norm_mode": "per_example",
+  "visual_cross_attn_blocks": 3,
+  "visual_cross_attn_candidates": [
+    0,
+    3,
+    6
+  ],
+  "enable_thinking_synccraft": true,
+  "vision_pilot_records": 32000,
   "thumbnail_patches": 256,
   "tile_patches": 576,
   "detail_tiles": 4,
@@ -51,68 +82,55 @@
   },
   "stages": [
     {
-      "name": "bridge_alignment",
+      "name": "vision_connector_pilot",
       "families": [
-        "image",
-        "video",
-        "audiovisual",
-        "speech_in",
-        "sound_in",
-        "speech_out",
-        "sound_out"
+        "image"
       ],
       "epochs": 1,
       "alignment_only": true,
-      "max_records_per_family": 256
+      "stage_mode": "frozen_spark_connector",
+      "max_records_per_family": 32000
     },
     {
-      "name": "vision_full",
+      "name": "vision_cross_attn_expansion",
       "families": [
         "image",
         "text"
       ],
-      "epochs": 1
+      "epochs": 1,
+      "alignment_only": true,
+      "stage_mode": "frozen_spark_cross_attn",
+      "replay_fraction": 0.15
     },
     {
-      "name": "temporal_full",
+      "name": "vision_synccraft_static_full",
       "families": [
-        "video",
-        "audiovisual"
+        "image",
+        "text"
       ],
       "epochs": 1,
-      "replay_fraction": 0.2
-    },
-    {
-      "name": "audio_understanding_full",
-      "families": [
-        "speech_in",
-        "sound_in"
+      "alignment_only": false,
+      "stage_mode": "full_spark",
+      "synccraft_tasks": [
+        "synccraft_part_grounding",
+        "synccraft_multiview_inverse_dsl",
+        "synccraft_uv_alpha_diagnosis",
+        "synccraft_typed_scene_edit"
       ],
-      "epochs": 1,
-      "replay_fraction": 0.2
+      "include_synccraft_animation": false
     },
     {
-      "name": "audio_generation_full",
-      "families": [
-        "speech_out",
-        "sound_out"
-      ],
-      "epochs": 1,
-      "replay_fraction": 0.2
-    },
-    {
-      "name": "joint_full",
+      "name": "synccraft_animation_full",
       "families": [
         "image",
         "video",
-        "audiovisual",
-        "speech_in",
-        "sound_in",
-        "speech_out",
-        "sound_out",
         "text"
       ],
-      "epochs": 1
+      "epochs": 1,
+      "alignment_only": false,
+      "stage_mode": "full_spark",
+      "include_synccraft_animation": true,
+      "replay_fraction": 0.2
     }
   ],
   "evaluation_per_family_language": 32,
