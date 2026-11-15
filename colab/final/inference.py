@@ -6,8 +6,7 @@ from typing import Any
 def load(directory,device='cuda'):
     from .common import read,sha
     from .engine import reload_paths
-    from .model import SparkNative
-    from safetensors.torch import load_model
+    from .model import SparkNative,load_spark_native_safetensors
     directory=Path(directory)
     release=read(directory/'MODEL_RELEASE.json')
     for f in release['files']:
@@ -16,8 +15,7 @@ def load(directory,device='cuda'):
             raise ValueError('Export content differs from its release manifest')
     config=read(directory/'config.json')
     model=SparkNative(reload_paths(directory,config=config),config,device=device,pretrained=False)
-    load_model(model,str(directory/'model.safetensors'),strict=False if hasattr(model.spark,'tie_weights') else True,device='cpu')
-    if hasattr(model.spark,'tie_weights'): model.spark.tie_weights()
+    load_spark_native_safetensors(model,directory/'model.safetensors')
     model.eval()
     return model
 

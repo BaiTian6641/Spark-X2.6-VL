@@ -670,3 +670,74 @@ def test_accumulator_close_releases_buffers_and_vision_text_plan_filters_audio(t
     assert "img-anim" not in order_static
     assert "txt-1" in order_static
 
+
+def test_spark_fp8_checkpoint_lock_roundtrip_and_frozen_spark_ce_checkpoint(tmp_path: Path):
+    from colab.final.assets import _active_component_keys
+    from colab.final.common import HERE, read, validate_config
+    from colab.final.engine import ensure_coat_for_model
+    from colab.final.model import export_spark_native_fp8_safetensors, load_spark_native_safetensors
+
+    lock = read(HERE / "components.lock.json")
+    assert "spark_fp8" in lock
+    fp8_spec = lock["spark_fp8"]
+    assert fp8_spec["repository"] == "XHToken/Spark-X2.6-4B-FP8"
+    assert fp8_spec["revision"] == "b0065cff38594d3a5e265a5ed12cfb552b179b7c"
+    assert sum(f["bytes"] for f in fp8_spec["files"]) == fp8_spec["bytes"]
+
+    ws_cfg = validate_config(read(HERE / "campaign_rtx_pro_4000_24gb.json"))
+    assert ws_cfg["spark_component"] == "spark_fp8"
+    assert _active_component_keys(lock, ws_cfg) == ["spark_fp8", "vision"]
+    assert _active_component_keys(lock, {"modalities": "omni"}) == [k for k in lock if k != "spark_fp8"]
+
+    # Verify channelwise FP8 safetensors export + reload roundtrip & frozen_spark_connector backward
+    model_a = make_synthetic_spark_native({"visual_cross_attn_blocks": 3, "apollo_min_dim": 64}, seed=707)
+    sf_path = tmp_path / "model.safetensors"
+    meta = export_spark_native_fp8_safetensors(model_a, sf_path)
+    assert meta["quantized_linear_tensors"] == len(model_a.spark.model.layers) * 5
+
+    model_b = make_synthetic_spark_native({"visual_cross_attn_blocks": 3, "apollo_min_dim": 64}, seed=999)
+    load_spark_native_safetensors(model_b, sf_path)
+    w_a = model_a.spark.model.layers[0].mlp.down_proj.weight.detach().float()
+    w_b = model_b.spark.model.layers[0].mlp.down_proj.weight.detach().float()
+    rel_err = float((w_a - w_b).norm() / w_a.norm())
+    assert rel_err < 0.08
+    # Unquantized attention gate and RMSNorm tensors match exactly
+    g_a = model_a.spark.model.layers[0].self_attn.headwise_attn_output_gate.weight
+    g_b = model_b.spark.model.layers[0].self_attn.headwise_attn_output_gate.weight
+    assert torch.equal(g_a, g_b)
+    assert torch.equal(
+        model_a.spark.model.layers[0].input_layernorm.weight,
+        model_b.spark.model.layers[0].input_layernorm.weight,
+    )
+
+    # Verify Stage 1 (`frozen_spark_connector`) non-reentrant CE checkpointing backward succeeds
+    model_b.set_stage(True, stage_mode="frozen_spark_connector")
+    model_b.train()
+    coat_ctrl = ensure_coat_for_model(model_b, model_b.policy)
+    rgb = Image.fromarray(np.full((48, 48, 3), 120, dtype=np.uint8), mode="RGB")
+    ex = (
+        {"id": "s1", "_family": "image", "language": "en", "task": "s1_test", "prompt": "Describe", "answer": "box part"},
+        {
+            "images": [rgb],
+            "alphas": [None],
+            "visual_kind": "independent_image",
+            "visual_units": [],
+            "times": [0.0],
+            "capture_times": None,
+            "audio": None,
+            "target_audio": None,
+            "motion": None,
+            "motion_times": None,
+        },
+    )
+    torch.utils.checkpoint.set_checkpoint_debug_enabled(True)
+    try:
+        with coat_ctrl.activation_context(training=True):
+            out = model_b(examples=[ex])
+            loss = out["per_example_loss"].sum()
+        loss.backward()
+    finally:
+        torch.utils.checkpoint.set_checkpoint_debug_enabled(False)
+    assert any(p.grad is not None and float(p.grad.detach().abs().sum()) > 0 for p in model_b.vision_projector.parameters())
+
+

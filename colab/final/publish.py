@@ -8,7 +8,13 @@ from .publication import public_artifact
 
 def card(config,state,bound):
     lock=read(HERE/'components.lock.json'); dataset=read(HERE/'dataset.lock.json')
-    rows='\n'.join(f"| {key} | [{value['repository']}](https://huggingface.co/{value['repository']}/tree/{value['revision']}) | {value.get('license','see source')} |" for key,value in lock.items() if key!='motion')
+    spark_key=config.get('spark_component','spark')
+    base_repo=lock.get(spark_key,lock['spark'])['repository']
+    rows='\n'.join(
+        f"| {key} | [{value['repository']}](https://huggingface.co/{value['repository']}/tree/{value['revision']}) | {value.get('license','see source')} |"
+        for key,value in lock.items()
+        if key!='motion' and (key not in ('spark','spark_fp8') or key==spark_key)
+    )
     return f'''---
 language: [en, zh]
 library_name: pytorch
@@ -16,7 +22,7 @@ pipeline_tag: any-to-any
 license: other
 license_name: composite-see-component-licenses
 license_link: README.md
-base_model: XHToken/Spark-X2.6-4B
+base_model: {base_repo}
 datasets:
 - TassP0lar/SparkX2.6-MM
 private: {str(config['model_repo_private']).lower()}
@@ -105,8 +111,24 @@ def export_and_upload(campaign,config):
                 if secret and secret.encode() in payload: raise ValueError('Credential detected in final text artifact')
     files=manifest(out); write(out/'MODEL_RELEASE.json',{'schema_version':1,'campaign_id':config['campaign_id'],'binding':campaign.bound,'training_complete':True,**files})
     if config.get('checkpoint_backend')=='local' and not config.get('publish_to_huggingface',False):
+        result_payload={'status':'local_export_closed','export_directory':str(out),'model_release_sha256':sha(out/'MODEL_RELEASE.json')}
+        if config.get('spark_component')=='spark_fp8' and campaign.model is not None:
+            from .model import export_spark_native_fp8_safetensors
+            out_fp8=campaign.root/'final-model-fp8'; out_fp8.mkdir(exist_ok=True)
+            for path in out.rglob('*'):
+                if not path.is_file(): continue
+                rel=path.relative_to(out)
+                if rel.as_posix() in ('model.safetensors','MODEL_RELEASE.json'): continue
+                dest=out_fp8/rel; dest.parent.mkdir(parents=True,exist_ok=True)
+                shutil.copy2(path,dest)
+            fp8_meta=export_spark_native_fp8_safetensors(campaign.model,out_fp8/'model.safetensors')
+            fp8_files=manifest(out_fp8)
+            write(out_fp8/'MODEL_RELEASE.json',{'schema_version':1,'campaign_id':config['campaign_id'],'binding':campaign.bound,'training_complete':True,'quantization':'compressed-tensors-fp8-e4m3-channel',**fp8_meta,**fp8_files})
+            emit('local_fp8_model_export_ready',directory=str(out_fp8),model_release_sha256=sha(out_fp8/'MODEL_RELEASE.json'),**fp8_meta)
+            result_payload['fp8_export_directory']=str(out_fp8)
+            result_payload['fp8_model_release_sha256']=sha(out_fp8/'MODEL_RELEASE.json')
         emit('local_model_export_ready',directory=str(out),model_release_sha256=sha(out/'MODEL_RELEASE.json'))
-        return {'status':'local_export_closed','export_directory':str(out),'model_release_sha256':sha(out/'MODEL_RELEASE.json')}
+        return result_payload
     return upload_closed_export(campaign,config,out)
 
 def _remote_bytes(repo,path,revision,token,limit):

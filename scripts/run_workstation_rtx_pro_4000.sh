@@ -479,7 +479,7 @@ if [[ ! -f "${WORK_ROOT}/asset-receipt.json" ]] && [[ -z "${HF_TOKEN:-}" ]]; the
   die "HF_TOKEN is not set in environment and ${WORK_ROOT}/asset-receipt.json does not exist yet. Export HF_TOKEN=<your_hf_read_token> for the initial Spark-X2.6-4B + SigLIP2 download."
 fi
 
-log "[Phase 4/6] Verifying / fetching pinned Spark-X2.6-4B & SigLIP2-SO400M-NaFlex assets (vision_text mode)..."
+log "[Phase 4/6] Verifying / fetching pinned Spark-X2.6-4B-FP8 (or BF16) & SigLIP2-SO400M-NaFlex assets (vision_text mode)..."
 "${VENV_PY}" "${REPO_ROOT}/scripts/launch_spark_synccraft.py" prepare-assets \
   --config "${CONFIG_PATH}" \
   --work-root "${WORK_ROOT}" \
@@ -547,6 +547,9 @@ while true; do
     log "======================================================================"
     log "Campaign completed successfully!"
     log "  Closed inference model : ${WORK_ROOT}/final-model"
+    if [[ -d "${WORK_ROOT}/final-model-fp8" ]]; then
+      log "  Closed FP8 model       : ${WORK_ROOT}/final-model-fp8"
+    fi
     log "  Release manifest       : ${WORK_ROOT}/final-model/MODEL_RELEASE.json"
     log "  Protected audit report : ${WORK_ROOT}/evaluations/final-protected-audit/REPORT.json"
     log "  SM120 ablation report  : ${WORK_ROOT}/ABLATION_PROFILES.json"

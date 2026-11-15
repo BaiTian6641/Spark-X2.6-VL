@@ -69,9 +69,10 @@ def check_gated_access(spec,token):
 
 
 def _active_component_keys(lock,config):
+    spark_key=config.get('spark_component','spark')
     if config.get('modalities','omni')=='vision_text':
-        return [k for k in ('spark','vision') if k in lock]
-    return list(lock.keys())
+        return [k for k in (spark_key,'vision') if k in lock]
+    return [k for k in lock.keys() if (k not in ('spark','spark_fp8') or k==spark_key)]
 
 
 def prepare_assets(root,token,config,download_weights=True):
@@ -118,7 +119,8 @@ def prepare_assets(root,token,config,download_weights=True):
     for key in active_keys:
         if key=='motion': continue
         spec=lock[key]
-        path=root/'assets'/key; paths[key]=path
+        alias='spark' if key in ('spark','spark_fp8') else key
+        path=root/'assets'/key; paths[alias]=path
         for f in spec['files']:
             is_weight=f['path'].endswith(('.safetensors','.bin'))
             if is_weight and not download_weights: continue
@@ -137,7 +139,7 @@ def prepare_assets(root,token,config,download_weights=True):
         paths['motion_source']=source/prefix
         paths['motion']=motion_path
         if download_weights: fetch(motion['checkpoint']['url'],paths['motion'],motion['checkpoint'],reserve=checkpoint_reserve,verified_existing=checks[motion_path])
-    write(root/'asset-receipt.json',{'component_lock_sha256':sha(HERE/'components.lock.json'),'modalities':config.get('modalities','omni'),'weights_downloaded':download_weights,'gated_access_checked':'sound_out' in active_keys,'paths':{k:str(v) for k,v in paths.items()}})
+    write(root/'asset-receipt.json',{'component_lock_sha256':sha(HERE/'components.lock.json'),'modalities':config.get('modalities','omni'),'spark_component':config.get('spark_component','spark'),'weights_downloaded':download_weights,'gated_access_checked':'sound_out' in active_keys,'paths':{k:str(v) for k,v in paths.items()}})
     return paths
 
 

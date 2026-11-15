@@ -6,6 +6,7 @@
   "hardware_profile": "rtx_pro_4000_blackwell_24gb",
   "dataset_mode": "local_synccraft",
   "modalities": "vision_text",
+  "spark_component": "spark_fp8",
   "spark_dtype": "bfloat16",
   "vision_dtype": "bfloat16",
   "model_repo": "TassP0lar/SparkX2.6-VL-SyncCraft",

@@ -283,6 +283,284 @@ def audio_resample(wav,sr,target):
     g=math.gcd(sr,target); return scipy.signal.resample_poly(wav,target//g,sr//g,axis=-1).astype('float32')
 
 
+_FP8_TARGET_SUFFIXES = (
+    '.self_attn.q_k_v_proj.weight',
+    '.self_attn.out_proj.weight',
+    '.self_attn.o_proj.weight',
+    '.mlp.gate_proj.weight',
+    '.mlp.up_proj.weight',
+    '.mlp.down_proj.weight',
+)
+
+
+def load_spark_backbone(spark_path, *, spark_dtype: torch.dtype, pretrained: bool = True):
+    """Load `XHToken/Spark-X2.6-4B` (BF16) or `XHToken/Spark-X2.6-4B-FP8` (compressed-tensors E4M3).
+
+    Strips inference-only `quantization_config` in-memory so `Spark2_5ForCausalLM` builds
+    trainable `nn.Linear` layers without requiring external `compressed-tensors`, and streams
+    exact channelwise FP8 (`w_fp8 * weight_scale`) dequantization into `spark_dtype` master weights.
+    """
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    spark_dir = Path(spark_path)
+    cfg = AutoConfig.from_pretrained(spark_dir, trust_remote_code=True, local_files_only=True)
+    quant_cfg = getattr(cfg, 'quantization_config', None) or cfg.__dict__.get('quantization_config')
+    if hasattr(cfg, 'quantization_config'):
+        try:
+            delattr(cfg, 'quantization_config')
+        except AttributeError:
+            pass
+    cfg.__dict__.pop('quantization_config', None)
+
+    if not pretrained:
+        return AutoModelForCausalLM.from_config(
+            cfg,
+            trust_remote_code=True,
+            attn_implementation='eager',
+        ).to(dtype=spark_dtype)
+
+    single_sf = spark_dir / 'model.safetensors'
+    is_fp8_safetensors = False
+    if single_sf.is_file():
+        from safetensors import safe_open
+        with safe_open(str(single_sf), framework='pt', device='cpu') as f:
+            keys = list(f.keys())
+            is_fp8_safetensors = any(k.endswith('.weight_scale') for k in keys) or (quant_cfg is not None)
+
+    if not is_fp8_safetensors:
+        return AutoModelForCausalLM.from_pretrained(
+            spark_dir,
+            config=cfg,
+            trust_remote_code=True,
+            local_files_only=True,
+            dtype=spark_dtype,
+            attn_implementation='eager',
+        )
+
+    from safetensors import safe_open
+
+    spark = AutoModelForCausalLM.from_config(
+        cfg,
+        trust_remote_code=True,
+        attn_implementation='eager',
+    ).to(dtype=spark_dtype)
+
+    param_map = dict(spark.named_parameters())
+    buf_map = dict(spark.named_buffers())
+    loaded_keys: set[str] = set()
+    fp8_dequant_count = 0
+
+    with safe_open(str(single_sf), framework='pt', device='cpu') as f:
+        sf_keys = set(f.keys())
+        for key in sorted(sf_keys):
+            if key.endswith('.weight_scale') or key.endswith('.input_scale'):
+                continue
+            target = param_map.get(key)
+            if target is None:
+                target = buf_map.get(key)
+            if target is None:
+                raise KeyError(f'Unexpected tensor {key!r} in FP8 Spark checkpoint {single_sf}')
+            raw_t = f.get_tensor(key)
+            scale_key = key + '_scale'
+            if raw_t.dtype == torch.float8_e4m3fn or scale_key in sf_keys:
+                if scale_key not in sf_keys:
+                    raise KeyError(f'Missing channelwise FP8 scale {scale_key!r} for {key!r}')
+                w_scale = f.get_tensor(scale_key)
+                deq = (raw_t.to(torch.float32) * w_scale.to(torch.float32)).to(dtype=target.dtype)
+                target.data.copy_(deq)
+                fp8_dequant_count += 1
+            else:
+                target.data.copy_(raw_t.to(dtype=target.dtype))
+            loaded_keys.add(key)
+
+    expected_keys = set(param_map.keys())
+    missing = expected_keys - loaded_keys - {'lm_head.weight'}
+    if missing:
+        raise RuntimeError(f'Missing parameters when loading FP8 Spark checkpoint: {sorted(missing)[:8]}')
+    if hasattr(spark, 'tie_weights'):
+        spark.tie_weights()
+    spark._fp8_checkpoint_source = {
+        'format': 'compressed-tensors-fp8-e4m3-channel',
+        'dequantized_linear_tensors': fp8_dequant_count,
+        'loaded_tensors': len(loaded_keys),
+    }
+    return spark
+
+
+def _write_safetensors_dict(tensors: dict[str, torch.Tensor], dest: Path, metadata: dict[str, str] | None = None) -> None:
+    try:
+        from safetensors.torch import save_file
+        save_file(tensors, str(dest), metadata=metadata)
+        return
+    except ModuleNotFoundError:
+        pass
+    import json, struct
+    dtype_map = {
+        torch.float32: 'F32',
+        torch.bfloat16: 'BF16',
+        torch.float16: 'F16',
+        torch.float8_e4m3fn: 'F8_E4M3',
+        torch.int64: 'I64',
+        torch.int32: 'I32',
+        torch.uint8: 'U8',
+        torch.bool: 'BOOL',
+    }
+    header: dict[str, Any] = {'__metadata__': metadata} if metadata else {}
+    blobs: list[bytes] = []
+    offset = 0
+    for name, t in tensors.items():
+        cpu_t = t.detach().contiguous().cpu()
+        dt = dtype_map[cpu_t.dtype]
+        raw = bytes(cpu_t.view(torch.uint8).reshape(-1).numpy())
+        end = offset + len(raw)
+        header[name] = {'dtype': dt, 'shape': list(cpu_t.shape), 'data_offsets': [offset, end]}
+        blobs.append(raw)
+        offset = end
+    hdr_bytes = json.dumps(header, separators=(',', ':')).encode('utf-8')
+    hdr_bytes += b' ' * ((8 - (len(hdr_bytes) % 8)) % 8)
+    with dest.open('wb') as f:
+        f.write(struct.pack('<Q', len(hdr_bytes)))
+        f.write(hdr_bytes)
+        for b in blobs:
+            f.write(b)
+
+
+def _read_safetensors_dict(src: Path) -> dict[str, torch.Tensor]:
+    try:
+        from safetensors import safe_open
+        out: dict[str, torch.Tensor] = {}
+        with safe_open(str(src), framework='pt', device='cpu') as f:
+            for k in f.keys():
+                out[k] = f.get_tensor(k)
+        return out
+    except ModuleNotFoundError:
+        pass
+    import json, struct
+    rev_dtype = {
+        'F32': torch.float32,
+        'BF16': torch.bfloat16,
+        'F16': torch.float16,
+        'F8_E4M3': torch.float8_e4m3fn,
+        'I64': torch.int64,
+        'I32': torch.int32,
+        'U8': torch.uint8,
+        'BOOL': torch.bool,
+    }
+    raw_all = src.read_bytes()
+    (hlen,) = struct.unpack('<Q', raw_all[:8])
+    hdr = json.loads(raw_all[8:8 + hlen].decode('utf-8'))
+    body = memoryview(raw_all)[8 + hlen:]
+    out = {}
+    for name, meta in hdr.items():
+        if name == '__metadata__':
+            continue
+        s, e = meta['data_offsets']
+        dt = rev_dtype[meta['dtype']]
+        chunk = bytes(body[s:e])
+        t = torch.frombuffer(bytearray(chunk), dtype=dt).reshape(meta['shape']) if len(chunk) > 0 else torch.empty(meta['shape'], dtype=dt)
+        out[name] = t
+    return out
+
+
+def export_spark_native_fp8_safetensors(model: nn.Module, path: str | Path) -> dict[str, Any]:
+    """Export `SparkNative` with Spark linear projections quantized to symmetric channelwise `F8_E4M3` + `weight_scale`."""
+    fp8_max = 448.0
+    out_tensors: dict[str, torch.Tensor] = {}
+    seen_ptrs: set[tuple[int, tuple[int, ...], tuple[int, ...]]] = set()
+    quantized_count = 0
+
+    for name, tensor in model.state_dict().items():
+        sig = (tensor.untyped_storage().data_ptr(), tuple(tensor.shape), tuple(tensor.stride()))
+        if sig in seen_ptrs:
+            continue
+        seen_ptrs.add(sig)
+        t_cpu = tensor.detach().contiguous().cpu()
+        if (
+            name.startswith('spark.model.layers.')
+            and any(name.endswith(sfx) for sfx in _FP8_TARGET_SUFFIXES)
+            and t_cpu.ndim == 2
+        ):
+            w_f32 = t_cpu.to(torch.float32)
+            scale = (w_f32.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12) / fp8_max).to(torch.bfloat16)
+            w_fp8 = (w_f32 / scale.to(torch.float32)).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
+            out_tensors[name] = w_fp8.contiguous()
+            out_tensors[name + '_scale'] = scale.contiguous()
+            quantized_count += 1
+        else:
+            out_tensors[name] = t_cpu
+
+    dest = Path(path)
+    _write_safetensors_dict(out_tensors, dest, metadata={'format': 'pt', 'quant_method': 'compressed-tensors-fp8-e4m3-channel'})
+    return {'quantized_linear_tensors': quantized_count, 'bytes': dest.stat().st_size}
+
+
+def load_spark_native_safetensors(model: nn.Module, path: str | Path) -> None:
+    """Load either standard BF16 `model.safetensors` or channelwise `F8_E4M3` + `weight_scale` `model.safetensors`."""
+    sf_path = Path(path)
+    try:
+        from safetensors import safe_open
+        from safetensors.torch import load_model
+        with safe_open(str(sf_path), framework='pt', device='cpu') as f:
+            sf_keys = set(f.keys())
+            has_fp8 = any(k.endswith('.weight_scale') for k in sf_keys)
+            if not has_fp8:
+                strict = not hasattr(getattr(model, 'spark', None), 'tie_weights')
+                load_model(model, str(sf_path), strict=strict, device='cpu')
+                if hasattr(getattr(model, 'spark', None), 'tie_weights'):
+                    model.spark.tie_weights()
+                return
+
+            param_map = dict(model.named_parameters())
+            buf_map = dict(model.named_buffers())
+            loaded: set[str] = set()
+            for key in sorted(sf_keys):
+                if key.endswith('.weight_scale'):
+                    continue
+                target = param_map.get(key)
+                if target is None:
+                    target = buf_map.get(key)
+                if target is None:
+                    continue
+                raw_t = f.get_tensor(key)
+                scale_key = key + '_scale'
+                if raw_t.dtype == torch.float8_e4m3fn or scale_key in sf_keys:
+                    w_scale = f.get_tensor(scale_key)
+                    deq = (raw_t.to(torch.float32) * w_scale.to(torch.float32)).to(dtype=target.dtype, device=target.device)
+                    target.data.copy_(deq)
+                else:
+                    target.data.copy_(raw_t.to(dtype=target.dtype, device=target.device))
+                loaded.add(key)
+    except ModuleNotFoundError:
+        tensors = _read_safetensors_dict(sf_path)
+        sf_keys = set(tensors.keys())
+        param_map = dict(model.named_parameters())
+        buf_map = dict(model.named_buffers())
+        loaded = set()
+        for key in sorted(sf_keys):
+            if key.endswith('.weight_scale'):
+                continue
+            target = param_map.get(key)
+            if target is None:
+                target = buf_map.get(key)
+            if target is None:
+                continue
+            raw_t = tensors[key]
+            scale_key = key + '_scale'
+            if raw_t.dtype == torch.float8_e4m3fn or scale_key in sf_keys:
+                w_scale = tensors[scale_key]
+                deq = (raw_t.to(torch.float32) * w_scale.to(torch.float32)).to(dtype=target.dtype, device=target.device)
+                target.data.copy_(deq)
+            else:
+                target.data.copy_(raw_t.to(dtype=target.dtype, device=target.device))
+            loaded.add(key)
+
+    if hasattr(getattr(model, 'spark', None), 'tie_weights'):
+        model.spark.tie_weights()
+    missing = set(param_map.keys()) - loaded - {'spark.lm_head.weight'}
+    if missing:
+        raise RuntimeError(f'Missing parameters when loading SparkNative safetensors: {sorted(missing)[:8]}')
+
+
 class SparkNative(nn.Module):
     main_input_name='input_ids'
     supports_gradient_checkpointing=True
@@ -307,8 +585,8 @@ class SparkNative(nn.Module):
             if hasattr(self.vision,'vision_model'): self.vision.vision_model.use_head=False
             self.image_processor=components['image_processor']
         else:
-            from transformers import (AutoConfig,AutoModelForCausalLM,AutoTokenizer,Siglip2VisionModel,Siglip2VisionConfig,AutoImageProcessor)
-            self.spark=(AutoModelForCausalLM.from_pretrained(paths['spark'],trust_remote_code=True,local_files_only=True,dtype=spark_dtype,attn_implementation='eager') if pretrained else AutoModelForCausalLM.from_config(AutoConfig.from_pretrained(paths['spark'],trust_remote_code=True,local_files_only=True),trust_remote_code=True,attn_implementation='eager').to(dtype=spark_dtype))
+            from transformers import (AutoTokenizer,Siglip2VisionModel,Siglip2VisionConfig,AutoImageProcessor)
+            self.spark=load_spark_backbone(paths['spark'],spark_dtype=spark_dtype,pretrained=pretrained)
             install_spark_sdpa(self.spark)
             self.tokenizer=AutoTokenizer.from_pretrained(paths['spark'],trust_remote_code=True,local_files_only=True)
             if self.tokenizer.pad_token_id is None: self.tokenizer.pad_token=self.tokenizer.eos_token
@@ -939,9 +1217,9 @@ class SparkNative(nn.Module):
         total=hidden.new_zeros((),dtype=torch.float32)
         from torch.utils.checkpoint import checkpoint
         for start in range(0,ids.shape[1],128):
-            hs=hidden[:,start:start+128]; labels=ids[:,start:start+128]
-            def ce(x,y): return F.cross_entropy(self.get_output_embeddings()(x).float().reshape(-1,self.config.vocab_size),y.flatten(),reduction='sum')
-            total=total+checkpoint(ce,hs,labels,use_reentrant=False)
+            hs_2d=hidden[:,start:start+128].reshape(-1,self.hidden); labels_1d=ids[:,start:start+128].reshape(-1)
+            def ce(x,y): return F.cross_entropy(self.get_output_embeddings()(x).float().reshape(-1,self.config.vocab_size),y,reduction='sum')
+            total=total+checkpoint(ce,hs_2d,labels_1d,use_reentrant=False)
         return total/ids.numel(),ids.numel()
 
     def text_batch_loss(self,examples):
@@ -986,8 +1264,9 @@ class SparkNative(nn.Module):
                 start=p_ids.shape[1]-1; count=a_ids.shape[1]
                 hs=hidden[i:i+1,start:start+count]; total=hidden.new_zeros((),dtype=torch.float32)
                 for offset in range(0,count,128):
-                    def ce(x,y): return F.cross_entropy(self.get_output_embeddings()(x).float().reshape(-1,self.config.vocab_size),y.flatten(),reduction='sum')
-                    total=total+checkpoint(ce,hs[:,offset:offset+128],a_ids[:,offset:offset+128],use_reentrant=False)
+                    hs_2d=hs[:,offset:offset+128].reshape(-1,self.hidden); lbl_1d=a_ids[:,offset:offset+128].reshape(-1)
+                    def ce(x,y): return F.cross_entropy(self.get_output_embeddings()(x).float().reshape(-1,self.config.vocab_size),y,reduction='sum')
+                    total=total+checkpoint(ce,hs_2d,lbl_1d,use_reentrant=False)
                 losses.append(total/count); units.append(count)
             return losses,units
 
@@ -1015,8 +1294,9 @@ class SparkNative(nn.Module):
             start=prefix.shape[1]-1; count=ids.shape[1]
             hs=hidden[i:i+1,start:start+count]; total=hidden.new_zeros((),dtype=torch.float32)
             for offset in range(0,count,128):
-                def ce(x,y): return F.cross_entropy(self.get_output_embeddings()(x).float().reshape(-1,self.config.vocab_size),y.flatten(),reduction='sum')
-                total=total+checkpoint(ce,hs[:,offset:offset+128],ids[:,offset:offset+128],use_reentrant=False)
+                hs_2d=hs[:,offset:offset+128].reshape(-1,self.hidden); lbl_1d=ids[:,offset:offset+128].reshape(-1)
+                def ce(x,y): return F.cross_entropy(self.get_output_embeddings()(x).float().reshape(-1,self.config.vocab_size),y,reduction='sum')
+                total=total+checkpoint(ce,hs_2d,lbl_1d,use_reentrant=False)
             losses.append(total/count); units.append(count)
         return losses,units
 

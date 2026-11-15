@@ -109,6 +109,8 @@ def validate_config(c):
         raise ValueError(f"Unknown hardware_profile {c['hardware_profile']!r}")
     if 'modalities' in c and c['modalities'] not in ('vision_text','omni'):
         raise ValueError(f"Unknown modalities {c['modalities']!r}")
+    if 'spark_component' in c and c['spark_component'] not in ('spark','spark_fp8'):
+        raise ValueError(f"Unknown spark_component {c['spark_component']!r}")
     if 'visual_cross_attn_blocks' in c and c['visual_cross_attn_blocks'] not in (0,3,6):
         raise ValueError('visual_cross_attn_blocks must be one of (0, 3, 6)')
     if 'apollo_rank' in c and (type(c['apollo_rank']) is not int or c['apollo_rank']<1):
