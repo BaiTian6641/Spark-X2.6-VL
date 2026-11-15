@@ -420,6 +420,9 @@ def qualify(campaign):
                 emit('qualification_step',family=fam,step=i+1,loss=float(loss.detach()),supervised_units=units,seconds=seconds)
     finally:
         accumulator.close()
+        del accumulator
+        gc.collect()
+        torch.cuda.empty_cache()
 
     if model.frozen_parameter_hashes()!=frozen_hashes_initial:
         raise RuntimeError('Frozen parameters (e.g., SigLIP2) mutated during full-Spark qualification')
@@ -493,6 +496,9 @@ def qualify(campaign):
             continuation.append(float(loss.detach()))
     finally:
         acc_cont.close()
+        del acc_cont
+        gc.collect()
+        torch.cuda.empty_cache()
 
     tol=5e-3 if c.get('optimizer_profile','').startswith('apollo') else 1e-4
     profile['continuation']={'ids':next_ids,'losses':continuation,'parameter_samples':sample_parameters(model),'tolerance':tol}
@@ -546,6 +552,9 @@ def recovery_check(campaign,profile):
                 losses.append(float(loss.detach()))
         finally:
             acc.close()
+            del acc
+            gc.collect()
+            torch.cuda.empty_cache()
     else:
         for rid in expected['ids']:
             row,media=campaign.media(rid); optimizer.zero_grad(set_to_none=True)

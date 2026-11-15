@@ -102,12 +102,11 @@
       "name": "vision_cross_attn_expansion",
       "families": [
         "image",
-        "text"
+        "video"
       ],
       "epochs": 1,
       "alignment_only": true,
-      "stage_mode": "frozen_spark_cross_attn",
-      "replay_fraction": 0.15
+      "stage_mode": "frozen_spark_cross_attn"
     },
     {
       "name": "vision_synccraft_static_full",

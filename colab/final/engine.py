@@ -421,7 +421,7 @@ class Campaign:
     def __init__(self,config,paths,source_sha,token=None,key=None):
         self.c=config; self.root=Path(config['work_root']); self.paths=paths; self.bound=binding(config,source_sha)
         from .storage import ColdStore
-        self.store=ColdStore(self.root,config,self.bound,token); self.catalogue=Catalogue(self.root/'metadata/corpus.sqlite')
+        self.store=ColdStore(self.root,config,self.bound,token); self.catalogue=Catalogue(self.root/'metadata/corpus.sqlite',modalities=config.get('modalities','omni'))
         local_handoff=self.root/'metadata/HANDOFF.json'
         handoff_doc=read(local_handoff) if local_handoff.is_file() else read(HERE.parent/'formal/HF_FULL_DATASET_HANDOFF.json')
         self.reader=MediaReader(self.root,handoff_doc,config,token,reserve=2*config['initial_checkpoint_reservation_bytes'])
@@ -606,7 +606,10 @@ class Campaign:
                     window_tokens+=mb_units
                     mb_weight=(mb_units/max(1,len(batch['examples']))) if norm_mode=='per_token' else 1.0
                     with accumulator.microbatch(weight=mb_weight,supervised_units=mb_units):
-                        micro_loss_sum.backward()
+                        if micro_loss_sum.requires_grad:
+                            micro_loss_sum.backward()
+                        elif not stage.get('alignment_only',False):
+                            raise RuntimeError('Full-Spark microbatch loss is detached from autograd graph')
                     window_microbatches+=1
 
                 should_step=(
@@ -670,6 +673,9 @@ class Campaign:
                     break
         finally:
             accumulator.close()
+            del accumulator
+            gc.collect()
+            if torch.cuda.is_available(): torch.cuda.empty_cache()
 
         self.save(optimizer,scheduler,cursor)
         if cursor.committed!=len(order):
@@ -959,7 +965,8 @@ class Campaign:
             if len(self.state.get('rsi_rounds',[]))!=self.c['instructor_rounds']: raise RuntimeError('Required instructed-RSI comparisons are incomplete')
         if phase in ('full','audit'):
             self.evaluate('audit','final-protected-audit',generate=True)
-            self.state.update(training_complete=True,final_audit_complete=True,human_audio_review='pending',capability_claims_verified=False,phase_result='audit_complete')
+            audio_review='not_applicable_vision_text' if self.c.get('modalities')=='vision_text' else 'pending'
+            self.state.update(training_complete=True,final_audit_complete=True,human_audio_review=audio_review,capability_claims_verified=False,phase_result='audit_complete')
             write(self.root/'CAMPAIGN.json',self.state); self.store.small_file(self.root/'CAMPAIGN.json','campaign-completion')
             from .publish import export_and_upload
             return export_and_upload(self,self.c)

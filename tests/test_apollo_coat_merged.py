@@ -606,3 +606,67 @@ def test_gradient_checkpointing_recomputation_with_visual_cross_attn_and_coat():
         assert stats2.finite and stats2.applied
     finally:
         acc.close()
+
+
+def test_accumulator_close_releases_buffers_and_vision_text_plan_filters_audio(tmp_path: Path):
+    import sqlite3
+    from colab.final.data import Catalogue
+
+    model = make_synthetic_spark_native({"visual_cross_attn_blocks": 3, "apollo_min_dim": 64})
+    model.set_stage(False, stage_mode="full_spark")
+    acc = MergedGradientAccumulator(
+        model,
+        accum_mode="bf16_apollo_fp32_small",
+        min_bf16_accum_dim=32,
+        allow_embeddings_in_apollo=True,
+    )
+    assert acc.buffer_bytes() > 0 and len(acc.buffers) > 0
+    acc.close()
+    assert acc.buffer_bytes() == 0
+    assert len(acc.buffers) == 0
+    assert len(acc.params) == 0
+
+    db_path = tmp_path / "corpus.sqlite"
+    con = sqlite3.connect(db_path)
+    con.executescript(
+        "CREATE TABLE packets(pid INTEGER, component TEXT, shard TEXT);"
+        "CREATE TABLE rows(rid TEXT, pid INTEGER, family TEXT, language TEXT, task TEXT, split TEXT);"
+    )
+    con.execute("INSERT INTO packets VALUES (1, 'comp', '0')")
+    rows = [
+        ("img-static", 1, "image", "en", "synccraft_part_grounding", "train"),
+        ("img-anim", 1, "image", "en", "synccraft_animation_pose", "train"),
+        ("vid-1", 1, "video", "en", "synccraft_animation_pose", "train"),
+        ("txt-1", 1, "text", "en", "text_replay", "train"),
+        ("aud-1", 1, "speech_in", "en", "speech_recognition", "train"),
+    ]
+    con.executemany("INSERT INTO rows VALUES (?, ?, ?, ?, ?, ?)", rows)
+    con.commit()
+    con.close()
+
+    cat = Catalogue(db_path)
+    order_align = cat.plan(
+        {"families": ["image"], "epochs": 1, "alignment_only": True, "replay_fraction": 1.0},
+        seed=7,
+        modalities="vision_text",
+    )
+    assert "aud-1" not in order_align
+    assert "txt-1" not in order_align
+    assert "vid-1" in order_align
+
+    order_static = cat.plan(
+        {
+            "families": ["image", "text"],
+            "epochs": 1,
+            "alignment_only": False,
+            "include_synccraft_animation": False,
+            "replay_fraction": 1.0,
+        },
+        seed=7,
+        modalities="vision_text",
+    )
+    assert "aud-1" not in order_static
+    assert "img-static" in order_static
+    assert "img-anim" not in order_static
+    assert "txt-1" in order_static
+

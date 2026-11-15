@@ -928,6 +928,9 @@ class MergedGradientAccumulator:
         for h in self._handles:
             h.remove()
         self._handles.clear()
+        self.buffers.clear()
+        self.params.clear()
+        self.param_names.clear()
 
     def buffer_bytes(self) -> int:
         return sum(buf.numel() * buf.element_size() for buf in self.buffers.values())

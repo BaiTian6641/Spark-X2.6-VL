@@ -216,7 +216,7 @@ def build_database(catalogue,db_path,config):
     db.close(); write(db_path.with_suffix('.report.json'),report); return report
 
 class Catalogue:
-    def __init__(self,db): self.db=sqlite3.connect(db); self.path=Path(db)
+    def __init__(self,db,modalities='omni'): self.db=sqlite3.connect(db); self.path=Path(db); self.modalities=modalities
     def row(self,rid):
         p=self.db.execute('SELECT p.body,r.variant,r.split,r.family,r.unit FROM rows r JOIN packets p USING(pid) WHERE rid=?',(rid,)).fetchone()
         if p is None: raise KeyError(rid)
@@ -233,14 +233,32 @@ class Catalogue:
         chosen=[rid for key in sorted(buckets) for rid in sorted(buckets[key],key=lambda x:identity([split,x]))[:per]]
         locations={r[0]:(r[3],r[4],r[0]) for r in items}
         return sorted(chosen,key=lambda rid:locations[rid])
-    def plan(self,stage,seed):
+    def plan(self,stage,seed,modalities=None):
+        eff_mod=modalities or getattr(self,'modalities','omni')
         rows=self.select('train',stage['families']); cap=stage.get('max_records_per_family')
+        allowed_sc=set(stage['synccraft_tasks']) if stage.get('synccraft_tasks') else None
+        exclude_sc_anim=(stage.get('include_synccraft_animation') is False)
+        if allowed_sc is not None or exclude_sc_anim:
+            cols={col[1] for col in self.db.execute('PRAGMA table_info(rows)')}
+            if 'task' in cols:
+                task_by_rid=dict(self.db.execute("SELECT rid,task FROM rows WHERE split='train'"))
+                filtered=[]
+                for r in rows:
+                    t=str(task_by_rid.get(r[0],'') or '')
+                    if t.startswith('synccraft_'):
+                        if exclude_sc_anim and ('animation' in t or 'motion' in t): continue
+                        if allowed_sc is not None and t not in allowed_sc: continue
+                    filtered.append(r)
+                if filtered: rows=filtered
         if cap:
             buckets=defaultdict(list)
             for r in rows: buckets[r[1]].append(r)
             rows=[r for fam in sorted(buckets) for r in sorted(buckets[fam],key=lambda x:identity([seed,x[0]]))[:cap]]
         if stage.get('replay_fraction'):
-            pool=[r for r in self.select('train') if r[1] not in stage['families']]
+            replay_fams=('image','video','text') if eff_mod=='vision_text' else FAMILIES
+            if stage.get('alignment_only'):
+                replay_fams=tuple(f for f in replay_fams if f!='text')
+            pool=[r for r in self.select('train',replay_fams) if r[1] not in stage['families']] if replay_fams else []
             random.Random(seed).shuffle(pool); rows+=pool[:round(len(rows)*stage['replay_fraction'])]
         order=[]
         for epoch in range(stage['epochs']):
