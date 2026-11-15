@@ -62,6 +62,9 @@ def export_and_upload(campaign,config):
     if (out/'MODEL_RELEASE.json').exists():
         release=read(out/'MODEL_RELEASE.json')
         if release['binding']!=campaign.bound or next(f['sha256'] for f in release['files'] if f['path']=='model.safetensors')!=sha(source/'model.safetensors'): raise ValueError('Existing closed export differs from the selected final checkpoint')
+        if config.get('checkpoint_backend')=='local' and not config.get('publish_to_huggingface',False):
+            emit('local_model_export_ready',directory=str(out),model_release_sha256=sha(out/'MODEL_RELEASE.json'))
+            return {'status':'local_export_closed','export_directory':str(out),'model_release_sha256':sha(out/'MODEL_RELEASE.json')}
         return upload_closed_export(campaign,config,out)
     keep={'model.safetensors','BINDING.json','PARAMETERS.json'}
     for path in source.rglob('*'):
@@ -101,6 +104,9 @@ def export_and_upload(campaign,config):
             for secret in (campaign._hf_token,campaign.key):
                 if secret and secret.encode() in payload: raise ValueError('Credential detected in final text artifact')
     files=manifest(out); write(out/'MODEL_RELEASE.json',{'schema_version':1,'campaign_id':config['campaign_id'],'binding':campaign.bound,'training_complete':True,**files})
+    if config.get('checkpoint_backend')=='local' and not config.get('publish_to_huggingface',False):
+        emit('local_model_export_ready',directory=str(out),model_release_sha256=sha(out/'MODEL_RELEASE.json'))
+        return {'status':'local_export_closed','export_directory':str(out),'model_release_sha256':sha(out/'MODEL_RELEASE.json')}
     return upload_closed_export(campaign,config,out)
 
 def _remote_bytes(repo,path,revision,token,limit):

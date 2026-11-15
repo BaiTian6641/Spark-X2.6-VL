@@ -163,19 +163,23 @@ def main(argv: list[str] | None = None) -> int:
             "manifest",
             "budget",
             "prepare-synccraft",
+            "prepare-assets",
             "doctor",
             "ablate",
             "pilot",
             "qualify",
             "recover",
             "train",
+            "run",
             "direct",
             "resume",
             "discover",
         ),
     )
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH, help="Campaign JSON config path")
-    parser.add_argument("--work-root", type=Path, default=None, help="Optional override for config work_root")
+    parser.add_argument("--work-root", "--root", dest="work_root", type=Path, default=None, help="Optional override for config work_root")
+    parser.add_argument("--dataset-mode", choices=("local_synccraft", "hf_full"), default=None, help="Dataset source override")
+    parser.add_argument("--steps", type=int, default=None, help="Number of optimizer updates per profile in ablate mode")
     parser.add_argument("--resume-receipt", type=str, default=None, help="Receipt JSON path for resume mode")
     parser.add_argument("--no-animation", action="store_true", help="Exclude Stage-B animation clips during static pilot prep")
     args = parser.parse_args(argv)
@@ -191,6 +195,13 @@ def main(argv: list[str] | None = None) -> int:
     raw_cfg = read(args.config)
     if args.work_root is not None:
         raw_cfg["work_root"] = str(args.work_root.resolve())
+    if args.dataset_mode is not None:
+        if args.dataset_mode == "hf_full":
+            raw_cfg.pop("dataset_mode", None)
+        else:
+            raw_cfg["dataset_mode"] = args.dataset_mode
+    if args.steps is not None:
+        raw_cfg["ablation_updates"] = max(1, int(args.steps))
     cfg = validate_config(raw_cfg)
     work_root = Path(cfg["work_root"])
     work_root.mkdir(parents=True, exist_ok=True)
@@ -216,7 +227,19 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"status": "ready", "work_root": str(work_root), "report": report}, indent=2))
         return 0
 
-    run_mode = "train" if args.command == "pilot" else args.command
+    if args.command == "prepare-assets":
+        from colab.final.assets import prepare_assets
+
+        paths = prepare_assets(
+            work_root,
+            os.environ.get("HF_TOKEN") or None,
+            cfg,
+            download_weights=True,
+        )
+        print(json.dumps({"status": "assets_ready", "work_root": str(work_root), "paths": {k: str(v) for k, v in paths.items()}}, indent=2))
+        return 0
+
+    run_mode = "train" if args.command in ("pilot", "run") else args.command
     extra: list[str] = []
     if args.resume_receipt:
         extra.extend(["--resume-receipt", args.resume_receipt])

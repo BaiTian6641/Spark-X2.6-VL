@@ -297,7 +297,7 @@ def dispatch(a,config,secrets):
             device='cuda',
             microbatch_size=int(config.get('microbatch_size',1)),
             accumulation_steps=max(1,int(config.get('gradient_accumulation',8))//max(1,int(config.get('microbatch_size',1)))),
-            num_updates=3,
+            num_updates=int(config.get('ablation_updates',3)),
         )
         write(root/'ABLATION_PROFILES.json',report)
         emit('ablation_profiles_complete',profiles=list(report['profiles'].keys()))

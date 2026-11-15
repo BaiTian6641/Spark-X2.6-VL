@@ -916,7 +916,7 @@ class Campaign:
             if missing: raise RuntimeError('Full fine-tune stages are incomplete: '+','.join(sorted(missing)))
         if phase=='audit' and len(self.state.get('rsi_rounds',[]))!=self.c['instructor_rounds']:
             raise RuntimeError('Both instructed-RSI rounds must complete before result checking')
-        if phase in ('full','rsi'): self.qualify_instructor_format()
+        if phase=='rsi' or (phase=='full' and int(self.c.get('instructor_rounds',0))>0): self.qualify_instructor_format()
         if not (self.root/'BASELINE.json').exists():
             base=self.evaluate('dev','pretrained-native-baseline',generate=True); write(self.root/'BASELINE.json',base); self.store.small_file(self.root/'BASELINE.json','baseline')
         if phase in ('full','train'):

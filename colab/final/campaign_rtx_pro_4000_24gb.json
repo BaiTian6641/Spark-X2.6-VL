@@ -4,6 +4,7 @@
   "work_root": "./work/spark-synccraft-24gb",
   "execution_target": "local_workstation",
   "hardware_profile": "rtx_pro_4000_blackwell_24gb",
+  "dataset_mode": "local_synccraft",
   "modalities": "vision_text",
   "spark_dtype": "bfloat16",
   "vision_dtype": "bfloat16",
@@ -138,11 +139,11 @@
       "replay_fraction": 0.2
     }
   ],
-  "evaluation_per_family_language": 32,
+  "evaluation_per_family_language": 16,
   "instructor_budget_usd": 50,
   "instructor_enabled": true,
   "instructor_model": "mimo-v2.6-pro",
-  "instructor_rounds": 2,
+  "instructor_rounds": 0,
   "instructor_records_per_round": 32,
   "instructor_per_request_reservation_usd": 0.5,
   "instructor_route_eligibility_receipt": null,
