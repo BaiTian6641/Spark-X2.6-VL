@@ -940,6 +940,8 @@ class MergedGradientAccumulator:
         self.microbatches_in_step = 0
         self.units_in_step = 0
 
+    zero_grad = zero_buffers
+
     class _MicrobatchScope:
         def __init__(self, owner: "MergedGradientAccumulator", weight: float, units: int):
             self.owner = owner

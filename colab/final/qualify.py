@@ -316,7 +316,7 @@ def qualify(campaign):
                 reference_norms={n:float(acc_parity.buffers[id(p)].detach().float().norm()) for n,p in model.named_parameters() if id(p) in acc_parity.buffers}
             finally:
                 module.eager_attention_forward=adapter
-            acc_parity.zero_grad()
+            acc_parity.zero_buffers()
             with torch.autocast('cuda',dtype=torch.bfloat16): candidate_loss,_=model.loss(row,media)
             candidate_value=float(candidate_loss.detach())
             with acc_parity.microbatch(weight=1.0,supervised_units=1):
