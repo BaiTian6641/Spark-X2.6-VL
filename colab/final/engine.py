@@ -611,6 +611,12 @@ class Campaign:
                     batch=None
 
                 if batch is not None:
+                    is_long_mb = use_cuda_amp and any(
+                        len(str(rw.get('prompt', ''))) + len(str(rw.get('answer', ''))) > 8000
+                        for rw, _ in batch['examples']
+                    )
+                    if is_long_mb:
+                        torch.cuda.empty_cache()
                     with amp_ctx(), coat_ctx():
                         result=self.model(examples=batch['examples'])
                         per=result.get('per_example_loss')
@@ -632,6 +638,7 @@ class Campaign:
                         raise RuntimeError('Nonfinite microbatch loss encountered; rolled back merged gradient buffer before step')
 
                     mb_units=max(1,int(result.get('supervised_units',len(batch['examples']))))
+                    result=per=weighted=None
                     window_tokens+=mb_units
                     mb_weight=(mb_units/max(1,len(batch['examples']))) if norm_mode=='per_token' else 1.0
                     with accumulator.microbatch(weight=mb_weight,supervised_units=mb_units):
@@ -639,6 +646,9 @@ class Campaign:
                             micro_loss_sum.backward()
                         elif not stage.get('alignment_only',False):
                             raise RuntimeError('Full-Spark microbatch loss is detached from autograd graph')
+                    micro_loss_sum=None
+                    if is_long_mb:
+                        torch.cuda.empty_cache()
                     window_microbatches+=1
 
                 should_step=(
