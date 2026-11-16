@@ -116,6 +116,14 @@ def validate_config(c):
         raise ValueError('visual_cross_attn_blocks must be one of (0, 3, 6)')
     if 'apollo_rank' in c and (type(c['apollo_rank']) is not int or c['apollo_rank']<1):
         raise ValueError('apollo_rank must be a positive integer')
+    if c.get('init_from_release_dir') is not None:
+        if not isinstance(c['init_from_release_dir'], str) or not c['init_from_release_dir'].strip():
+            raise ValueError('init_from_release_dir must be a non-empty path string when specified')
+        local(c['init_from_release_dir'], execution_target=target)
+    if 'vision_rsi_rounds' in c and (type(c['vision_rsi_rounds']) is not int or not 0 <= c['vision_rsi_rounds'] <= 8):
+        raise ValueError('vision_rsi_rounds must be an integer between 0 and 8')
+    if 'rsi_mode' in c and c['rsi_mode'] not in ('instructor', 'vision_self_improvement'):
+        raise ValueError('rsi_mode must be instructor or vision_self_improvement')
     if any(k in c for k in ('HF_TOKEN','OPENCODE_API_KEY','token','api_key')): raise ValueError('Secrets do not belong in configuration')
     return c
 

@@ -242,7 +242,8 @@ def _valid_recovery_proof(proof,profile):
 def direct(config,token,key,source_sha):
     phase=config.get('run_phase','full')
     if phase not in ('full','train','rsi','audit'): raise ValueError('Expected run_phase full, train, rsi or audit')
-    needs_instructor=(phase=='rsi') or (phase=='full' and int(config.get('instructor_rounds',0))>0)
+    is_vision_rsi=(config.get('rsi_mode')=='vision_self_improvement' or int(config.get('vision_rsi_rounds',0))>0)
+    needs_instructor=((phase=='rsi' and not is_vision_rsi) or (phase=='full' and int(config.get('instructor_rounds',0))>0 and not is_vision_rsi))
     if needs_instructor and not key: raise ValueError('OPENCODE_API_KEY is required for instructor rounds')
     from .teacher import eligibility
     eligibility(config)

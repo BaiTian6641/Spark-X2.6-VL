@@ -39,36 +39,84 @@ SUPPORTED_EXPORT_FORMATS = (
     "labpbr",
 )
 
-SYNCCRAFT_V32_GRAMMAR_SYSTEM_PROMPT = """You author valid SyncCraft Block-DSL v3.2 3D assets. Every Block-DSL v3.2 program MUST strictly obey this syntax:
+SYNCCRAFT_V32_GRAMMAR_SYSTEM_PROMPT = """You author valid, artist-grade SyncCraft Block-DSL v3.2 3D assets with rich anatomical/architectural hierarchy (never simplistic 5-9 box headless toys). Every Block-DSL v3.2 program MUST strictly obey this syntax:
 ```blockdsl
 @meta { archetype: entity, target_profile: bedrock_entity, texel_density: 16, audit_profile: strict }
 @palette {
-  pelt_mat: ramp(base_lch=[0.64, 0.11, 42], steps=6)
-  hoof_mat: ramp(base_lch=[0.4, 0.06, 132], steps=6)
+  coat_fur: ramp(base_lch=[0.58, 0.10, 48], steps=6)
+  underbelly_fur: ramp(base_lch=[0.76, 0.05, 68], steps=6)
+  armor_plate: ramp(base_lch=[0.42, 0.08, 245], steps=6)
+  dark_keratin: ramp(base_lch=[0.26, 0.03, 35], steps=6)
+  amber_glow: ramp(base_lch=[0.80, 0.17, 78], steps=6, emissive=true)
 }
 @rig {
-  root bone body_root {
-    pivot_local: [0, 10, 0]
-    box torso { size: [6, 5, 9], material: pelt_mat }
-    bone fl_thigh attach(parent_box=torso, anchor=[-1, -0.6, -0.6], align=[1, 1, 0]) mirror_x(fr_thigh) {
-      box fl_thigh_seg { size: [2, 4, 2], material: pelt_mat }
-      bone fl_shin attach(parent_box=fl_thigh_seg, anchor=[0, -1, 0], align=[0, 1, 0]) {
-        box fl_shin_seg { size: [2, 4, 2], material: hoof_mat }
+  root bone pelvis_root {
+    pivot_local: [0, 12, 0]
+    box ribcage { size: [6, 6, 7], material: coat_fur }
+    box chest_armor place(base_box=ribcage, anchor=[0, 1, -0.2], align=[0, -1, 0]) {
+      size: [6, 1, 5], material: armor_plate, inflate: 0.2
+    }
+    box belly_trim place(base_box=ribcage, anchor=[0, -1, 0.1], align=[0, 1, 0]) {
+      size: [4, 1, 5], material: underbelly_fur
+    }
+    box pelvis place(base_box=ribcage, anchor=[0, 0.15, 1], align=[0, 0, -1]) {
+      size: [5, 5, 5], material: coat_fur
+    }
+    bone neck attach(parent_box=ribcage, anchor=[0, 0.5, -1], align=[0, -0.5, 1]) {
+      box neck_core { size: [4, 4, 3], material: coat_fur }
+      box collar_crest place(base_box=neck_core, anchor=[0, 1, 0.2], align=[0, -1, 0]) {
+        size: [4, 1, 2], material: armor_plate
+      }
+      bone head attach(parent_box=neck_core, anchor=[0, 0.3, -1], align=[0, -0.5, 1]) {
+        box skull { size: [5, 4, 4], material: coat_fur }
+        box brow_crest place(base_box=skull, anchor=[0, 1, -0.4], align=[0, -1, 0]) {
+          size: [1, 1, 2], material: amber_glow
+        }
+        box muzzle place(base_box=skull, anchor=[0, 0.15, -1], align=[0, 0, 1]) {
+          size: [3, 2, 3], material: underbelly_fur
+        }
+        box nose_tip place(base_box=muzzle, anchor=[0, 0.5, -1], align=[0, 0, 1]) {
+          size: [1, 1, 1], material: dark_keratin
+        }
+        box lower_jaw place(base_box=skull, anchor=[0, -0.75, -1], align=[0, 0, 1]) {
+          size: [3, 1, 2], material: dark_keratin
+        }
+        bone left_ear attach(parent_box=skull, anchor=[-0.8, 1, 0.4], align=[0, -1, 0]) mirror_x(right_ear) {
+          box left_ear_pinna { size: [1, 3, 2], material: dark_keratin }
+        }
       }
     }
-    bone hl_thigh attach(parent_box=torso, anchor=[-1, -0.6, 0.6], align=[1, 1, 0]) mirror_x(hr_thigh) {
-      box hl_thigh_seg { size: [2, 4, 2], material: pelt_mat }
+    bone tail_base attach(parent_box=pelvis, anchor=[0, 0.6, 1], align=[0, 0, -1]) {
+      box tail_prox { size: [2, 2, 4], material: coat_fur }
+      bone tail_tip attach(parent_box=tail_prox, anchor=[0, 0, 1], align=[0, 0, -1]) {
+        box tail_plume { size: [2, 2, 4], material: underbelly_fur }
+      }
+    }
+    bone fl_thigh attach(parent_box=ribcage, anchor=[-1, -0.5, -0.6], align=[1, 1, 0]) mirror_x(fr_thigh) {
+      box fl_thigh_seg { size: [2, 4, 2], material: armor_plate }
+      bone fl_shin attach(parent_box=fl_thigh_seg, anchor=[0, -1, 0], align=[0, 1, 0]) {
+        box fl_shin_seg { size: [2, 4, 2], material: coat_fur }
+        box fl_paw place(base_box=fl_shin_seg, anchor=[0, -1, -0.25], align=[0, 1, 0]) {
+          size: [2, 1, 3], material: dark_keratin
+        }
+      }
+    }
+    bone hl_thigh attach(parent_box=pelvis, anchor=[-1, -0.5, 0.4], align=[1, 1, 0]) mirror_x(hr_thigh) {
+      box hl_thigh_seg { size: [2, 4, 2], material: coat_fur }
       bone hl_shin attach(parent_box=hl_thigh_seg, anchor=[0, -1, 0], align=[0, 1, 0]) {
-        box hl_shin_seg { size: [2, 4, 2], material: hoof_mat }
+        box hl_shin_seg { size: [2, 4, 2], material: coat_fur }
+        box hl_paw place(base_box=hl_shin_seg, anchor=[0, -1, -0.25], align=[0, 1, 0]) {
+          size: [2, 1, 3], material: dark_keratin
+        }
       }
     }
   }
 }
 @kinematics {
-  ik_chain fl_leg_ik { upper: fl_thigh, lower: fl_shin, effector: [0, -4, 0] }
-  ik_chain fr_leg_ik { upper: fr_thigh, lower: fr_thigh__fl_shin, effector: [0, -4, 0] }
-  ik_chain hl_leg_ik { upper: hl_thigh, lower: hl_shin, effector: [0, -4, 0] }
-  ik_chain hr_leg_ik { upper: hr_thigh, lower: hr_thigh__hl_shin, effector: [0, -4, 0] }
+  ik_chain fl_leg_ik { upper: fl_thigh, lower: fl_shin, effector: [0, -5, 0] }
+  ik_chain fr_leg_ik { upper: fr_thigh, lower: fr_thigh__fl_shin, effector: [0, -5, 0] }
+  ik_chain hl_leg_ik { upper: hl_thigh, lower: hl_shin, effector: [0, -5, 0] }
+  ik_chain hr_leg_ik { upper: hr_thigh, lower: hr_thigh__hl_shin, effector: [0, -5, 0] }
 }
 @behavior {
   clip walk_cycle {
@@ -80,12 +128,153 @@ SYNCCRAFT_V32_GRAMMAR_SYSTEM_PROMPT = """You author valid SyncCraft Block-DSL v3
   }
 }
 ```
-Mandatory syntax rules:
-1. `@meta` ONLY accepts `archetype`, `target_profile`, `texel_density`, and optional `audit_profile` (`strict` | `sculpted` | `authored`) — never `version` or `domain`.
-2. `@palette` entries MUST use `mat_name: ramp(base_lch=[L, C, H], steps=6)` — never `#hex` or `rgb(...)`.
-3. Box `size: [W, H, D]` MUST be 3 positive INTEGER literals in square brackets `[W, H, D]` (never floats or parentheses).
+Mandatory syntax & aesthetic quality rules:
+1. `@meta` ONLY accepts `archetype`, `target_profile`, `texel_density`, and optional `audit_profile` (`strict` | `sculpted` | `authored`) — never `version` or `domain`. Section order: `@meta`, `@palette`, `@rig`, optional `@materials`, optional `@style`, optional `@muscles`, optional `@kinematics`, optional `@behavior`.
+2. `@palette` entries MUST use `mat_name: ramp(base_lch=[L, C, H], steps=6)` — never `#hex` or `rgb(...)`. Use 3 to 6 distinct harmonious OKLCH ramps for primary mass, secondary trim/underbelly, armor/structure, dark keratin/joints, and focal accents.
+3. Box `size: [W, H, D]` MUST be 3 positive INTEGER literals in square brackets `[W, H, D]` (never floats or parentheses). Vary proportions across primary, secondary, and tertiary detail boxes.
 4. Child bones MUST attach cleanly via `attach(parent_box=<box>, anchor=[ax, ay, az], align=[lx, ly, lz])` so faces touch with 0 SAT penetration and 0 air gap.
-5. Every bone and box identifier MUST be unique; when a bone declares `mirror_x(right_name)`, NEVER declare a separate `bone right_name` block (mirror_x expands it automatically)."""
+5. Every bone and box identifier MUST be unique; when a bone declares `mirror_x(right_name)`, NEVER declare a separate `bone right_name` block (`mirror_x` expands it automatically).
+6. Author complete artist-grade silhouettes (16–48 boxes for entities/creatures/vehicles): include distinct trunk/ribcage + pelvis/base, articulated neck + head/skull + muzzle/jaw/ears/crest, multi-segment tail or secondary appendages, 3-part limbs (thigh/upper + shin/lower + paw/foot), and layered armor/trim plates."""
+
+
+def evaluate_3d_asset_aesthetics(
+    program_or_dsl: Any,
+    *,
+    prompt: str = "",
+) -> dict[str, Any]:
+    """Perform quantitative structural, anatomical, material, and anti-toy aesthetic judgment on a Block-DSL asset."""
+    ensure_synccraft_importable()
+    from synccraft.audit.sync_audit import audit_scene
+    from synccraft.dsl.ast_nodes import Program, validate_program
+    from synccraft.dsl.parser import parse_program
+    from synccraft.kinematics.se3_chain import compile_geometry
+    from synccraft.world.artist_loop import analyze_artist_project
+
+    prog = validate_program(program_or_dsl) if isinstance(program_or_dsl, Program) else validate_program(parse_program(str(program_or_dsl)))
+    scene = compile_geometry(prog)
+    enforce_contact = getattr(prog.meta, "audit_profile", "strict") != "authored"
+    aud = audit_scene(scene, enforce_physical_contact=enforce_contact)
+    critique = analyze_artist_project(prog)
+
+    n_boxes = len(scene.boxes)
+    n_bones = len(scene.bones)
+    max_depth = int(critique.max_bone_depth)
+    n_palettes = len(prog.palettes)
+    n_materials = len(getattr(prog, "materials", ()) or ())
+    used_materials = {b.material for b in scene.boxes}
+    unique_sizes = {tuple(int(x) for x in b.size) for b in scene.boxes}
+
+    all_names_low = " ".join([*(b.name.lower() for b in scene.boxes), *(bn.name.lower() for bn in scene.bones)])
+    is_entity = prog.meta.archetype == "entity" or any(
+        w in str(prompt or "").lower()
+        for w in ("hound", "dog", "wolf", "wyvern", "dragon", "creature", "beast", "horse", "quadruped", "walker", "mech", "sentinel", "character", "bird")
+    )
+
+    has_head_group = any(
+        k in all_names_low for k in ("head", "skull", "snout", "muzzle", "jaw", "beak", "helm", "turret", "cockpit", "visor", "crest", "eye")
+    )
+    has_axial_group = any(
+        k in all_names_low for k in ("torso", "ribcage", "chest", "body", "pelvis", "spine", "hull", "chassis", "pedestal", "frame", "core")
+    )
+    has_limb_group = any(
+        k in all_names_low for k in ("thigh", "shin", "leg", "arm", "wing", "paw", "foot", "hoof", "claw", "fin", "wheel", "link")
+    )
+    has_secondary_group = any(
+        k in all_names_low for k in ("tail", "ear", "horn", "plate", "armor", "collar", "trim", "plume", "crest", "antenna", "banner", "brow", "nose")
+    )
+
+    critique_notes: list[str] = []
+    if not aud["passed"]:
+        critique_notes.append(
+            f"Resolve {len(aud['collision_pairs'])} SAT collision(s) and {len(aud['contact_violations'])} contact violation(s)."
+        )
+
+    # 1. Complexity & Part Hierarchy Score (0..1)
+    target_boxes = 18 if is_entity else 10
+    complexity_score = min(1.0, n_boxes / float(target_boxes))
+    if is_entity and n_boxes < 12:
+        critique_notes.append(
+            f"Asset has only {n_boxes} boxes (toy blockout); expand to >= 18 boxes with primary, secondary, and tertiary silhouette details."
+        )
+    elif not is_entity and n_boxes < 6:
+        critique_notes.append(
+            f"Asset has only {n_boxes} boxes; add secondary structural trim, bevels, or sub-assemblies."
+        )
+
+    hierarchy_score = min(1.0, 0.5 * min(1.0, n_bones / (8.0 if is_entity else 3.0)) + 0.5 * min(1.0, max_depth / (2.0 if is_entity else 1.0)))
+    if is_entity and n_bones < 6:
+        critique_notes.append(
+            f"Only {n_bones} bone(s) declared; articulate separate neck, head, tail, and multi-segment limb chains."
+        )
+
+    # 2. Anatomical / Architectural Landmark Completeness (0..1)
+    if is_entity:
+        landmarks = [has_head_group, has_axial_group, has_limb_group, has_secondary_group]
+        landmark_score = sum(1.0 for x in landmarks if x) / 4.0
+        if not has_head_group:
+            critique_notes.append("Missing cranial/head assembly (add neck + skull + muzzle/jaw/visor/crest).")
+        if not has_secondary_group:
+            critique_notes.append("Missing secondary silhouette landmarks (add ears/horns, multi-segment tail, chest/collar armor, or paws).")
+    else:
+        landmark_score = min(1.0, 0.5 * float(has_axial_group) + 0.5 * min(1.0, len(unique_sizes) / 3.0))
+
+    # 3. Proportion & Material Contrast Score (0..1)
+    variety_score = min(1.0, len(unique_sizes) / (5.0 if is_entity else 3.0))
+    if len(unique_sizes) <= 2 and n_boxes >= 5:
+        critique_notes.append(
+            f"Only {len(unique_sizes)} unique integer box size(s) used; vary primary trunk, tapered pelvis/neck, and fine extremity dimensions."
+        )
+    mat_score = min(1.0, max(len(used_materials), n_palettes) / (4.0 if is_entity else 2.5))
+    if len(used_materials) < 3 and is_entity:
+        critique_notes.append(
+            f"Only {len(used_materials)} material ramp(s) applied across boxes; use >= 4 contrasting OKLCH ramps (coat/hull, underbelly/trim, armor/metal, dark keratin/emissive)."
+        )
+
+    phys_score = 1.0 if aud["passed"] else max(0.0, 1.0 - 0.25 * len(aud["collision_pairs"]) - 0.2 * len(aud["contact_violations"]))
+    aesthetic_score = round(
+        0.26 * complexity_score
+        + 0.18 * hierarchy_score
+        + 0.22 * landmark_score
+        + 0.14 * variety_score
+        + 0.10 * mat_score
+        + 0.10 * phys_score,
+        4,
+    )
+
+    is_toy_like = bool(
+        (is_entity and (n_boxes < 12 or not has_head_group or len(unique_sizes) <= 2))
+        or (not is_entity and n_boxes < 4)
+        or aesthetic_score < 0.58
+    )
+    if aesthetic_score >= 0.76 and not is_toy_like and aud["passed"]:
+        grade = "artist_grade"
+    elif not is_toy_like and aesthetic_score >= 0.60:
+        grade = "intermediate_asset"
+    else:
+        grade = "toy_blockout"
+
+    return {
+        "aesthetic_score": aesthetic_score,
+        "artist_readiness_score": round(float(critique.readiness_score), 4),
+        "grade": grade,
+        "is_toy_like": is_toy_like,
+        "is_entity": is_entity,
+        "static_audit_passed": bool(aud["passed"]),
+        "box_count": n_boxes,
+        "bone_count": n_bones,
+        "max_bone_depth": max_depth,
+        "palette_count": n_palettes,
+        "used_material_count": len(used_materials),
+        "physical_material_spec_count": n_materials,
+        "unique_box_sizes": len(unique_sizes),
+        "landmarks": {
+            "head_or_focal": has_head_group,
+            "axial_core": has_axial_group,
+            "limbs_or_actuators": has_limb_group,
+            "secondary_silhouette": has_secondary_group,
+        },
+        "critique_notes": critique_notes,
+    }
 
 
 def _extract_clean_blockdsl(raw_text: str) -> str:
@@ -503,10 +692,14 @@ class SyncCraftWorldPipeline:
         max_reaudits: int = 3,
         max_projection_steps_per_reaudit: int = 8,
         max_new_tokens: int | None = None,
+        min_aesthetic_score: float | None = None,
         seed: int = 0,
     ) -> dict[str, Any]:
-        """Generate, repair (<= 3 re-audits + PGD + model feedback), audit, bake, and export a 3D asset."""
+        """Generate, repair (<= 3 re-audits + PGD + model feedback), aesthetic-critique, bake, and export a 3D asset."""
         ensure_synccraft_importable()
+        import io
+        from PIL import Image
+        from synccraft.dsl.parser import format_program
         from synccraft.evaluation.budget import CostLedger
         from synccraft.modeling.repair_loop import run_bounded_repair_policy
 
@@ -534,6 +727,66 @@ class SyncCraftWorldPipeline:
             enforce_physical_contact=True,
         )
 
+        aesthetic_eval: dict[str, Any] | None = None
+        aesthetic_upgraded = False
+        eff_min_aes = (
+            float(min_aesthetic_score)
+            if min_aesthetic_score is not None
+            else (float(self.config["min_aesthetic_score"]) if "min_aesthetic_score" in self.config else None)
+        )
+
+        if repair_result["passed"] and repair_result["program"] is not None:
+            aesthetic_eval = evaluate_3d_asset_aesthetics(repair_result["program"], prompt=prompt)
+            if (
+                eff_min_aes is not None
+                and (aesthetic_eval["is_toy_like"] or float(aesthetic_eval["aesthetic_score"]) < eff_min_aes)
+                and int(repair_result["reaudits_used"]) < int(max_reaudits)
+            ):
+                rem_reaudits = max(1, int(max_reaudits) - int(repair_result["reaudits_used"]))
+                preview_imgs = images
+                if not preview_imgs:
+                    try:
+                        ws_prev = build_default_world_state_for_program(repair_result["program"], seed=seed)
+                        png_map, _, _, _ = render_world_views_rgba(ws_prev, panel_size=(144, 144))
+                        preview_imgs = [Image.open(io.BytesIO(png_map[v])) for v in ("south", "right", "top", "iso")]
+                    except Exception:
+                        preview_imgs = None
+                aes_prompt = (
+                    f"Your initial SyncCraft v3.2 asset compiled cleanly ({aesthetic_eval['box_count']} boxes, "
+                    f"aesthetic_score={aesthetic_eval['aesthetic_score']:.3f}, grade={aesthetic_eval['grade']!r}), "
+                    "but failed the artist-grade richness gate:\n"
+                    + "\n".join(f"- {n}" for n in aesthetic_eval["critique_notes"])
+                    + f"\n\nOriginal request:\n{prompt.strip()}\n\n"
+                    f"Initial Block-DSL blockout:\n```blockdsl\n{format_program(repair_result['program'])}\n```\n\n"
+                    "Upgrade this blockout into an artist-grade 18–42 box articulated SyncCraft Block-DSL v3.2 asset "
+                    "with complete cranial/head anatomy, tapered trunk/pelvis, secondary armor/trim, >=4 OKLCH ramps, "
+                    "and zero 15-axis SAT collisions."
+                )
+
+                def _upgrade_gen(_spec: Any = None) -> tuple[str, int]:
+                    txt, toks = self._invoke_model(aes_prompt, images=preview_imgs, attempt=0, max_new_tokens=max_new_tokens)
+                    raw_generations.append(txt)
+                    return txt, toks
+
+                upgrade_res = run_bounded_repair_policy(
+                    _upgrade_gen,
+                    prompt_spec if prompt_spec is not None else {},
+                    ledger,
+                    max_reaudits=rem_reaudits - 1,
+                    model_repair_fn=_repair_callback,
+                    max_projection_steps_per_reaudit=int(max_projection_steps_per_reaudit),
+                    enforce_physical_contact=True,
+                )
+                if upgrade_res["passed"] and upgrade_res["program"] is not None:
+                    cand_aes = evaluate_3d_asset_aesthetics(upgrade_res["program"], prompt=prompt)
+                    if float(cand_aes["aesthetic_score"]) > float(aesthetic_eval["aesthetic_score"]):
+                        repair_result = {
+                            **upgrade_res,
+                            "reaudits_used": int(repair_result["reaudits_used"]) + 1 + int(upgrade_res["reaudits_used"]),
+                        }
+                        aesthetic_eval = cand_aes
+                        aesthetic_upgraded = True
+
         bundle_report: dict[str, Any] | None = None
         if repair_result["passed"] and repair_result["program"] is not None:
             bundle_report = export_program_bundle(
@@ -555,6 +808,8 @@ class SyncCraftWorldPipeline:
             "failure_reason": repair_result["failure_reason"],
             "boxes": int(repair_result["boxes"]),
             "bones": int(repair_result["bones"]),
+            "aesthetic_upgraded": aesthetic_upgraded,
+            "aesthetic_evaluation": aesthetic_eval,
             "canonical_ast_sha256": repair_result["canonical_ast_sha256"],
             "final_dsl": repair_result["final_dsl"],
             "raw_generation_count": len(raw_generations),

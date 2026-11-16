@@ -123,6 +123,7 @@ SYNCCRAFT_TASKS: tuple[str, ...] = (
     "synccraft_behavior_animation",
     "synccraft_world_capability",
     "synccraft_artist_assistant",
+    "synccraft_visual_aesthetic_judgment",
 )
 
 ARTIST_ASSISTANT_MODES: tuple[str, ...] = (
@@ -853,9 +854,220 @@ def build_typed_scene_edit_record(
     return row, media_payloads
 
 
-def build_animated_quadruped_program(variant: int = 0) -> Program:
+SENTINEL_HOUND_V32_DSL: str = """
+@meta { archetype: entity, target_profile: bedrock_entity, texel_density: 16, audit_profile: strict }
+@palette {
+  coat_fur: ramp(base_lch=[0.58, 0.10, 48], steps=6)
+  underbelly_fur: ramp(base_lch=[0.76, 0.05, 68], steps=6)
+  armor_plate: ramp(base_lch=[0.42, 0.08, 245], steps=6)
+  dark_keratin: ramp(base_lch=[0.26, 0.03, 35], steps=6)
+  amber_glow: ramp(base_lch=[0.80, 0.17, 78], steps=6, emissive=true)
+}
+@rig {
+  root bone pelvis_root {
+    pivot_local: [0, 12, 0]
+    box ribcage { size: [6, 6, 7], material: coat_fur }
+    box chest_armor place(base_box=ribcage, anchor=[0, 1, -0.2], align=[0, -1, 0]) {
+      size: [6, 1, 5], material: armor_plate, inflate: 0.2
+    }
+    box belly_trim place(base_box=ribcage, anchor=[0, -1, 0.1], align=[0, 1, 0]) {
+      size: [4, 1, 5], material: underbelly_fur
+    }
+    box pelvis place(base_box=ribcage, anchor=[0, 0.15, 1], align=[0, 0, -1]) {
+      size: [5, 5, 5], material: coat_fur
+    }
+    bone neck attach(parent_box=ribcage, anchor=[0, 0.5, -1], align=[0, -0.5, 1]) {
+      box neck_core { size: [4, 4, 3], material: coat_fur }
+      box collar_crest place(base_box=neck_core, anchor=[0, 1, 0.2], align=[0, -1, 0]) {
+        size: [4, 1, 2], material: armor_plate
+      }
+      bone head attach(parent_box=neck_core, anchor=[0, 0.3, -1], align=[0, -0.5, 1]) {
+        box skull { size: [5, 4, 4], material: coat_fur }
+        box brow_crest place(base_box=skull, anchor=[0, 1, -0.4], align=[0, -1, 0]) {
+          size: [1, 1, 2], material: amber_glow
+        }
+        box muzzle place(base_box=skull, anchor=[0, 0.15, -1], align=[0, 0, 1]) {
+          size: [3, 2, 3], material: underbelly_fur
+        }
+        box nose_tip place(base_box=muzzle, anchor=[0, 0.5, -1], align=[0, 0, 1]) {
+          size: [1, 1, 1], material: dark_keratin
+        }
+        box lower_jaw place(base_box=skull, anchor=[0, -0.75, -1], align=[0, 0, 1]) {
+          size: [3, 1, 2], material: dark_keratin
+        }
+        bone left_ear attach(parent_box=skull, anchor=[-0.8, 1, 0.4], align=[0, -1, 0]) mirror_x(right_ear) {
+          box left_ear_pinna { size: [1, 3, 2], material: dark_keratin }
+        }
+      }
+    }
+    bone tail_base attach(parent_box=pelvis, anchor=[0, 0.6, 1], align=[0, 0, -1]) {
+      box tail_prox { size: [2, 2, 4], material: coat_fur }
+      bone tail_tip attach(parent_box=tail_prox, anchor=[0, 0, 1], align=[0, 0, -1]) {
+        box tail_plume { size: [2, 2, 4], material: underbelly_fur }
+      }
+    }
+    bone fl_thigh attach(parent_box=ribcage, anchor=[-1, -0.5, -0.6], align=[1, 1, 0]) mirror_x(fr_thigh) {
+      box fl_thigh_seg { size: [2, 4, 2], material: armor_plate }
+      bone fl_shin attach(parent_box=fl_thigh_seg, anchor=[0, -1, 0], align=[0, 1, 0]) {
+        box fl_shin_seg { size: [2, 4, 2], material: coat_fur }
+        box fl_paw place(base_box=fl_shin_seg, anchor=[0, -1, -0.25], align=[0, 1, 0]) {
+          size: [2, 1, 3], material: dark_keratin
+        }
+      }
+    }
+    bone hl_thigh attach(parent_box=pelvis, anchor=[-1, -0.5, 0.4], align=[1, 1, 0]) mirror_x(hr_thigh) {
+      box hl_thigh_seg { size: [2, 4, 2], material: coat_fur }
+      bone hl_shin attach(parent_box=hl_thigh_seg, anchor=[0, -1, 0], align=[0, 1, 0]) {
+        box hl_shin_seg { size: [2, 4, 2], material: coat_fur }
+        box hl_paw place(base_box=hl_shin_seg, anchor=[0, -1, -0.25], align=[0, 1, 0]) {
+          size: [2, 1, 3], material: dark_keratin
+        }
+      }
+    }
+  }
+}
+@kinematics {
+  ik_chain fl_leg_ik { upper: fl_thigh, lower: fl_shin, effector: [0, -5, 0] }
+  ik_chain fr_leg_ik { upper: fr_thigh, lower: fr_thigh__fl_shin, effector: [0, -5, 0] }
+  ik_chain hl_leg_ik { upper: hl_thigh, lower: hl_shin, effector: [0, -5, 0] }
+  ik_chain hr_leg_ik { upper: hr_thigh, lower: hr_thigh__hl_shin, effector: [0, -5, 0] }
+}
+@behavior {
+  clip walk_cycle {
+    duration_s: 1.6
+    ik_drive fl_leg_ik: foot_cycle(stride=1.5, lift=0.65, phase_deg=0)
+    ik_drive hr_leg_ik: foot_cycle(stride=1.5, lift=0.65, phase_deg=0)
+    ik_drive fr_leg_ik: foot_cycle(stride=1.5, lift=0.65, phase_deg=180)
+    ik_drive hl_leg_ik: foot_cycle(stride=1.5, lift=0.65, phase_deg=180)
+  }
+}
+"""
+
+
+def build_parametric_sentinel_hound_world(
+    variant: int = 0,
+    subdivisions_per_unit: int = 1,
+) -> WorldState:
+    """Build 27-box anatomically complete armored quadruped rigs (ribcage, pelvis, neck, head/muzzle/jaw/ears, tail, 4x 3-part legs)."""
+    v = int(variant)
+    base_prog = parse_program(SENTINEL_HOUND_V32_DSL)
+    hue_shift = float((41.0 * v) % 360.0)
+    new_palettes = [
+        replace(
+            p,
+            base_lch=(p.base_lch[0], p.base_lch[1], round((p.base_lch[2] + hue_shift) % 360.0, 2)),
+        )
+        for p in base_prog.palettes
+    ]
+    stride = round(1.4 + 0.12 * (v % 4), 2)
+    lift = round(0.60 + 0.08 * (v % 3), 2)
+    new_clips = []
+    for cl in base_prog.behavior.clips if base_prog.behavior else ():
+        if cl.name == "walk_cycle":
+            ik_ds = tuple(replace(d, stride=stride, lift=lift) for d in cl.ik_drives)
+            new_clips.append(replace(cl, ik_drives=ik_ds))
+        else:
+            new_clips.append(cl)
+    new_beh = replace(base_prog.behavior, clips=tuple(new_clips)) if base_prog.behavior else None
+    prog = validate_program(replace(base_prog, palettes=new_palettes, behavior=new_beh))
+    mat_prog = MaterialProgram.from_program(prog, seed=505 + 31 * v)
+    domain = build_surface_domain(prog, mat_prog, subdivisions_per_unit=subdivisions_per_unit)
+    return WorldState(
+        program=prog,
+        material_program=mat_prog,
+        surface_state=initialize_surface_state(domain),
+        style_config=StyleConfig.from_program(prog),
+        environment=EnvironmentState(),
+    )
+
+
+def build_visual_aesthetic_judgment_record(
+    world_state: WorldState,
+    *,
+    asset_id: str,
+    family_id: str,
+    inject_toy_coarsening: bool = False,
+    enable_thinking: bool = True,
+    views: tuple[str, ...] = ("south", "right", "top", "iso"),
+    panel_size: tuple[int, int] = (160, 160),
+) -> tuple[dict[str, Any], dict[str, bytes]]:
+    """Build a 4-view visual aesthetic & toy-vs-artist-grade judgment record (`synccraft_visual_aesthetic_judgment`)."""
+    from .world_pipeline import build_default_world_state_for_program, evaluate_3d_asset_aesthetics
+
+    if inject_toy_coarsening:
+        eval_prog = validate_program(coarsen_program_to_tier(world_state.program, "tier_1_simple"))
+        eval_ws = build_default_world_state_for_program(eval_prog, seed=77)
+    else:
+        eval_prog = world_state.program
+        eval_ws = world_state
+
+    scene = compile_geometry(eval_prog)
+    audit = audit_scene(scene, enforce_physical_contact=getattr(eval_prog.meta, "audit_profile", "strict") != "authored")
+    aes = evaluate_3d_asset_aesthetics(eval_prog, prompt=family_id)
+    png_by_view, _, _, _ = render_world_views_rgba(eval_ws, views=views, panel_size=panel_size)
+
+    suffix = "toy" if inject_toy_coarsening else "artist"
+    frame_paths = [f"aesthetic_judge/{asset_id}_{suffix}/view_{v}.png" for v in views]
+    media_payloads = {frame_paths[i]: png_by_view[v] for i, v in enumerate(views)}
+    visual_units = [_camera_unit_meta(v) for v in views]
+
+    oracle_judgment = {
+        "grade": aes["grade"],
+        "is_toy_like": bool(aes["is_toy_like"]),
+        "aesthetic_score": round(float(aes["aesthetic_score"]), 3),
+        "box_count_bucket": "rich_16_plus" if aes["box_count"] >= 16 else ("medium_9_15" if aes["box_count"] >= 9 else "toy_under_9"),
+        "has_head_or_focal_assembly": bool(aes["landmarks"]["head_or_focal"]),
+        "has_secondary_silhouette_detail": bool(aes["landmarks"]["secondary_silhouette"]),
+        "used_material_count": int(aes["used_material_count"]),
+    }
+    answer_body = json.dumps(oracle_judgment, sort_keys=True, separators=(",", ":"))
+    think = synthesize_oracle_think_trace(
+        task="synccraft_visual_aesthetic_judgment",
+        scene=scene,
+        audit_report=audit,
+        extra_facts=[
+            f"views={list(views)}, silhouette_grade={aes['grade']}, is_toy_like={aes['is_toy_like']}, aesthetic_score={oracle_judgment['aesthetic_score']}",
+            f"landmarks={aes['landmarks']}, used_materials={aes['used_material_count']}, critique={aes['critique_notes'][:2]}",
+        ],
+    )
+    prov = make_clean_room_provenance(f"{asset_id}_{suffix}", title=f"{family_id} visual aesthetic judgment")
+    row = {
+        "id": f"{asset_id}#aesthetic_judgment_{suffix}",
+        "source_group": f"synccraft:{asset_id}",
+        "language": "en",
+        "task": "synccraft_visual_aesthetic_judgment",
+        "visual_kind": "multiview_render",
+        "enable_thinking": enable_thinking,
+        "frames": frame_paths,
+        "media_times_s": [0.0] * len(frame_paths),
+        "visual_units": visual_units,
+        "prompt": (
+            f"Review these {len(views)} orthographic views ({', '.join(views)}) of a `{family_id}` 3D cuboid asset "
+            "as a senior Blockbench / game-art director. Judge whether it is a simplistic `toy_blockout`, "
+            "`intermediate_asset`, or `artist_grade` creation. Return JSON with keys `grade`, `is_toy_like`, "
+            "`aesthetic_score`, `box_count_bucket` (`toy_under_9` | `medium_9_15` | `rich_16_plus`), "
+            "`has_head_or_focal_assembly`, `has_secondary_silhouette_detail`, and `used_material_count`."
+        ),
+        "answer": format_supervised_answer(answer_body, think, enable_thinking=enable_thinking),
+        "target": {"kind": "text", "text": answer_body},
+        "provenance": prov,
+        "metadata": {
+            "asset_id": asset_id,
+            "base_asset_id": asset_id,
+            "family_id": family_id,
+            "provenance": prov,
+            "oracle_json": oracle_judgment,
+        },
+    }
+    validate_synccraft_license_record(row)
+    return row, media_payloads
+
+
+def build_animated_quadruped_program(variant: int = 0, *, rich_anatomy: bool = False) -> Program:
     """Build a clean-room quadruped Program with closed-loop IK `@behavior` gait (<0.02u stance slip)."""
     v = int(variant)
+    if rich_anatomy:
+        return build_parametric_sentinel_hound_world(variant=v // 2, subdivisions_per_unit=1).program
     hue = float((42.0 + 53.0 * v) % 360.0)
     torso_w = 6 + (v % 3)
     torso_h = 5 + ((v // 3) % 2)
@@ -1428,14 +1640,16 @@ def build_artist_assistant_record(
 
     if render_views or mode == "inverse_structure_and_kinematics_reading":
         views = ("south", "right", "top", "iso")
-        subdiv = 1 if len(scene.boxes) > 20 else 2
-        mp = MaterialProgram.from_program(prog, seed=101)
-        dom = build_surface_domain(prog, mp, subdivisions_per_unit=subdiv)
+        obs_prog = validate_program(coarsen_program_to_tier(prog, "tier_1_simple")) if mode == "coarse_to_fine_upgrade" else prog
+        obs_scene = compile_geometry(obs_prog)
+        subdiv = 1 if len(obs_scene.boxes) > 20 else 2
+        mp = MaterialProgram.from_program(obs_prog, seed=101)
+        dom = build_surface_domain(obs_prog, mp, subdivisions_per_unit=subdiv)
         ws = WorldState(
-            program=prog,
+            program=obs_prog,
             material_program=mp,
             surface_state=initialize_surface_state(dom),
-            style_config=StyleConfig.from_program(prog),
+            style_config=StyleConfig.from_program(obs_prog),
             environment=EnvironmentState(),
         )
         png_by_view, _, _, _ = render_world_views_rgba(ws, views=views, panel_size=panel_size)
@@ -1852,8 +2066,8 @@ def evaluate_synccraft_completion(record: dict[str, Any], completion_text: str) 
     is_json_critique = (
         task == "synccraft_artist_assistant"
         and meta.get("assistant_mode") == "inverse_structure_and_kinematics_reading"
-    )
-    if task in ("synccraft_part_grounding", "synccraft_uv_alpha_diagnosis") or is_json_critique:
+    ) or (task == "synccraft_visual_aesthetic_judgment")
+    if task in ("synccraft_part_grounding", "synccraft_uv_alpha_diagnosis", "synccraft_visual_aesthetic_judgment") or is_json_critique:
         try:
             pred = _extract_json_candidate(body)
         except Exception as exc:

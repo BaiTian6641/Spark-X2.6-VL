@@ -762,3 +762,162 @@ def test_dynamic_epoch_stratified_slicing_and_campaign_config(tmp_path):
     cursor = CommittedCursor(order1)
     assert CommittedCursor(order2, cursor.state()).committed == 0
 
+
+def test_aesthetic_toy_rejection_and_pipeline_upgrade(tmp_path):
+    """Verify Stage-4 9-box headless dog is caught as toy_blockout and upgraded to 27-box artist_grade."""
+    from colab.final.synccraft_bridge import SENTINEL_HOUND_V32_DSL, build_animated_quadruped_program
+    from colab.final.world_pipeline import SyncCraftWorldPipeline, evaluate_3d_asset_aesthetics
+    from synccraft.dsl.parser import format_program
+
+    # Variant 0 is the legacy 9-box headless quadruped; Variant 1 is the 27-box Sentinel Hound
+    toy_prog = build_animated_quadruped_program(variant=0)
+    toy_dsl = format_program(toy_prog)
+    toy_aes = evaluate_3d_asset_aesthetics(toy_prog, prompt="armored sentinel hound quadruped")
+    assert toy_aes["is_toy_like"] is True
+    assert toy_aes["grade"] == "toy_blockout"
+    assert toy_aes["landmarks"]["head_or_focal"] is False
+
+    hound_aes = evaluate_3d_asset_aesthetics(SENTINEL_HOUND_V32_DSL, prompt="armored sentinel hound quadruped")
+    assert hound_aes["static_audit_passed"] is True
+    assert hound_aes["is_toy_like"] is False
+    assert hound_aes["grade"] == "artist_grade"
+    assert hound_aes["box_count"] == 27
+    assert hound_aes["bone_count"] == 15
+    assert hound_aes["aesthetic_score"] >= 0.85
+
+    calls = []
+
+    def _mock_model(prompt_txt, images, attempt):
+        calls.append((prompt_txt, images is not None and len(images) == 4, attempt))
+        if len(calls) == 1:
+            return f"<think>\nQuick rough draft.\n</think>\n```blockdsl\n{toy_dsl}\n```", 120
+        return f"<think>\nUpgrading with full head, neck, pelvis, tail, and paws.\n</think>\n```blockdsl\n{SENTINEL_HOUND_V32_DSL}\n```", 420
+
+    pipe = SyncCraftWorldPipeline(_mock_model)
+    res = pipe.generate_3d_asset(
+        "Design an armored sentinel hound quadruped.",
+        asset_name="upgraded_hound",
+        output_dir=tmp_path / "aes_hound",
+        export_formats=("bbmodel", "bedrock"),
+        min_aesthetic_score=0.72,
+    )
+    assert res["passed"] is True
+    assert res["aesthetic_upgraded"] is True
+    assert res["boxes"] == 27
+    assert res["bones"] == 15
+    assert res["aesthetic_evaluation"]["grade"] == "artist_grade"
+    # Second call received the rendered 4-view preview of the initial 9-box draft!
+    assert len(calls) == 2 and calls[1][1] is True
+
+
+def test_visual_aesthetic_judgment_record_and_oracle():
+    """Verify 4-view `synccraft_visual_aesthetic_judgment` distinguishes toy blockouts from artist-grade rigs."""
+    from colab.final.synccraft_bridge import (
+        build_parametric_sentinel_hound_world,
+        build_visual_aesthetic_judgment_record,
+        evaluate_synccraft_completion,
+    )
+
+    ws = build_parametric_sentinel_hound_world(variant=0, subdivisions_per_unit=1)
+    toy_row, toy_blobs = build_visual_aesthetic_judgment_record(
+        ws,
+        asset_id="hound_judge_test",
+        family_id="sentinel_hound",
+        inject_toy_coarsening=True,
+    )
+    art_row, art_blobs = build_visual_aesthetic_judgment_record(
+        ws,
+        asset_id="hound_judge_test",
+        family_id="sentinel_hound",
+        inject_toy_coarsening=False,
+    )
+    assert len(toy_blobs) == 4 and len(art_blobs) == 4
+    assert toy_row["metadata"]["oracle_json"]["is_toy_like"] is True
+    assert art_row["metadata"]["oracle_json"]["is_toy_like"] is False
+    assert art_row["metadata"]["oracle_json"]["grade"] == "artist_grade"
+
+    assert evaluate_synccraft_completion(toy_row, toy_row["answer"])["passed"] is True
+    assert evaluate_synccraft_completion(art_row, art_row["answer"])["passed"] is True
+    # Flipping toy prediction onto artist ground truth must fail!
+    assert evaluate_synccraft_completion(art_row, toy_row["answer"])["passed"] is False
+
+
+def test_anti_collapse_think_sanitizer_and_stage5_config():
+    """Verify `<think>` anti-collapse bounds, repetition detector, Stage-5 task families, and Stage-5 JSON config."""
+    from colab.final.common import HERE, read, validate_config
+    from colab.final.data import family
+    from colab.final.reasoning_agentic_corpus import (
+        STAGE5_PURE_TEXT_TASKS,
+        check_generation_collapse_health,
+        sanitize_and_bound_think_trace,
+        sanitize_workspace_paths,
+    )
+
+    cfg = validate_config(read(HERE / "campaign_rtx_pro_4000_stage5_rsi.json"))
+    assert cfg["rsi_mode"] == "vision_self_improvement"
+    assert cfg["vision_rsi_rounds"] == 2
+    assert cfg["enable_stage5_reasoning_mix"] is True
+    assert cfg["init_from_release_dir"] == "./work/spark-world-v32-24gb/final-model"
+
+    for tname in STAGE5_PURE_TEXT_TASKS:
+        assert family({"task": tname, "frames": [], "target": {"kind": "text", "text": "ok"}}) == "text"
+    assert family({"task": "hle_multimodal_reasoning", "frames": ["img.png"], "target": {"kind": "text", "text": "ok"}}) == "image"
+
+    assert sanitize_workspace_paths("File at /Users/alice_dev/repo/main.py and /home/bob/app.py") == "File at /workspace/repo/main.py and /workspace/app.py"
+
+    clean = sanitize_and_bound_think_trace(
+        "Inspect router segments and verify wildcard remainder capture.",
+        "Implemented `Match(path)` in `router.go` and verified `go test ./...`.",
+        enable_thinking=True,
+    )
+    assert clean is not None and clean.startswith("<think>\n") and "</think>\nImplemented" in clean
+
+    # Unclosed `<think>` or circular repetition loop must be rejected!
+    assert check_generation_collapse_health("<think>\nUnclosed monologue without end tag", expect_thinking=True)["healthy"] is False
+    loop_str = " ".join(["Wait, let me double check the exact value again."] * 18)
+    assert sanitize_and_bound_think_trace(loop_str, "Answer: 42", enable_thinking=True) is None
+
+
+def test_vision_rsi_verifier_and_self_critique_no_leakage():
+    """Verify `score_rsi_candidate` + `build_self_critique_turn` enforce aesthetics & never leak ground truth."""
+    from colab.final.synccraft_bridge import (
+        SENTINEL_HOUND_V32_DSL,
+        build_animated_quadruped_program,
+        make_clean_room_provenance,
+    )
+    from colab.final.vision_rsi import build_self_critique_turn, score_rsi_candidate
+    from synccraft.dsl.parser import format_program
+
+    secret_marker = "SUPER_SECRET_ORACLE_MARKER_DO_NOT_LEAK"
+    row = {
+        "id": "rsi_test_001",
+        "task": "synccraft_artist_assistant",
+        "language": "en",
+        "enable_thinking": True,
+        "frames": [],
+        "prompt": "Design an armored sentinel hound quadruped.",
+        "answer": f"<think>\n{secret_marker}\n</think>\n```blockdsl\n{SENTINEL_HOUND_V32_DSL.strip()}\n```",
+        "target": {"kind": "text", "text": f"```blockdsl\n{SENTINEL_HOUND_V32_DSL.strip()}\n```"},
+        "provenance": make_clean_room_provenance("rsi_test_001"),
+        "metadata": {
+            "assistant_mode": "create_full_asset",
+            "expected_audit_profile": "strict",
+        },
+    }
+    toy_cand = f"<think>\nSimple draft body and legs.\n</think>\n```blockdsl\n{format_program(build_animated_quadruped_program(0))}\n```"
+    diag_toy = score_rsi_candidate(row, toy_cand, min_aesthetic_score=0.70)
+    assert diag_toy["verified"] is False
+    assert "toy_aesthetic_rejected" in diag_toy["reason"]
+
+    turn = build_self_critique_turn(row, {"images": []}, toy_cand, diag_toy)
+    assert turn is not None
+    crit_row, crit_media = turn
+    assert secret_marker not in crit_row["prompt"]
+    assert len(crit_media["images"]) == 4
+
+    rich_cand = f"<think>\nComplete 27-box hound with skull, muzzle, ears, pelvis, tail, and 3-part legs.\n</think>\n```blockdsl\n{SENTINEL_HOUND_V32_DSL.strip()}\n```"
+    diag_rich = score_rsi_candidate(row, rich_cand, min_aesthetic_score=0.70)
+    assert diag_rich["verified"] is True
+    assert diag_rich["score"] >= 0.85
+
+

@@ -93,6 +93,18 @@ def infer_visual_kind(row:dict[str,Any])->str:
         return 'multiview_render'
     return 'independent_image'
 
+PURE_TEXT_TASKS={
+    'text_replay',
+    'general_reasoning',
+    'fable5_swe_agent',
+    'fable5_reasoning',
+    'claude_code_agent',
+    'terminal_bench_agent',
+    'openthoughts_reasoning',
+    'gpqa_extended_science',
+    'hle_text_reasoning',
+}
+
 def family(row):
     target=row.get('target',{}); direction=row.get('audio_direction'); role=row.get('media_role')
     output=direction=='text_to_audio' or role=='target' or target.get('kind')=='waveform'
@@ -107,7 +119,7 @@ def family(row):
         return 'audiovisual' if row.get('audio') else 'video'
     if row.get('audio'): return 'speech_in' if row['task']=='speech_recognition' else 'sound_in'
     if row.get('frames'): return 'image'
-    if row['task'] in ('text_replay','general_reasoning') or str(row.get('task','')).startswith('synccraft_'): return 'text'
+    if row['task'] in PURE_TEXT_TASKS or str(row.get('task','')).startswith('synccraft_'): return 'text'
     raise ValueError('No implemented modality for row '+row['task'])
 
 def conditioning_members(row):

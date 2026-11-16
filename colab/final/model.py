@@ -797,6 +797,15 @@ class SparkNative(nn.Module):
             self.motion=None; self.motion_projector=None
             self.speech_projector=None; self.sound_projector=None
             self.audio_clock=None; self.speech_out=None; self.sound_out=None
+            if pretrained and components is None and policy.get('init_from_release_dir'):
+                init_dir = Path(str(policy['init_from_release_dir'])).expanduser()
+                if not init_dir.is_absolute():
+                    init_dir = (HERE.parents[1] / init_dir).resolve()
+                init_sf = init_dir / 'model.safetensors'
+                if not init_sf.is_file():
+                    raise FileNotFoundError(f'Warm-start init_from_release_dir missing model.safetensors: {init_sf}')
+                load_spark_native_safetensors(self, init_sf)
+                self._warm_started_from = str(init_sf)
             # Move Spark + SigLIP2 preserving their configured dtypes; keep connectors/adapters in float32.
             self.spark.to(device=device,dtype=spark_dtype)
             if hasattr(self.spark,'tie_weights'): self.spark.tie_weights()
@@ -1589,16 +1598,16 @@ class SparkNative(nn.Module):
         top_k: int | None = None,
         repetition_penalty: float = 1.0,
     ):
-        if max_new_tokens is None:
-            task = row.get('task', '')
-            if str(task).startswith('synccraft_') or task in ('document_ocr', 'music_instrument_note_understanding'):
-                max_new_tokens = 1024
-            elif task in ('factual_caption', 'image_caption', 'video_caption', 'video_box_tracking', 'region_dense_video_caption'):
-                max_new_tokens = 512
-            else:
-                max_new_tokens = 256
-
         effective_row = row if enable_thinking is None else {**row, 'enable_thinking': bool(enable_thinking)}
+        if max_new_tokens is None:
+            task = effective_row.get('task', '')
+            want_th = bool(effective_row.get('enable_thinking', False))
+            if str(task).startswith('synccraft_') or task in ('document_ocr', 'music_instrument_note_understanding'):
+                max_new_tokens = 1536 if want_th else 1024
+            elif task in ('factual_caption', 'image_caption', 'video_caption', 'video_box_tracking', 'region_dense_video_caption'):
+                max_new_tokens = 768 if want_th else 512
+            else:
+                max_new_tokens = 1024 if want_th else 256
 
         # Pure-text fast path: call Spark directly via `input_ids` with zero visual-module execution!
         if not has_multimodal_context(media):

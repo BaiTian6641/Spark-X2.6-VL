@@ -31,6 +31,8 @@ PINNED_RUNTIME_PATHS = (
     "colab/final/coat_spark.py",
     "colab/final/synccraft_bridge.py",
     "colab/final/world_pipeline.py",
+    "colab/final/reasoning_agentic_corpus.py",
+    "colab/final/vision_rsi.py",
     "colab/final/hybrid_corpus.py",
     "colab/final/data.py",
     "colab/final/model.py",

@@ -365,6 +365,15 @@ def _build_sat_3d_spatial_records(
                 if is_pair
                 else [{"visual_kind": "independent_image", "view_id": "single"}]
             )
+            sat_use_think = bool(config.get("enable_stage5_reasoning_mix", False)) and (orig_idx % 2 == 0)
+            if sat_use_think:
+                sat_think = (
+                    f"<think>\n3D spatial category: {qtype}. "
+                    f"Frames={'before/after pair' if is_pair else 'single ego-view'}. "
+                    f"Evaluate camera forward/left/right axes, depth occlusion, and object displacement -> {correct}.\n</think>\n{correct}"
+                )
+            else:
+                sat_think = correct
             rec = {
                 "id": f"sat-3d-{qtype}-{orig_idx:05d}",
                 "source_id": f"array-sat-val-{orig_idx:05d}",
@@ -375,9 +384,9 @@ def _build_sat_3d_spatial_records(
                 "media_times_s": [0.0] * len(frame_paths),
                 "visual_kind": "state_pair" if is_pair else "independent_image",
                 "visual_units": visual_units,
-                "enable_thinking": False,
+                "enable_thinking": sat_use_think,
                 "prompt": prompt,
-                "answer": correct,
+                "answer": sat_think,
                 "target": {"kind": "text", "text": correct},
                 "metadata": {
                     "dataset": "array/SAT",
@@ -526,10 +535,12 @@ def _render_synccraft_rig_worker(job: dict[str, Any]) -> tuple[list[dict[str, An
         build_animation_clip_record,
         build_multiview_consistency_record,
         build_parametric_sculpted_wyvern_world,
+        build_parametric_sentinel_hound_world,
         build_parametric_walking_citadel_world,
         build_part_grounding_record,
         build_typed_scene_edit_record,
         build_uv_seam_alpha_diagnosis_record,
+        build_visual_aesthetic_judgment_record,
         ensure_synccraft_importable,
         make_clean_room_provenance,
         validate_synccraft_license_record,
@@ -597,25 +608,43 @@ def _render_synccraft_rig_worker(job: dict[str, Any]) -> tuple[list[dict[str, An
             prov=prov,
             lang="en",
         )
-        # Exact 4-way balanced UV/alpha diagnosis (`a0_o0`, `a1_o0`, `a0_o1`, `a1_o1`)
-        uv_mode = idx % 4
-        inject_alpha = uv_mode in (1, 3)
-        inject_overlap = uv_mode in (2, 3)
-        if len(scene.boxes) >= 2 or not inject_overlap:
-            _collect(
-                build_uv_seam_alpha_diagnosis_record(
-                    ws,
-                    asset_id=f"{aid}_uv{uv_mode}",
-                    family_id=fid,
-                    inject_alpha_cutout=inject_alpha,
-                    inject_uv_overlap=inject_overlap,
-                    vary_target_faces=True,
-                    enable_thinking=enable_thinking,
-                    panel_size=(160, 160),
-                ),
-                prov=prov,
-                lang=lang,
-            )
+        # Exact 4-way balanced UV/alpha diagnosis (`a0_o0`, `a1_o0`, `a0_o1`, `a1_o1`), plus full 4-way counterfactual sets
+        uv_modes = (0, 1, 2, 3) if (job.get("full_4way_uv_counterfactual") and len(scene.boxes) >= 2) else (idx % 4,)
+        for uv_mode in uv_modes:
+            inject_alpha = uv_mode in (1, 3)
+            inject_overlap = uv_mode in (2, 3)
+            if len(scene.boxes) >= 2 or not inject_overlap:
+                _collect(
+                    build_uv_seam_alpha_diagnosis_record(
+                        ws,
+                        asset_id=f"{aid}_uv{uv_mode}",
+                        family_id=fid,
+                        inject_alpha_cutout=inject_alpha,
+                        inject_uv_overlap=inject_overlap,
+                        vary_target_faces=True,
+                        enable_thinking=enable_thinking,
+                        panel_size=(160, 160),
+                    ),
+                    prov=prov,
+                    lang=lang,
+                )
+        if job.get("include_aesthetic_judgment") and len(scene.boxes) >= 12:
+            for toy_flag in ((False, True) if idx % 3 == 0 else ((idx % 2 == 1),)):
+                try:
+                    _collect(
+                        build_visual_aesthetic_judgment_record(
+                            ws,
+                            asset_id=aid,
+                            family_id=fid,
+                            inject_toy_coarsening=bool(toy_flag),
+                            enable_thinking=enable_thinking,
+                            panel_size=(160, 160),
+                        ),
+                        prov=prov,
+                        lang="en",
+                    )
+                except Exception:
+                    pass
         if len(scene.bones) >= 2 and getattr(prog.meta, "audit_profile", "strict") != "authored":
             edit_mode = "repair_sat_defect" if (idx % 2 == 0) else "infer_world_action"
             try:
@@ -636,7 +665,7 @@ def _render_synccraft_rig_worker(job: dict[str, Any]) -> tuple[list[dict[str, An
 
     elif kind == "quadruped_anim":
         v = int(job["variant_idx"])
-        prog = build_animated_quadruped_program(v)
+        prog = build_animated_quadruped_program(v, rich_anatomy=(v % 2 == 1))
         aid = f"quad_gait_v32_{v:03d}"
         fid = f"synccraft_v32_quad_family_{v % 12:02d}"
         prov = make_clean_room_provenance(aid, title=f"{fid} quadruped gait {v}")
@@ -659,17 +688,22 @@ def _render_synccraft_rig_worker(job: dict[str, Any]) -> tuple[list[dict[str, An
 
     elif kind == "sculpted_flagship":
         v = int(job["variant_idx"])
-        is_citadel = (v % 2 == 1)
-        if is_citadel:
-            ws = build_parametric_walking_citadel_world(variant=v // 2, subdivisions_per_unit=1)
+        archetype_slot = v % 3
+        if archetype_slot == 1:
+            ws = build_parametric_walking_citadel_world(variant=v // 3, subdivisions_per_unit=1)
             clip_name = "fortress_march"
-            aid = f"colossal_citadel_v32_{v // 2:03d}"
-            fid = f"synccraft_v32_citadel_family_{(v // 2) % 8:02d}"
+            aid = f"colossal_citadel_v32_{v // 3:03d}"
+            fid = f"synccraft_v32_citadel_family_{(v // 3) % 8:02d}"
+        elif archetype_slot == 2:
+            ws = build_parametric_sentinel_hound_world(variant=v // 3, subdivisions_per_unit=1)
+            clip_name = "walk_cycle"
+            aid = f"sentinel_hound_v32_{v // 3:03d}"
+            fid = f"synccraft_v32_hound_family_{(v // 3) % 8:02d}"
         else:
-            ws = build_parametric_sculpted_wyvern_world(variant=v // 2, subdivisions_per_unit=1)
+            ws = build_parametric_sculpted_wyvern_world(variant=v // 3, subdivisions_per_unit=1)
             clip_name = "stalk_gait"
-            aid = f"sculpted_wyvern_v32_{v // 2:03d}"
-            fid = f"synccraft_v32_wyvern_family_{(v // 2) % 8:02d}"
+            aid = f"sculpted_wyvern_v32_{v // 3:03d}"
+            fid = f"synccraft_v32_wyvern_family_{(v // 3) % 8:02d}"
         prov = make_clean_room_provenance(aid, title=f"ADR 0007 {fid}")
         _collect(
             build_part_grounding_record(
@@ -687,6 +721,18 @@ def _render_synccraft_rig_worker(job: dict[str, Any]) -> tuple[list[dict[str, An
                 ws,
                 asset_id=aid,
                 family_id=fid,
+                enable_thinking=enable_thinking,
+                panel_size=(160, 160),
+            ),
+            prov=prov,
+            lang="en",
+        )
+        _collect(
+            build_visual_aesthetic_judgment_record(
+                ws,
+                asset_id=aid,
+                family_id=fid,
+                inject_toy_coarsening=(v % 2 == 1),
                 enable_thinking=enable_thinking,
                 panel_size=(160, 160),
             ),
@@ -851,7 +897,20 @@ def _build_synccraft_world_v32_records(
                     continue
                 human_rows.append(ar)
 
-    human_rows.sort(key=lambda r: identity([seed, "human_cc", r["asset_id"]]))
+    human_rendered_cap = int(
+        config.get("hybrid_human_artist_rendered_rigs", 160 if config.get("enable_stage5_reasoning_mix") else 48)
+    )
+    apex_rendered_cap = int(
+        config.get("hybrid_apex_rendered_rigs", 64 if config.get("enable_stage5_reasoning_mix") else 24)
+    )
+    # Prioritize rich multi-part human-artist assets (`14 <= box_count <= 95`) ahead of tiny single-box props
+    human_rows.sort(
+        key=lambda r: (
+            0 if 14 <= int(r.get("box_count") or 0) <= 95 else (1 if 8 <= int(r.get("box_count") or 0) < 14 else 2),
+            identity([seed, "human_cc", r["asset_id"]]),
+        )
+    )
+    rendered_human_count = 0
     for h_idx, ar in enumerate(human_rows):
         aid = str(ar["asset_id"])
         fid = str(ar.get("family_id") or f"human_cc_{aid[:16]}")
@@ -880,17 +939,21 @@ def _build_synccraft_world_v32_records(
             "reviewer_id": "synccraft_catalog_verified_v3_2",
         }
         validate_synccraft_license_record({"provenance": prov}, allow_research_nc=False)
-        if h_idx < 48:
+        bx_cnt = int(ar.get("box_count") or 0)
+        if rendered_human_count < human_rendered_cap and 6 <= bx_cnt <= 95:
             render_jobs.append(
                 {
                     "kind": "dsl_rig",
-                    "idx": num_rendered_dsl_rigs + h_idx,
+                    "idx": num_rendered_dsl_rigs + rendered_human_count,
                     "seed": seed + 1000,
                     "canonical_dsl": ar["canonical_dsl"],
                     "provenance": prov,
                     "enable_thinking": enable_thinking,
+                    "include_aesthetic_judgment": bool(config.get("enable_stage5_reasoning_mix", False)) and bx_cnt >= 14,
+                    "full_4way_uv_counterfactual": bool(config.get("enable_stage5_reasoning_mix", False)) and (rendered_human_count < 24),
                 }
             )
+            rendered_human_count += 1
         try:
             prog = validate_program(parse_program(str(ar["canonical_dsl"])))
             pp_doc = ar.get("prompt_and_provenance") or {}
@@ -929,12 +992,19 @@ def _build_synccraft_world_v32_records(
                     },
                 }
                 records.append((direct_rec, []))
+            assist_mode = "coarse_to_fine_upgrade" if h_idx % 2 == 0 else "inverse_structure_and_kinematics_reading"
+            render_blockout_views = bool(
+                config.get("enable_stage5_reasoning_mix", False)
+                and assist_mode == "coarse_to_fine_upgrade"
+                and 14 <= bx_cnt <= 80
+            )
             rec, extra_blobs = build_artist_assistant_record(
                 prog,
-                mode="coarse_to_fine_upgrade" if h_idx % 2 == 0 else "inverse_structure_and_kinematics_reading",
+                mode=assist_mode,
                 asset_id=f"{aid}_assist",
                 family_id=fid,
                 provenance_override=prov,
+                render_views=render_blockout_views,
                 enable_thinking=enable_thinking,
                 panel_size=(144, 144),
             )
@@ -1004,15 +1074,17 @@ def _build_synccraft_world_v32_records(
                     },
                 }
                 records.append((rec, []))
-                if a_idx < 24:
+                if a_idx < apex_rendered_cap:
                     render_jobs.append(
                         {
                             "kind": "dsl_rig",
-                            "idx": num_rendered_dsl_rigs + 100 + a_idx,
+                            "idx": num_rendered_dsl_rigs + 300 + a_idx,
                             "seed": seed + 3000,
                             "canonical_dsl": canon,
                             "provenance": prov,
                             "enable_thinking": enable_thinking,
+                            "include_aesthetic_judgment": bool(config.get("enable_stage5_reasoning_mix", False)) and (a_idx < 32),
+                            "full_4way_uv_counterfactual": bool(config.get("enable_stage5_reasoning_mix", False)) and (a_idx < 16),
                         }
                     )
             except Exception:
@@ -1184,12 +1256,18 @@ def prepare_hybrid_world_v32_data(root: str | Path, token: str | None, config: d
             "split": config["split_percent"],
             "seed": config["seed"],
             "dataset_mode": "hybrid_world_v32",
+            "stage5_reasoning_mix": bool(config.get("enable_stage5_reasoning_mix", False)),
         }
-        if read(build_meta) != expected:
+        saved_meta = read(build_meta)
+        # Backward compatibility when Stage 1-4 BUILD.json omitted stage5_reasoning_mix=False
+        if "stage5_reasoning_mix" not in saved_meta and not expected["stage5_reasoning_mix"]:
+            saved_meta = {**saved_meta, "stage5_reasoning_mix": False}
+        if saved_meta != expected:
             raise ValueError("Existing hybrid_world_v32 split metadata differs; use a fresh work_root")
         return read(db.with_suffix(".report.json"))
 
     seed = int(config["seed"])
+    use_stage5_mix = bool(config.get("enable_stage5_reasoning_mix", False))
     emit("hybrid_corpus_stage", stage="spark_mm_selection")
     spark_mm_packets, spark_mm_comps = _select_spark_mm_packets(root, token, config)
 
@@ -1208,15 +1286,34 @@ def prepare_hybrid_world_v32_data(root: str | Path, token: str | None, config: d
         merged_sc_blobs[k] = v
     sc_comp_entry, sc_transport = _write_local_tar_component(root, "synccraft_world_v32", merged_sc_blobs, seed=seed)
 
+    stage5_records: list[tuple[dict[str, Any], list[str]]] = []
+    stage5_holdout_manifest: dict[str, Any] | None = None
+    hle_comp_entry: dict[str, Any] | None = None
+    hle_transport: dict[str, dict[str, Any]] = {}
+    if use_stage5_mix:
+        from .reasoning_agentic_corpus import build_stage5_reasoning_and_agentic_stream
+
+        stage5_records, hle_blobs, stage5_holdout_manifest = build_stage5_reasoning_and_agentic_stream(
+            root,
+            token,
+            config,
+        )
+        if hle_blobs:
+            hle_comp_entry, hle_transport = _write_local_tar_component(root, "hle_multimodal", hle_blobs, seed=seed)
+
+    handoff_comps = [
+        *spark_mm_comps,
+        sat_comp_entry,
+        sc_comp_entry,
+    ]
+    if hle_comp_entry is not None:
+        handoff_comps.append(hle_comp_entry)
+
     handoff_doc = {
         "schema_version": 1,
         "repo_id": "TassP0lar/SparkX2.6-MM",
         "revision": "f472f980a6c95d3e9844f27e6045c8c09b21536a",
-        "components": [
-            *spark_mm_comps,
-            sat_comp_entry,
-            sc_comp_entry,
-        ],
+        "components": handoff_comps,
     }
     write(handoff_path, handoff_doc)
 
@@ -1225,7 +1322,6 @@ def prepare_hybrid_world_v32_data(root: str | Path, token: str | None, config: d
     for rec, frame_names in sat_records:
         shards_used = {sat_transport[m]["shard"] for m in frame_names}
         if len(shards_used) != 1:
-            # Ensure all frames of one multi-image packet reside in the same shard
             continue
         shard_name = next(iter(shards_used))
         transport = {
@@ -1247,6 +1343,22 @@ def prepare_hybrid_world_v32_data(root: str | Path, token: str | None, config: d
             all_packets.append({"component": "synccraft_world_v32", "record": rec, "transport": transport})
         else:
             all_packets.append({"component": "synccraft_world_v32", "record": rec, "transport": None})
+
+    for rec, frame_names in stage5_records:
+        if frame_names:
+            if not hle_transport or any(m not in hle_transport for m in frame_names):
+                continue
+            shards_used = {hle_transport[m]["shard"] for m in frame_names}
+            if len(shards_used) != 1:
+                continue
+            shard_name = next(iter(shards_used))
+            transport = {
+                "shard": shard_name,
+                "media": [dict(hle_transport[m]["entry"]) for m in frame_names],
+            }
+            all_packets.append({"component": "hle_multimodal", "record": rec, "transport": transport})
+        else:
+            all_packets.append({"component": "stage5_reasoning_agentic", "record": rec, "transport": None})
 
     # Enforce qualified context policy across 100% of rows before freezing catalogue
     all_packets, context_filter_stats = _filter_packets_to_context_policy(all_packets, root, config)
@@ -1270,6 +1382,18 @@ def prepare_hybrid_world_v32_data(root: str | Path, token: str | None, config: d
         "sat_3d_records": len(sat_records),
         "compositional_vqa_records": len(comp_records),
         "synccraft_world_v32_records": len(sc_records),
+        "stage5_reasoning_and_agentic_records": len(stage5_records),
+        "stage5_holdout_manifest_summary": (
+            {
+                "gpqa_diamond_held_out_100_percent": stage5_holdout_manifest["gpqa_diamond_held_out_100_percent"],
+                "gpqa_diamond_question_count": stage5_holdout_manifest["gpqa_diamond_question_count"],
+                "terminal_bench_3_holdout_count": len(stage5_holdout_manifest["terminal_bench_3_holdout_tasks"]),
+                "hle_holdout_count": stage5_holdout_manifest["hle_holdout_count"],
+                "anti_collapse_policy": stage5_holdout_manifest["anti_collapse_policy"],
+            }
+            if stage5_holdout_manifest
+            else None
+        ),
         "context_policy_filter": context_filter_stats,
         "task_distribution": dict(sorted(task_counts.items())),
     }
@@ -1281,6 +1405,7 @@ def prepare_hybrid_world_v32_data(root: str | Path, token: str | None, config: d
             "split": config["split_percent"],
             "seed": config["seed"],
             "dataset_mode": "hybrid_world_v32",
+            "stage5_reasoning_mix": use_stage5_mix,
         },
     )
     emit(

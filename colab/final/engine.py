@@ -395,12 +395,13 @@ def load_checkpoint(directory,config,bound,model=None,load_optimizer=True,device
 
 class MediaCollator:
     """Open independent catalogue/cache handles in each DataLoader process."""
-    def __init__(self,campaign,dynamic_seed:int=0):
+    def __init__(self,campaign,dynamic_seed:int=0,row_overrides:dict|None=None):
         self.root=campaign.root; self.config=campaign.c; self.token=campaign._hf_token
         local_handoff=self.root/'metadata/HANDOFF.json'
         self.handoff=read(local_handoff) if local_handoff.is_file() else read(HERE.parent/'formal/HF_FULL_DATASET_HANDOFF.json')
         self.slot=campaign.reader.checkpoint_slot_bytes; self.worker=None
         self.dynamic_seed=int(dynamic_seed)
+        self.row_overrides=dict(row_overrides) if row_overrides else {}
     def __call__(self,rows):
         import torch
         if self.worker is None:
@@ -413,7 +414,11 @@ class MediaCollator:
         for item in rows:
             row,packet=catalogue.row(item['rid'])
             with reader.packet(packet) as get: media=prepare_media(row,get,self.config)
-            if use_dyn:
+            override=self.row_overrides.get(item['rid'])
+            if override is not None:
+                row=dict(row)
+                row.update(override)
+            elif use_dyn:
                 aug_seed=int(identity([self.dynamic_seed,int(item['_index']),item['rid']])[:16],16)
                 row,media=apply_dynamic_training_augmentation(row,media,random.Random(aug_seed),self.config)
             examples.append((row,media))
@@ -492,7 +497,7 @@ class Campaign:
         write(self.root/'RESTORE_PROOF.json',proof); self.store.small_file(self.root/'RESTORE_PROOF.json','restore-proof')
         return optimizer,scheduler,proof
 
-    def train_order_native(self,stage,order,resume=False,dynamic_seed:int=0):
+    def train_order_native(self,stage,order,resume=False,dynamic_seed:int=0,row_overrides:dict|None=None):
         """Native PyTorch APOLLO + COAT + merged-gradient training loop for 24 GB SM120 workstations and Colab."""
         import torch
         from torch.utils.data import DataLoader
@@ -569,7 +574,7 @@ class Campaign:
             cursor_dataset(order,cursor),
             batch_size=microbatch,
             num_workers=workers,
-            collate_fn=MediaCollator(self,dynamic_seed=dynamic_seed),
+            collate_fn=MediaCollator(self,dynamic_seed=dynamic_seed,row_overrides=row_overrides),
             pin_memory=False,
             **loader_kwargs,
         )
@@ -806,7 +811,7 @@ class Campaign:
         del optimizer,scheduler; gc.collect()
         if torch.cuda.is_available(): torch.cuda.empty_cache()
 
-    def train_order(self,stage,order,resume=False,dynamic_seed:int=0):
+    def train_order(self,stage,order,resume=False,dynamic_seed:int=0,row_overrides:dict|None=None):
         profile=self.c.get('optimizer_profile','adamw8bit')
         use_native=(
             self.c.get('trainer_backend')=='native_merged'
@@ -814,7 +819,7 @@ class Campaign:
             or profile!='adamw8bit'
         )
         if use_native:
-            return self.train_order_native(stage,order,resume=resume,dynamic_seed=dynamic_seed)
+            return self.train_order_native(stage,order,resume=resume,dynamic_seed=dynamic_seed,row_overrides=row_overrides)
 
         import torch,unsloth
         import studio.backend.core.training.trainer as backend
@@ -998,6 +1003,9 @@ class Campaign:
         self.state['rsi_rounds'].append(result); self.save(opt,sched); del opt,sched
         write(self.root/f'RSI-{round_no}.json',result); self.store.small_file(self.root/f'RSI-{round_no}.json','rsi-result')
         return result
+    def vision_self_improving_rsi(self,round_no):
+        from .vision_rsi import run_vision_self_improvement_round
+        return run_vision_self_improvement_round(self,round_no)
     def qualify_instructor_format(self):
         from .teacher import Instructor
         import torch
@@ -1039,9 +1047,12 @@ class Campaign:
         if phase in ('rsi','audit'):
             missing={s['name'] for s in self.c['stages']}-set(self.state.get('completed_stages',[]))
             if missing: raise RuntimeError('Full fine-tune stages are incomplete: '+','.join(sorted(missing)))
-        if phase=='audit' and len(self.state.get('rsi_rounds',[]))!=self.c['instructor_rounds']:
-            raise RuntimeError('Both instructed-RSI rounds must complete before result checking')
-        if phase=='rsi' or (phase=='full' and int(self.c.get('instructor_rounds',0))>0): self.qualify_instructor_format()
+        is_vision_rsi=(self.c.get('rsi_mode')=='vision_self_improvement' or int(self.c.get('vision_rsi_rounds',0))>0)
+        target_rsi_rounds=int(self.c.get('vision_rsi_rounds',0)) if is_vision_rsi else int(self.c.get('instructor_rounds',0))
+        if phase=='audit' and len(self.state.get('rsi_rounds',[]))!=target_rsi_rounds:
+            raise RuntimeError('All configured RSI rounds must complete before result checking')
+        if not is_vision_rsi and (phase=='rsi' or (phase=='full' and int(self.c.get('instructor_rounds',0))>0)):
+            self.qualify_instructor_format()
         if not (self.root/'BASELINE.json').exists():
             base=self.evaluate('dev','pretrained-native-baseline',generate=True); write(self.root/'BASELINE.json',base); self.store.small_file(self.root/'BASELINE.json','baseline')
         if phase in ('full','train'):
@@ -1080,14 +1091,25 @@ class Campaign:
                             opt,sched,_=self.restore(self.state.get('best_checkpoint') or parent_receipt)
                             del opt,sched
         if phase in ('full','rsi'):
-            for round_no in range(1,self.c['instructor_rounds']+1):
-                if any(r['round']==round_no for r in self.state.get('rsi_rounds',[])): continue
-                result=self.instructed_rsi(round_no)
-                if isinstance(result,dict) and result.get('stopped'):
-                    emit('campaign_stopped',reason=self.stop_reason,stage=result['stage'],
-                         curriculum_complete=False,capability_promoted=False)
-                    return result
-            if len(self.state.get('rsi_rounds',[]))!=self.c['instructor_rounds']: raise RuntimeError('Required instructed-RSI comparisons are incomplete')
+            if is_vision_rsi:
+                for round_no in range(1,target_rsi_rounds+1):
+                    if any(r['round']==round_no for r in self.state.get('rsi_rounds',[])): continue
+                    result=self.vision_self_improving_rsi(round_no)
+                    if isinstance(result,dict) and result.get('stopped'):
+                        emit('campaign_stopped',reason=self.stop_reason,stage=result['stage'],
+                             curriculum_complete=False,capability_promoted=False)
+                        return result
+                if len(self.state.get('rsi_rounds',[]))!=target_rsi_rounds:
+                    raise RuntimeError('Required vision-RSI rounds are incomplete')
+            else:
+                for round_no in range(1,self.c['instructor_rounds']+1):
+                    if any(r['round']==round_no for r in self.state.get('rsi_rounds',[])): continue
+                    result=self.instructed_rsi(round_no)
+                    if isinstance(result,dict) and result.get('stopped'):
+                        emit('campaign_stopped',reason=self.stop_reason,stage=result['stage'],
+                             curriculum_complete=False,capability_promoted=False)
+                        return result
+                if len(self.state.get('rsi_rounds',[]))!=self.c['instructor_rounds']: raise RuntimeError('Required instructed-RSI comparisons are incomplete')
         if phase in ('full','audit'):
             self.evaluate('audit','final-protected-audit',generate=True)
             audio_review='not_applicable_vision_text' if self.c.get('modalities')=='vision_text' else 'pending'
