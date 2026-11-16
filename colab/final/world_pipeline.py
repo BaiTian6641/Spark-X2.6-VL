@@ -27,7 +27,7 @@ import re
 from typing import Any
 
 from .common import write
-from .synccraft_bridge import ensure_synccraft_importable, render_world_views_rgba
+from .synccraft_bridge import _camera_unit_meta, ensure_synccraft_importable, render_world_views_rgba
 
 
 SUPPORTED_EXPORT_FORMATS = (
@@ -38,6 +38,66 @@ SUPPORTED_EXPORT_FORMATS = (
     "gltf_pbr",
     "labpbr",
 )
+
+SYNCCRAFT_V32_GRAMMAR_SYSTEM_PROMPT = """You author valid SyncCraft Block-DSL v3.2 3D assets. Every Block-DSL v3.2 program MUST strictly obey this syntax:
+```blockdsl
+@meta { archetype: entity, target_profile: bedrock_entity, texel_density: 16, audit_profile: strict }
+@palette {
+  pelt_mat: ramp(base_lch=[0.64, 0.11, 42], steps=6)
+  hoof_mat: ramp(base_lch=[0.4, 0.06, 132], steps=6)
+}
+@rig {
+  root bone body_root {
+    pivot_local: [0, 10, 0]
+    box torso { size: [6, 5, 9], material: pelt_mat }
+    bone left_thigh attach(parent_box=torso, anchor=[-1, -0.6, -0.6], align=[1, 1, 0]) mirror_x(right_thigh) {
+      box thigh_seg { size: [2, 4, 2], material: pelt_mat }
+      bone left_shin attach(parent_box=thigh_seg, anchor=[0, -1, 0], align=[0, 1, 0]) {
+        box shin_seg { size: [2, 4, 2], material: hoof_mat }
+      }
+    }
+  }
+}
+@kinematics {
+  ik_chain left_leg_ik { upper: left_thigh, lower: left_shin, effector: [0, -4, 0] }
+  ik_chain right_leg_ik { upper: right_thigh, lower: right_thigh__left_shin, effector: [0, -4, 0] }
+}
+@behavior {
+  clip walk_cycle {
+    duration_s: 1.6
+    ik_drive left_leg_ik: foot_cycle(stride=1.5, lift=0.65)
+    ik_drive right_leg_ik: foot_cycle(stride=1.5, lift=0.65, phase_deg=180)
+  }
+}
+```
+Mandatory syntax rules:
+1. `@meta` ONLY accepts `archetype`, `target_profile`, `texel_density`, and optional `audit_profile` (`strict` | `sculpted` | `authored`) — never `version` or `domain`.
+2. `@palette` entries MUST use `mat_name: ramp(base_lch=[L, C, H], steps=6)` — never `#hex` or `rgb(...)`.
+3. Box `size: [W, H, D]` MUST be 3 positive INTEGER literals in square brackets `[W, H, D]` (never floats or parentheses).
+4. Child bones MUST attach cleanly via `attach(parent_box=<box>, anchor=[ax, ay, az], align=[lx, ly, lz])` so faces touch with 0 SAT penetration and 0 air gap."""
+
+
+def _extract_clean_blockdsl(raw_text: str) -> str:
+    """Strip closed/unclosed `<think>` wrappers and Markdown fences deterministically."""
+    txt = str(raw_text or "")
+    # 1. Prefer an explicit ```blockdsl ... ``` code fence anywhere after `</think>` (or in full text)
+    after_think = txt.split("</think>", 1)[1] if "</think>" in txt else re.sub(r"^<think>\s*", "", txt)
+    fence = re.search(r"```(?:blockdsl|dsl|synccraft)?\s*\n(.*?)```", after_think, flags=re.DOTALL | re.IGNORECASE)
+    if fence is not None:
+        cand = fence.group(1).strip()
+    else:
+        open_fence = re.search(r"```(?:blockdsl|dsl|synccraft)\s*\n(.*)$", after_think, flags=re.DOTALL | re.IGNORECASE)
+        if open_fence is not None:
+            cand = open_fence.group(1).replace("```", "").strip()
+        else:
+            cleaned = re.sub(r"<think>.*?</think>", "", txt, flags=re.DOTALL | re.IGNORECASE).strip()
+            meta_idx = cleaned.find("@meta")
+            cand = cleaned[meta_idx:].replace("```", "").strip() if meta_idx >= 0 else cleaned.replace("```", "").strip()
+    open_braces = cand.count("{")
+    close_braces = cand.count("}")
+    if 0 < (open_braces - close_braces) <= 4:
+        cand = cand + ("\n}" * (open_braces - close_braces))
+    return cand
 
 
 def _safe_slug(name: str) -> str:
@@ -96,12 +156,16 @@ def _build_repair_prompt(
         lines.append(f"Prompt adherence violations: {', '.join(str(v) for v in adh[:8])}")
     lines.append(f"Current candidate Block-DSL:\n```blockdsl\n{candidate_dsl.strip()}\n```")
     lines.append(
-        "Think concisely inside <think>...</think> and output the complete repaired ```blockdsl ... ``` program."
+        "Output ONLY the complete repaired ```blockdsl ... ``` program obeying `@meta { archetype: ..., target_profile: ..., texel_density: ... }`, `ramp(base_lch=[...], steps=6)`, integer `size: [W, H, D]`, and `attach(parent_box=..., anchor=[...], align=[...])`."
     )
     return "\n\n".join(lines)
 
 
-def _prepare_media_from_pil_images(images: Sequence[Any] | None) -> dict[str, Any]:
+def _prepare_media_from_pil_images(
+    images: Sequence[Any] | None,
+    *,
+    view_names: Sequence[str] | None = None,
+) -> dict[str, Any]:
     from PIL import Image
     from .inference import empty_media, visual_media
 
@@ -109,7 +173,11 @@ def _prepare_media_from_pil_images(images: Sequence[Any] | None) -> dict[str, An
         return empty_media()
     loaded = [Image.open(raw) if isinstance(raw, (str, Path)) else raw for raw in images]
     vkind = "multiview_render" if len(loaded) > 1 else "independent_image"
-    return visual_media(loaded, visual_kind=vkind)
+    resolved_views = list(view_names) if view_names is not None else (
+        ["south", "right", "top", "iso"] if len(loaded) == 4 else []
+    )
+    v_units = [_camera_unit_meta(v) for v in resolved_views] if len(resolved_views) == len(loaded) else None
+    return visual_media(loaded, visual_kind=vkind, visual_units=v_units)
 
 
 def build_default_world_state_for_program(program: Any, *, seed: int = 0) -> Any:
@@ -388,24 +456,28 @@ class SyncCraftWorldPipeline:
 
             media = _prepare_media_from_pil_images(images)
             has_img = bool(media.get("images"))
-            text = str(
+            # Direct non-thinking generation avoids exhausting token budget inside open-ended `<think>` blocks
+            use_think = bool(self.enable_thinking and attempt == 0 and self.config.get("pipeline_enable_thinking", False))
+            raw_text = str(
                 generate(
                     self.model_or_fn,
                     prompt,
                     media=media,
-                    enable_thinking=self.enable_thinking,
+                    enable_thinking=use_think,
                     max_new_tokens=max_toks,
                     task="synccraft_multiview_inverse_dsl" if has_img else "synccraft_artist_assistant",
+                    system_prompt=SYNCCRAFT_V32_GRAMMAR_SYSTEM_PROMPT,
                 )
             )
-            tok_count = len(self.model_or_fn.tokenizer.encode(text, add_special_tokens=False))
-            return text, max(1, tok_count)
+            tok_count = len(self.model_or_fn.tokenizer.encode(raw_text, add_special_tokens=False))
+            return _extract_clean_blockdsl(raw_text), max(1, tok_count)
         if callable(self.model_or_fn):
             out = self.model_or_fn(prompt, images, attempt)
             if isinstance(out, tuple) and len(out) == 2:
-                return str(out[0]), int(out[1])
-            text = str(out)
-            return text, max(1, (len(text) + 3) // 4)
+                raw_s = str(out[0])
+                return _extract_clean_blockdsl(raw_s), int(out[1])
+            raw_s = str(out)
+            return _extract_clean_blockdsl(raw_s), max(1, (len(raw_s) + 3) // 4)
         raise TypeError(f"Unsupported model_or_fn {type(self.model_or_fn).__name__}; expected SparkNative or callable")
 
     def generate_3d_asset(

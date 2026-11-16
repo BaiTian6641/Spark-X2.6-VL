@@ -94,10 +94,11 @@ def generate(
         row['system_prompt']=system_prompt
     model.eval()
     import contextlib, torch
+    pol=getattr(model,'policy',{})
     use_bf16_amp=(
         str(getattr(model,'device','cpu')).startswith('cuda')
         and torch.cuda.is_available()
-        and getattr(model,'policy',{}).get('mixed_precision')=='bf16'
+        and (pol.get('mixed_precision')=='bf16' or pol.get('spark_dtype')=='bfloat16')
     )
     amp_ctx=torch.autocast('cuda',dtype=torch.bfloat16) if use_bf16_amp else contextlib.nullcontext()
     with torch.no_grad(), amp_ctx:

@@ -71,7 +71,7 @@ def run_verification(
             row, pkt = catalogue.row(rid)
             with reader.packet(pkt) as get:
                 media = prepare_media(row, get, cfg)
-            max_toks = 1792 if task_name.startswith("synccraft_") else int(cfg.get("evaluation_max_new_tokens", 384))
+            max_toks = 6400 if task_name.startswith("synccraft_") else int(cfg.get("evaluation_max_new_tokens", 384))
             pred = generate(
                 model,
                 row["prompt"],
@@ -143,9 +143,9 @@ def run_verification(
     text_to_3d = pipeline.generate_3d_asset(
         (
             "Design a complete SyncCraft Block-DSL v3.2 3D asset for an articulated quadruped sentinel hound "
-            "(`archetype='entity'`, `target_profile='bedrock_entity'`, `texel_density=16`, `audit_profile='strict'`, "
-            "at least 5 boxes across 3+ bones, including `@kinematics` two-bone leg IK and `@behavior` `walk_cycle` "
-            "with `foot_cycle(...)` stance slip <= 0.02u) that passes 15-axis SAT + P1-02 audit."
+            "(archetype: entity, target_profile: bedrock_entity, texel_density: 16, audit_profile: strict, "
+            "at least 5 boxes across 3+ bones, including @kinematics two-bone leg IK and @behavior walk_cycle "
+            "with foot_cycle(...) stance slip <= 0.02u) that passes 15-axis SAT + P1-02 audit."
         ),
         prompt_spec={"min_boxes": 5},
         asset_name="sentinel_hound_v32",
@@ -200,8 +200,8 @@ def run_verification(
         fp8_gen = pipe_fp8.generate_3d_asset(
             (
                 "Design a complete SyncCraft Block-DSL v3.2 3D asset for an articulated quadruped sentinel hound "
-                "(`archetype='entity'`, `target_profile='bedrock_entity'`, `texel_density=16`, `audit_profile='strict'`, "
-                "at least 5 boxes across 3+ bones, including `@kinematics` and `@behavior`) that passes 15-axis SAT + P1-02 audit."
+                "(archetype: entity, target_profile: bedrock_entity, texel_density: 16, audit_profile: strict, "
+                "at least 5 boxes across 3+ bones, including @kinematics and @behavior) that passes 15-axis SAT + P1-02 audit."
             ),
             prompt_spec={"min_boxes": 5},
             asset_name="sentinel_hound_v32_fp8",
