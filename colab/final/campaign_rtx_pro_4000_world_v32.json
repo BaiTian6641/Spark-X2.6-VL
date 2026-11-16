@@ -125,7 +125,7 @@
         "image",
         "video"
       ],
-      "epochs": 4,
+      "epochs": 3,
       "alignment_only": true,
       "stage_mode": "frozen_spark_cross_attn",
       "dynamic_epoch_records_per_family": {

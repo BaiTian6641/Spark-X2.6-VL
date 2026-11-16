@@ -199,22 +199,79 @@ class GatedVisualCrossAttentionBlock(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, visual_tokens: torch.Tensor) -> torch.Tensor:
         orig_dtype = hidden_states.dtype
-        work_dtype = self.norm_q.weight.dtype
-        x = hidden_states.to(work_dtype)
-        vis = visual_tokens.to(work_dtype)
+        compute_dtype = (
+            orig_dtype
+            if orig_dtype in (torch.bfloat16, torch.float16)
+            else self.norm_q.weight.dtype
+        )
+        x = hidden_states.to(compute_dtype)
+        vis = visual_tokens.to(compute_dtype)
         if vis.shape[0] == 1 and x.shape[0] > 1:
             vis = vis.expand(x.shape[0], -1, -1)
 
-        q = self.norm_q(x)
-        kv = self.norm_kv(vis)
-        attn_out, _ = self.attn(q, kv, kv, need_weights=False)
-        attn_out = self.drop(attn_out)
-        x = x + torch.tanh(self.gate_attn) * attn_out
+        d = self.hidden_size
+        head_dim = d // self.num_heads
+        q = F.layer_norm(
+            x.float(),
+            (d,),
+            self.norm_q.weight.float(),
+            self.norm_q.bias.float() if self.norm_q.bias is not None else None,
+            self.norm_q.eps,
+        ).to(compute_dtype)
+        kv = F.layer_norm(
+            vis.float(),
+            (d,),
+            self.norm_kv.weight.float(),
+            self.norm_kv.bias.float() if self.norm_kv.bias is not None else None,
+            self.norm_kv.eps,
+        ).to(compute_dtype)
 
-        h = self.norm_ffn(x)
-        ffn_hidden = self.drop(F.gelu(self.ffn_gate(h), approximate='tanh') * self.ffn_up(h))
-        ffn_out = self.drop(self.ffn_down(ffn_hidden))
-        x = x + torch.tanh(self.gate_ffn) * ffn_out
+        w_in = self.attn.in_proj_weight.to(compute_dtype)
+        b_in = self.attn.in_proj_bias.to(compute_dtype) if self.attn.in_proj_bias is not None else None
+        q_proj = F.linear(q, w_in[:d], None if b_in is None else b_in[:d])
+        kv_proj = F.linear(kv, w_in[d:], None if b_in is None else b_in[d:])
+        k_proj, v_proj = kv_proj.chunk(2, dim=-1)
+
+        bsz, q_len, _ = q_proj.shape
+        kv_len = k_proj.shape[1]
+        q_heads = q_proj.view(bsz, q_len, self.num_heads, head_dim).transpose(1, 2)
+        k_heads = k_proj.view(bsz, kv_len, self.num_heads, head_dim).transpose(1, 2)
+        v_heads = v_proj.view(bsz, kv_len, self.num_heads, head_dim).transpose(1, 2)
+        attn_p = float(self.attn.dropout) if self.training else 0.0
+        attn_ctx = F.scaled_dot_product_attention(q_heads, k_heads, v_heads, dropout_p=attn_p)
+        attn_ctx = attn_ctx.transpose(1, 2).contiguous().view(bsz, q_len, d)
+
+        w_out = self.attn.out_proj.weight.to(compute_dtype)
+        b_out = self.attn.out_proj.bias.to(compute_dtype) if self.attn.out_proj.bias is not None else None
+        attn_out = self.drop(F.linear(attn_ctx, w_out, b_out))
+        x = x + torch.tanh(self.gate_attn).to(compute_dtype) * attn_out
+
+        h = F.layer_norm(
+            x.float(),
+            (d,),
+            self.norm_ffn.weight.float(),
+            self.norm_ffn.bias.float() if self.norm_ffn.bias is not None else None,
+            self.norm_ffn.eps,
+        ).to(compute_dtype)
+        fg = F.linear(
+            h,
+            self.ffn_gate.weight.to(compute_dtype),
+            None if self.ffn_gate.bias is None else self.ffn_gate.bias.to(compute_dtype),
+        )
+        fu = F.linear(
+            h,
+            self.ffn_up.weight.to(compute_dtype),
+            None if self.ffn_up.bias is None else self.ffn_up.bias.to(compute_dtype),
+        )
+        ffn_hidden = self.drop(F.gelu(fg, approximate='tanh') * fu)
+        ffn_out = self.drop(
+            F.linear(
+                ffn_hidden,
+                self.ffn_down.weight.to(compute_dtype),
+                None if self.ffn_down.bias is None else self.ffn_down.bias.to(compute_dtype),
+            )
+        )
+        x = x + torch.tanh(self.gate_ffn).to(compute_dtype) * ffn_out
         return x.to(orig_dtype)
 
 
@@ -797,6 +854,15 @@ class SparkNative(nn.Module):
             block = self.visual_cross_attn[block_idx]
 
             def _make_hook(b: GatedVisualCrossAttentionBlock):
+                def _run_block(hs_in: torch.Tensor, v_in: torch.Tensor) -> torch.Tensor:
+                    if torch.is_grad_enabled() and (
+                        hs_in.requires_grad
+                        or v_in.requires_grad
+                        or any(p.requires_grad for p in b.parameters())
+                    ):
+                        return torch.utils.checkpoint.checkpoint(b, hs_in, v_in, use_reentrant=False)
+                    return b(hs_in, v_in)
+
                 def _hook(_module, _inputs, output):
                     vis_ctx = getattr(self, '_active_visual_context', None)
                     if vis_ctx is None:
@@ -804,9 +870,9 @@ class SparkNative(nn.Module):
                     if vis_ctx is None:
                         return output
                     if isinstance(output, tuple):
-                        hs = b(output[0], vis_ctx)
+                        hs = _run_block(output[0], vis_ctx)
                         return (hs, *output[1:])
-                    return b(output, vis_ctx)
+                    return _run_block(output, vis_ctx)
 
                 return _hook
 

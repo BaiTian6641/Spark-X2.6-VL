@@ -700,9 +700,11 @@ class Campaign:
                 cur_epoch=min(epochs,cursor.committed//epoch_size)
                 if eval_every_epoch and cur_epoch>evaluated_epoch and not self.stop_reason:
                     evaluated_epoch=cur_epoch
+                    if torch.cuda.is_available(): torch.cuda.empty_cache()
                     saved_rng=rng_state()
                     ep_eval=self.evaluate('dev',f"{stage['name']}-ep{cur_epoch}",generate=False)
                     set_rng(saved_rng)
+                    if torch.cuda.is_available(): torch.cuda.empty_cache()
                     self.model.train()
                     by_st=ep_eval.get('by_stratum',{}) if isinstance(ep_eval,dict) else {}
                     def _rec_count(v): return int(v.get('records',v.get('n',0)))
