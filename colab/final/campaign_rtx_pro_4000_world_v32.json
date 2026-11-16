@@ -112,7 +112,7 @@
       "families": [
         "image"
       ],
-      "epochs": 4,
+      "epochs": 2,
       "alignment_only": true,
       "stage_mode": "frozen_spark_connector",
       "dynamic_epoch_records_per_family": {

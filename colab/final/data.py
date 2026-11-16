@@ -395,6 +395,40 @@ class CommittedCursor:
         self.issued=max(self.issued,self.committed)
     def state(self): return {'order_sha256':self.order_sha256,'committed':self.committed,'records':len(self.order)}
 
+try:
+    from torch.utils.data import IterableDataset as _TorchIterableDataset
+except ImportError:  # pragma: no cover
+    _TorchIterableDataset = object
+
+
+class CursorStreamDataset(_TorchIterableDataset):
+    """Picklable top-level IterableDataset safe for `multiprocessing_context='spawn'`."""
+
+    def __init__(self, order: list[str], start: int):
+        self.order = list(order)
+        self.start = int(start)
+        self.remaining = max(0, len(self.order) - self.start)
+
+    def __len__(self) -> int:
+        return self.remaining
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        if not isinstance(index, int):
+            raise TypeError('Cursor dataset indices must be integers')
+        if not 0 <= index < self.remaining:
+            raise IndexError(index)
+        absolute = self.start + index
+        return {'rid': self.order[absolute], '_index': absolute}
+
+    def __iter__(self):
+        from torch.utils.data import get_worker_info
+        worker = get_worker_info()
+        step = worker.num_workers if worker else 1
+        offset = worker.id if worker else 0
+        for index in range(self.start + offset, len(self.order), step):
+            yield {'rid': self.order[index], '_index': index}
+
+
 def cursor_rows(order,cursor):
     """Shard metadata by worker while retaining a contiguous committed prefix."""
     from torch.utils.data import get_worker_info
@@ -404,20 +438,7 @@ def cursor_rows(order,cursor):
         yield {'rid':order[index],'_index':index}
 
 def cursor_dataset(order,cursor):
-    from torch.utils.data import IterableDataset
-    start=cursor.committed;remaining=len(order)-start
-    class Stream(IterableDataset):
-        # Unsloth's zero-loss probe treats every non-HF iterable as map-style.
-        # These read-only methods satisfy that probe; DataLoader still uses __iter__.
-        def __len__(self): return remaining
-        def __getitem__(self,index):
-            if not isinstance(index,int): raise TypeError('Cursor dataset indices must be integers')
-            if not 0<=index<remaining: raise IndexError(index)
-            absolute=start+index
-            return {'rid':order[absolute],'_index':absolute}
-        def __iter__(self):
-            yield from cursor_rows(order,cursor)
-    return Stream()
+    return CursorStreamDataset(order, cursor.committed)
 
 
 class MediaReader:
@@ -458,18 +479,28 @@ def decode_audio(payload):
     return wav.T.copy(),int(sr)
 
 def decode_video(payload,count,origin_seconds=None):
-    """Read decoded presentation timestamps, then decode only selected images."""
+    """Read decoded presentation timestamps, then decode only selected images without global swscale slice-threads."""
     import av, numpy as np
+    from PIL import Image
     pts=[]
     with av.open(io.BytesIO(payload)) as source:
+        vstream=source.streams.video[0]
+        vstream.thread_type='NONE'
+        vstream.thread_count=1
         for frame in source.decode(video=0):
             if frame.pts is None or frame.time_base is None: raise ValueError('Unknown video PTS')
             pts.append(float(frame.pts*frame.time_base))
     if not pts or any(b<=a for a,b in zip(pts,pts[1:])): raise ValueError('Unusable presentation clock')
     ids=np.linspace(0,len(pts)-1,count).round().astype(int).tolist(); wanted=set(ids); frames={}
+    reformatter=av.video.reformatter.VideoReformatter()
     with av.open(io.BytesIO(payload)) as source:
+        vstream=source.streams.video[0]
+        vstream.thread_type='NONE'
+        vstream.thread_count=1
         for i,frame in enumerate(source.decode(video=0)):
-            if i in wanted: frames[i]=frame.to_image().convert('RGB')
+            if i in wanted:
+                rgb_arr=reformatter.reformat(frame,format='rgb24',threads=1).to_ndarray()
+                frames[i]=Image.fromarray(rgb_arr,mode='RGB')
             if i>=max(ids): break
     if len(frames)!=len(wanted): raise ValueError('Video decode did not produce the selected frames')
     origin=pts[0] if origin_seconds is None else float(origin_seconds)

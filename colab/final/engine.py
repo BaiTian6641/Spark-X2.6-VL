@@ -556,7 +556,15 @@ class Campaign:
         norm_mode=str(self.c.get('merged_grad_norm_mode','per_example'))
 
         workers=int(self.c.get('dataloader_workers',0))
-        loader_kwargs={'prefetch_factor':int(self.c.get('dataloader_prefetch',2)),'persistent_workers':True} if workers>0 else {}
+        loader_kwargs=(
+            {
+                'prefetch_factor':int(self.c.get('dataloader_prefetch',2)),
+                'persistent_workers':False,
+                'multiprocessing_context':'spawn',
+            }
+            if workers>0
+            else {}
+        )
         loader=DataLoader(
             cursor_dataset(order,cursor),
             batch_size=microbatch,
@@ -738,6 +746,8 @@ class Campaign:
                 if self.stop_reason or batch is None:
                     break
         finally:
+            batches_iter=None
+            loader=None
             accumulator.close()
             del accumulator
             gc.collect()
