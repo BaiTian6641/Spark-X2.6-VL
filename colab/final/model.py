@@ -24,6 +24,7 @@ from .data import VIEW_IDS, VIEW_ID_TO_INDEX, VISUAL_KINDS, VISUAL_KIND_TO_INDEX
 
 _ACTIVE_VISUAL_CONTEXT: ContextVar[torch.Tensor | None] = ContextVar('_ACTIVE_VISUAL_CONTEXT', default=None)
 _INSIDE_VIS_CKPT_WRAPPER: ContextVar[bool] = ContextVar('_INSIDE_VIS_CKPT_WRAPPER', default=False)
+_SUPPRESS_XATTN_HOOK: ContextVar[bool] = ContextVar('_SUPPRESS_XATTN_HOOK', default=False)
 
 def install_spark_sdpa(spark):
     """Replace only the reference attention kernel, keeping masks/RoPE/gates."""
@@ -199,20 +200,22 @@ class GatedVisualCrossAttentionBlock(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, visual_tokens: torch.Tensor) -> torch.Tensor:
         orig_dtype = hidden_states.dtype
-        compute_dtype = (
-            orig_dtype
-            if orig_dtype in (torch.bfloat16, torch.float16)
-            else self.norm_q.weight.dtype
-        )
-        x = hidden_states.to(compute_dtype)
+        if hidden_states.is_cuda and torch.is_autocast_enabled():
+            compute_dtype = torch.get_autocast_gpu_dtype()
+        elif orig_dtype in (torch.bfloat16, torch.float16):
+            compute_dtype = orig_dtype
+        else:
+            compute_dtype = self.norm_q.weight.dtype
+
         vis = visual_tokens.to(compute_dtype)
-        if vis.shape[0] == 1 and x.shape[0] > 1:
-            vis = vis.expand(x.shape[0], -1, -1)
+        if vis.shape[0] == 1 and hidden_states.shape[0] > 1:
+            vis = vis.expand(hidden_states.shape[0], -1, -1)
 
         d = self.hidden_size
         head_dim = d // self.num_heads
+        res = hidden_states
         q = F.layer_norm(
-            x.float(),
+            res.float(),
             (d,),
             self.norm_q.weight.float(),
             self.norm_q.bias.float() if self.norm_q.bias is not None else None,
@@ -244,10 +247,10 @@ class GatedVisualCrossAttentionBlock(nn.Module):
         w_out = self.attn.out_proj.weight.to(compute_dtype)
         b_out = self.attn.out_proj.bias.to(compute_dtype) if self.attn.out_proj.bias is not None else None
         attn_out = self.drop(F.linear(attn_ctx, w_out, b_out))
-        x = x + torch.tanh(self.gate_attn).to(compute_dtype) * attn_out
+        res = res + (torch.tanh(self.gate_attn).float() * attn_out.float()).to(orig_dtype)
 
         h = F.layer_norm(
-            x.float(),
+            res.float(),
             (d,),
             self.norm_ffn.weight.float(),
             self.norm_ffn.bias.float() if self.norm_ffn.bias is not None else None,
@@ -271,8 +274,8 @@ class GatedVisualCrossAttentionBlock(nn.Module):
                 None if self.ffn_down.bias is None else self.ffn_down.bias.to(compute_dtype),
             )
         )
-        x = x + torch.tanh(self.gate_ffn).to(compute_dtype) * ffn_out
-        return x.to(orig_dtype)
+        res = res + (torch.tanh(self.gate_ffn).float() * ffn_out.float()).to(orig_dtype)
+        return res
 
 
 def spatial_downshuffle(x,h,w):
@@ -826,11 +829,15 @@ class SparkNative(nn.Module):
         for handle in getattr(self, '_xattn_hooks', []):
             handle.remove()
         self._xattn_hooks = []
+        layers = getattr(getattr(self.spark, 'model', None), 'layers', None)
+        if layers is not None:
+            for lyr in layers:
+                if hasattr(lyr, '_spark_xattn_idx'):
+                    delattr(lyr, '_spark_xattn_idx')
         if num_blocks == 0:
             self.visual_cross_attn = nn.ModuleList()
             self.visual_cross_attn_layer_indices = []
             return []
-        layers = getattr(getattr(self.spark, 'model', None), 'layers', None)
         if layers is None or len(layers) == 0:
             raise ValueError('Cannot attach gated visual cross-attention: spark.model.layers not found')
         n_layers = len(layers)
@@ -852,27 +859,21 @@ class SparkNative(nn.Module):
 
         for block_idx, layer_idx in enumerate(unique_indices):
             block = self.visual_cross_attn[block_idx]
+            layers[layer_idx]._spark_xattn_idx = block_idx
 
             def _make_hook(b: GatedVisualCrossAttentionBlock):
-                def _run_block(hs_in: torch.Tensor, v_in: torch.Tensor) -> torch.Tensor:
-                    if torch.is_grad_enabled() and (
-                        hs_in.requires_grad
-                        or v_in.requires_grad
-                        or any(p.requires_grad for p in b.parameters())
-                    ):
-                        return torch.utils.checkpoint.checkpoint(b, hs_in, v_in, use_reentrant=False)
-                    return b(hs_in, v_in)
-
                 def _hook(_module, _inputs, output):
+                    if _SUPPRESS_XATTN_HOOK.get():
+                        return output
                     vis_ctx = getattr(self, '_active_visual_context', None)
                     if vis_ctx is None:
                         vis_ctx = _ACTIVE_VISUAL_CONTEXT.get()
                     if vis_ctx is None:
                         return output
                     if isinstance(output, tuple):
-                        hs = _run_block(output[0], vis_ctx)
+                        hs = b(output[0], vis_ctx)
                         return (hs, *output[1:])
-                    return _run_block(output, vis_ctx)
+                    return b(output, vis_ctx)
 
                 return _hook
 
@@ -902,13 +903,41 @@ class SparkNative(nn.Module):
             vis_ctx = getattr(self, '_active_visual_context', None)
             if vis_ctx is None:
                 vis_ctx = _ACTIVE_VISUAL_CONTEXT.get()
+            bound_layer = getattr(fn, '__self__', None)
+            xattn_idx = getattr(bound_layer, '_spark_xattn_idx', None)
+            xattn_blk = (
+                self.visual_cross_attn[xattn_idx]
+                if (isinstance(xattn_idx, int) and 0 <= xattn_idx < len(self.visual_cross_attn))
+                else None
+            )
             guard_tok = _INSIDE_VIS_CKPT_WRAPPER.set(True)
             try:
                 if vis_ctx is None:
                     def _no_vis_fn(*a, **kw):
-                        with self._visual_cross_attn_scope(None):
-                            return fn(*a, **kw)
+                        sup_tok = _SUPPRESS_XATTN_HOOK.set(True)
+                        try:
+                            with self._visual_cross_attn_scope(None):
+                                return fn(*a, **kw)
+                        finally:
+                            _SUPPRESS_XATTN_HOOK.reset(sup_tok)
                     return base_ckpt(_no_vis_fn, *args, **kwargs)
+
+                if xattn_blk is not None:
+                    # Disjoint sequential checkpoint segments: decoder_layer and xattn_blk
+                    # never materialize autograd activations simultaneously during backward!
+                    def _layer_only_fn(*a, **kw):
+                        sup_tok = _SUPPRESS_XATTN_HOOK.set(True)
+                        try:
+                            with self._visual_cross_attn_scope(None):
+                                return fn(*a, **kw)
+                        finally:
+                            _SUPPRESS_XATTN_HOOK.reset(sup_tok)
+
+                    layer_out = base_ckpt(_layer_only_fn, *args, **kwargs)
+                    if isinstance(layer_out, tuple):
+                        hs_adapted = base_ckpt(xattn_blk, layer_out[0], vis_ctx)
+                        return (hs_adapted, *layer_out[1:])
+                    return base_ckpt(xattn_blk, layer_out, vis_ctx)
 
                 def _with_vis_fn(captured_vis, *a, **kw):
                     with self._visual_cross_attn_scope(captured_vis):
