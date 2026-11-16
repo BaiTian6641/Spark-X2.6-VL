@@ -74,7 +74,8 @@ Mandatory syntax rules:
 1. `@meta` ONLY accepts `archetype`, `target_profile`, `texel_density`, and optional `audit_profile` (`strict` | `sculpted` | `authored`) — never `version` or `domain`.
 2. `@palette` entries MUST use `mat_name: ramp(base_lch=[L, C, H], steps=6)` — never `#hex` or `rgb(...)`.
 3. Box `size: [W, H, D]` MUST be 3 positive INTEGER literals in square brackets `[W, H, D]` (never floats or parentheses).
-4. Child bones MUST attach cleanly via `attach(parent_box=<box>, anchor=[ax, ay, az], align=[lx, ly, lz])` so faces touch with 0 SAT penetration and 0 air gap."""
+4. Child bones MUST attach cleanly via `attach(parent_box=<box>, anchor=[ax, ay, az], align=[lx, ly, lz])` so faces touch with 0 SAT penetration and 0 air gap.
+5. Every bone and box identifier MUST be unique; when a bone declares `mirror_x(right_name)`, NEVER declare a separate `bone right_name` block (mirror_x expands it automatically)."""
 
 
 def _extract_clean_blockdsl(raw_text: str) -> str:
