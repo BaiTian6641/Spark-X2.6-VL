@@ -50,23 +50,33 @@ SYNCCRAFT_V32_GRAMMAR_SYSTEM_PROMPT = """You author valid SyncCraft Block-DSL v3
   root bone body_root {
     pivot_local: [0, 10, 0]
     box torso { size: [6, 5, 9], material: pelt_mat }
-    bone left_thigh attach(parent_box=torso, anchor=[-1, -0.6, -0.6], align=[1, 1, 0]) mirror_x(right_thigh) {
-      box thigh_seg { size: [2, 4, 2], material: pelt_mat }
-      bone left_shin attach(parent_box=thigh_seg, anchor=[0, -1, 0], align=[0, 1, 0]) {
-        box shin_seg { size: [2, 4, 2], material: hoof_mat }
+    bone fl_thigh attach(parent_box=torso, anchor=[-1, -0.6, -0.6], align=[1, 1, 0]) mirror_x(fr_thigh) {
+      box fl_thigh_seg { size: [2, 4, 2], material: pelt_mat }
+      bone fl_shin attach(parent_box=fl_thigh_seg, anchor=[0, -1, 0], align=[0, 1, 0]) {
+        box fl_shin_seg { size: [2, 4, 2], material: hoof_mat }
+      }
+    }
+    bone hl_thigh attach(parent_box=torso, anchor=[-1, -0.6, 0.6], align=[1, 1, 0]) mirror_x(hr_thigh) {
+      box hl_thigh_seg { size: [2, 4, 2], material: pelt_mat }
+      bone hl_shin attach(parent_box=hl_thigh_seg, anchor=[0, -1, 0], align=[0, 1, 0]) {
+        box hl_shin_seg { size: [2, 4, 2], material: hoof_mat }
       }
     }
   }
 }
 @kinematics {
-  ik_chain left_leg_ik { upper: left_thigh, lower: left_shin, effector: [0, -4, 0] }
-  ik_chain right_leg_ik { upper: right_thigh, lower: right_thigh__left_shin, effector: [0, -4, 0] }
+  ik_chain fl_leg_ik { upper: fl_thigh, lower: fl_shin, effector: [0, -4, 0] }
+  ik_chain fr_leg_ik { upper: fr_thigh, lower: fr_thigh__fl_shin, effector: [0, -4, 0] }
+  ik_chain hl_leg_ik { upper: hl_thigh, lower: hl_shin, effector: [0, -4, 0] }
+  ik_chain hr_leg_ik { upper: hr_thigh, lower: hr_thigh__hl_shin, effector: [0, -4, 0] }
 }
 @behavior {
   clip walk_cycle {
     duration_s: 1.6
-    ik_drive left_leg_ik: foot_cycle(stride=1.5, lift=0.65)
-    ik_drive right_leg_ik: foot_cycle(stride=1.5, lift=0.65, phase_deg=180)
+    ik_drive fl_leg_ik: foot_cycle(stride=1.5, lift=0.65, phase_deg=0)
+    ik_drive hr_leg_ik: foot_cycle(stride=1.5, lift=0.65, phase_deg=0)
+    ik_drive fr_leg_ik: foot_cycle(stride=1.5, lift=0.65, phase_deg=180)
+    ik_drive hl_leg_ik: foot_cycle(stride=1.5, lift=0.65, phase_deg=180)
   }
 }
 ```
