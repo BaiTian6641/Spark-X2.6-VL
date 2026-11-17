@@ -135,12 +135,12 @@ def eval_terminal_bench4_holdout(model: Any, holdout_tids: list[str], token: str
             model,
             (
                 f"[Terminal-Bench 4.0 Task: {tid}]\n{inst[:4500]}\n\n"
-                "Author a complete, non-interactive solution inside a ```bash ... ``` or ```python ... ``` code block."
+                "Author a complete, concise (< 120 lines), non-interactive solution inside a single closed ```bash ... ``` or ```python ... ``` code block (do not emit XML <tool_call> tags)."
             ),
             media=empty_media(),
             enable_thinking=True,
-            max_new_tokens=2304,
-            max_think_tokens=448,
+            max_new_tokens=3072,
+            max_think_tokens=384,
             repetition_penalty=1.06,
             task="terminal_bench_agent",
         )
