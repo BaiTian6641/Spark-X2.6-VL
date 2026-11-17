@@ -1333,13 +1333,19 @@ def prepare_hybrid_world_v32_data(root: str | Path, token: str | None, config: d
 
         human_studio_cap = int(config.get("hybrid_human_artist_sculpted_studio_rigs", 48))
         if human_studio_cap > 0:
-            human_p = _hf_cached_file(
-                SYNCCRAFT_ARTIST_REPO_ID,
-                "permissive_cc/train.jsonl",
-                revision=SYNCCRAFT_ARTIST_REVISION,
-                token=token,
-            )
-            raw_human = [json.loads(ln) for ln in human_p.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            raw_human: list[dict[str, Any]] = []
+            for sub_hf in ("data/permissive_cc/train.jsonl", "data/permissive_cc/val.jsonl"):
+                human_p = _hf_cached_file(
+                    SYNCCRAFT_ARTIST_REPO_ID,
+                    sub_hf,
+                    revision=SYNCCRAFT_ARTIST_REVISION,
+                    token=token,
+                )
+                raw_human.extend(
+                    json.loads(ln)
+                    for ln in human_p.read_text(encoding="utf-8").splitlines()
+                    if ln.strip()
+                )
             h_studio_recs, h_studio_blobs = build_human_artist_sculpted_studio_records(
                 raw_human,
                 max_assets=human_studio_cap,
