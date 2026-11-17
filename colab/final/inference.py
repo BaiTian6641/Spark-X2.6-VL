@@ -75,14 +75,21 @@ def generate(
     temperature:float=1.0,
     top_p:float=1.0,
     top_k:int|None=None,
-    repetition_penalty:float=1.0,
-    task:str='text_replay',
+    repetition_penalty:float|None=None,
+    max_think_tokens:int|None=None,
+    task:str='general_instruction',
     language:str='en',
     system_prompt:str|None=None,
 )->str:
     """Unified inference entrypoint routing pure-text calls directly to Spark and visual calls through connectors."""
     effective_media=media or empty_media()
     fam='image' if effective_media.get('images') else 'text'
+    eff_rep=float(repetition_penalty) if repetition_penalty is not None else (1.05 if enable_thinking else 1.0)
+    eff_max_think=(
+        max_think_tokens
+        if max_think_tokens is not None
+        else (min(768, max(64, int(max_new_tokens * 0.55))) if (enable_thinking and max_new_tokens >= 128) else None)
+    )
     row={
         '_family':fam,
         'language':language,
@@ -111,5 +118,6 @@ def generate(
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
-            repetition_penalty=repetition_penalty,
+            repetition_penalty=eff_rep,
+            max_think_tokens=eff_max_think,
         )

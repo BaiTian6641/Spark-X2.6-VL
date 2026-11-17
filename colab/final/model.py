@@ -1549,6 +1549,7 @@ class SparkNative(nn.Module):
         top_p: float = 1.0,
         top_k: int | None = None,
         repetition_penalty: float = 1.0,
+        max_think_tokens: int | None = None,
     ) -> list[int]:
         """KV-cached pure-text decoding directly on `self.spark.model(input_ids=...)` with zero visual overhead."""
         generated: list[int] = []
@@ -1557,10 +1558,38 @@ class SparkNative(nn.Module):
         length = int(input_ids.shape[1])
         max_seq = int(getattr(self, 'policy', {}).get('max_sequence', 8192))
         eos_id = self.tokenizer.eos_token_id
+        think_budget_checked = False
         with self._visual_cross_attn_scope(None):
             for _ in range(max_new_tokens):
                 if length + len(generated) >= max_seq:
                     break
+                if (
+                    max_think_tokens is not None
+                    and max_think_tokens > 0
+                    and not think_budget_checked
+                    and past is not None
+                    and len(generated) >= max_think_tokens
+                ):
+                    think_budget_checked = True
+                    cur_txt = self.tokenizer.decode(generated, skip_special_tokens=False)
+                    if '</think>' not in cur_txt:
+                        close_ids = list(self.tokenizer.encode('\n</think>\n', add_special_tokens=False))
+                        if close_ids and length + len(generated) + len(close_ids) < max_seq:
+                            bridge_ids = torch.tensor(
+                                [[int(cur_ids.view(-1)[-1].item()), *close_ids[:-1]]],
+                                device=input_ids.device,
+                                dtype=torch.long,
+                            )
+                            out_b = self.spark.model(
+                                input_ids=bridge_ids,
+                                past_key_values=past,
+                                use_cache=True,
+                                return_dict=True,
+                            )
+                            past = out_b.past_key_values
+                            generated.extend(int(x) for x in close_ids)
+                            cur_ids = torch.tensor([[int(close_ids[-1])]], device=input_ids.device, dtype=torch.long)
+
                 output = self.spark.model(
                     input_ids=cur_ids,
                     past_key_values=past,
@@ -1597,6 +1626,7 @@ class SparkNative(nn.Module):
         top_p: float = 1.0,
         top_k: int | None = None,
         repetition_penalty: float = 1.0,
+        max_think_tokens: int | None = None,
     ):
         effective_row = row if enable_thinking is None else {**row, 'enable_thinking': bool(enable_thinking)}
         if max_new_tokens is None:
@@ -1608,6 +1638,8 @@ class SparkNative(nn.Module):
                 max_new_tokens = 768 if want_th else 512
             else:
                 max_new_tokens = 1024 if want_th else 256
+
+        eff_max_think = max_think_tokens if bool(effective_row.get('enable_thinking', False)) else None
 
         # Pure-text fast path: call Spark directly via `input_ids` with zero visual-module execution!
         if not has_multimodal_context(media):
@@ -1641,6 +1673,7 @@ class SparkNative(nn.Module):
                 top_p=top_p,
                 top_k=top_k,
                 repetition_penalty=repetition_penalty,
+                max_think_tokens=eff_max_think,
             )
             decoded = self.tokenizer.decode(generated, skip_special_tokens=True)
             return self.chat.restore_thinking_prefix(
@@ -1655,9 +1688,39 @@ class SparkNative(nn.Module):
             for_generation=True,
         )
         generated=[]; past=None; state=None; length=embeds.shape[1]
+        think_budget_checked = False
         with self._visual_cross_attn_scope(vis_ctx):
             for _ in range(max_new_tokens):
                 if length+len(generated)>=self.policy['max_sequence']: break
+                if (
+                    eff_max_think is not None
+                    and eff_max_think > 0
+                    and not think_budget_checked
+                    and past is not None
+                    and generated
+                    and len(generated) >= eff_max_think
+                ):
+                    think_budget_checked = True
+                    cur_txt = self.tokenizer.decode(generated, skip_special_tokens=False)
+                    if '</think>' not in cur_txt:
+                        close_ids = list(self.tokenizer.encode('\n</think>\n', add_special_tokens=False))
+                        if close_ids and length + len(generated) + len(close_ids) < self.policy['max_sequence']:
+                            bridge_toks = torch.tensor(
+                                [[int(generated[-1]), *close_ids[:-1]]],
+                                device=self.device,
+                                dtype=torch.long,
+                            )
+                            out_b = self.spark.model(
+                                inputs_embeds=self.get_input_embeddings()(bridge_toks),
+                                past_key_values=past,
+                                use_cache=True,
+                                return_dict=True,
+                            )
+                            past = out_b.past_key_values
+                            generated.extend(int(x) for x in close_ids)
+                            state = self.get_input_embeddings()(
+                                torch.tensor([[int(close_ids[-1])]], device=self.device, dtype=torch.long)
+                            )
                 if past is None:
                     output=self.spark.model(inputs_embeds=embeds,use_cache=True,return_dict=True)
                 else:

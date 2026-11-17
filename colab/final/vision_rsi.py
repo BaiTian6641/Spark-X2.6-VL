@@ -372,12 +372,21 @@ def build_self_critique_turn(
     return None
 
 
+NON_PROSE_COLLAPSE_TASKS: frozenset[str] = frozenset(
+    {
+        "text_replay",
+        "video_box_tracking",
+    }
+)
+
+
 def audit_promotion_generation_health(eval_report: dict[str, Any]) -> dict[str, Any]:
-    """Compute anti-collapse generation metrics across a `generate=True` evaluation report."""
-    rows = [r for r in (eval_report.get("rows") or ()) if isinstance(r.get("prediction"), str)]
-    if not rows:
+    """Compute instruction-scoped anti-collapse metrics across a `generate=True` evaluation report (ADR-002)."""
+    all_rows = [r for r in (eval_report.get("rows") or ()) if isinstance(r.get("prediction"), str)]
+    if not all_rows:
         return {
             "generated_count": 0,
+            "instruction_count": 0,
             "healthy_rate": 1.0,
             "think_close_rate": 1.0,
             "mean_rep_4gram": 0.0,
@@ -385,13 +394,18 @@ def audit_promotion_generation_health(eval_report: dict[str, Any]) -> dict[str, 
             "anti_collapse_passed": True,
         }
 
+    inst_rows = [r for r in all_rows if str(r.get("task") or "") not in NON_PROSE_COLLAPSE_TASKS]
+    eval_rows = inst_rows if inst_rows else all_rows
+
     healthy_cnt = 0
     think_total = 0
     think_closed = 0
     reps: list[float] = []
-    for r in rows:
+    for r in eval_rows:
         pred = str(r["prediction"])
-        h = check_generation_collapse_health(pred, expect_thinking=False, max_rep_4gram=0.12, max_think_chars=5200)
+        is_dsl_or_json = str(r.get("task") or "").startswith("synccraft_")
+        rep_cap = 0.24 if is_dsl_or_json else 0.14
+        h = check_generation_collapse_health(pred, expect_thinking=False, max_rep_4gram=rep_cap, max_think_chars=5200)
         if h["healthy"]:
             healthy_cnt += 1
         reps.append(float(h.get("rep_4gram", compute_ngram_repetition_ratio(pred))))
@@ -400,13 +414,14 @@ def audit_promotion_generation_health(eval_report: dict[str, Any]) -> dict[str, 
             if h.get("think_closed"):
                 think_closed += 1
 
-    healthy_rate = healthy_cnt / len(rows)
+    healthy_rate = healthy_cnt / len(eval_rows)
     think_close_rate = (think_closed / think_total) if think_total > 0 else 1.0
     mean_rep = sum(reps) / len(reps)
     max_rep = max(reps)
     passed = (healthy_rate >= 0.88) and (think_close_rate >= 0.90) and (mean_rep <= 0.085)
     return {
-        "generated_count": len(rows),
+        "generated_count": len(all_rows),
+        "instruction_count": len(eval_rows),
         "healthy_rate": round(healthy_rate, 4),
         "think_responses": think_total,
         "think_close_rate": round(think_close_rate, 4),

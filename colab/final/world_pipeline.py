@@ -39,102 +39,72 @@ SUPPORTED_EXPORT_FORMATS = (
     "labpbr",
 )
 
-SYNCCRAFT_V32_GRAMMAR_SYSTEM_PROMPT = """You author valid, artist-grade SyncCraft Block-DSL v3.2 3D assets with rich anatomical/architectural hierarchy (never simplistic 5-9 box headless toys). Every Block-DSL v3.2 program MUST strictly obey this syntax:
-```blockdsl
-@meta { archetype: entity, target_profile: bedrock_entity, texel_density: 16, audit_profile: strict }
-@palette {
-  coat_fur: ramp(base_lch=[0.58, 0.10, 48], steps=6)
-  underbelly_fur: ramp(base_lch=[0.76, 0.05, 68], steps=6)
-  armor_plate: ramp(base_lch=[0.42, 0.08, 245], steps=6)
-  dark_keratin: ramp(base_lch=[0.26, 0.03, 35], steps=6)
-  amber_glow: ramp(base_lch=[0.80, 0.17, 78], steps=6, emissive=true)
-}
-@rig {
-  root bone pelvis_root {
-    pivot_local: [0, 12, 0]
-    box ribcage { size: [6, 6, 7], material: coat_fur }
-    box chest_armor place(base_box=ribcage, anchor=[0, 1, -0.2], align=[0, -1, 0]) {
-      size: [6, 1, 5], material: armor_plate, inflate: 0.2
-    }
-    box belly_trim place(base_box=ribcage, anchor=[0, -1, 0.1], align=[0, 1, 0]) {
-      size: [4, 1, 5], material: underbelly_fur
-    }
-    box pelvis place(base_box=ribcage, anchor=[0, 0.15, 1], align=[0, 0, -1]) {
-      size: [5, 5, 5], material: coat_fur
-    }
-    bone neck attach(parent_box=ribcage, anchor=[0, 0.5, -1], align=[0, -0.5, 1]) {
-      box neck_core { size: [4, 4, 3], material: coat_fur }
-      box collar_crest place(base_box=neck_core, anchor=[0, 1, 0.2], align=[0, -1, 0]) {
-        size: [4, 1, 2], material: armor_plate
-      }
-      bone head attach(parent_box=neck_core, anchor=[0, 0.3, -1], align=[0, -0.5, 1]) {
-        box skull { size: [5, 4, 4], material: coat_fur }
-        box brow_crest place(base_box=skull, anchor=[0, 1, -0.4], align=[0, -1, 0]) {
-          size: [1, 1, 2], material: amber_glow
-        }
-        box muzzle place(base_box=skull, anchor=[0, 0.15, -1], align=[0, 0, 1]) {
-          size: [3, 2, 3], material: underbelly_fur
-        }
-        box nose_tip place(base_box=muzzle, anchor=[0, 0.5, -1], align=[0, 0, 1]) {
-          size: [1, 1, 1], material: dark_keratin
-        }
-        box lower_jaw place(base_box=skull, anchor=[0, -0.75, -1], align=[0, 0, 1]) {
-          size: [3, 1, 2], material: dark_keratin
-        }
-        bone left_ear attach(parent_box=skull, anchor=[-0.8, 1, 0.4], align=[0, -1, 0]) mirror_x(right_ear) {
-          box left_ear_pinna { size: [1, 3, 2], material: dark_keratin }
-        }
-      }
-    }
-    bone tail_base attach(parent_box=pelvis, anchor=[0, 0.6, 1], align=[0, 0, -1]) {
-      box tail_prox { size: [2, 2, 4], material: coat_fur }
-      bone tail_tip attach(parent_box=tail_prox, anchor=[0, 0, 1], align=[0, 0, -1]) {
-        box tail_plume { size: [2, 2, 4], material: underbelly_fur }
-      }
-    }
-    bone fl_thigh attach(parent_box=ribcage, anchor=[-1, -0.5, -0.6], align=[1, 1, 0]) mirror_x(fr_thigh) {
-      box fl_thigh_seg { size: [2, 4, 2], material: armor_plate }
-      bone fl_shin attach(parent_box=fl_thigh_seg, anchor=[0, -1, 0], align=[0, 1, 0]) {
-        box fl_shin_seg { size: [2, 4, 2], material: coat_fur }
-        box fl_paw place(base_box=fl_shin_seg, anchor=[0, -1, -0.25], align=[0, 1, 0]) {
-          size: [2, 1, 3], material: dark_keratin
-        }
-      }
-    }
-    bone hl_thigh attach(parent_box=pelvis, anchor=[-1, -0.5, 0.4], align=[1, 1, 0]) mirror_x(hr_thigh) {
-      box hl_thigh_seg { size: [2, 4, 2], material: coat_fur }
-      bone hl_shin attach(parent_box=hl_thigh_seg, anchor=[0, -1, 0], align=[0, 1, 0]) {
-        box hl_shin_seg { size: [2, 4, 2], material: coat_fur }
-        box hl_paw place(base_box=hl_shin_seg, anchor=[0, -1, -0.25], align=[0, 1, 0]) {
-          size: [2, 1, 3], material: dark_keratin
-        }
-      }
-    }
-  }
-}
-@kinematics {
-  ik_chain fl_leg_ik { upper: fl_thigh, lower: fl_shin, effector: [0, -5, 0] }
-  ik_chain fr_leg_ik { upper: fr_thigh, lower: fr_thigh__fl_shin, effector: [0, -5, 0] }
-  ik_chain hl_leg_ik { upper: hl_thigh, lower: hl_shin, effector: [0, -5, 0] }
-  ik_chain hr_leg_ik { upper: hr_thigh, lower: hr_thigh__hl_shin, effector: [0, -5, 0] }
-}
-@behavior {
-  clip walk_cycle {
-    duration_s: 1.6
-    ik_drive fl_leg_ik: foot_cycle(stride=1.5, lift=0.65, phase_deg=0)
-    ik_drive hr_leg_ik: foot_cycle(stride=1.5, lift=0.65, phase_deg=0)
-    ik_drive fr_leg_ik: foot_cycle(stride=1.5, lift=0.65, phase_deg=180)
-    ik_drive hl_leg_ik: foot_cycle(stride=1.5, lift=0.65, phase_deg=180)
-  }
-}
-```
-Mandatory syntax & aesthetic quality rules:
-1. `@meta` ONLY accepts `archetype`, `target_profile`, `texel_density`, and optional `audit_profile` (`strict` | `sculpted` | `authored`) — never `version` or `domain`. Section order: `@meta`, `@palette`, `@rig`, optional `@materials`, optional `@style`, optional `@muscles`, optional `@kinematics`, optional `@behavior`.
-2. `@palette` entries MUST use `mat_name: ramp(base_lch=[L, C, H], steps=6)` — never `#hex` or `rgb(...)`. Use 3 to 6 distinct harmonious OKLCH ramps for primary mass, secondary trim/underbelly, armor/structure, dark keratin/joints, and focal accents.
-3. Box `size: [W, H, D]` MUST be 3 positive INTEGER literals in square brackets `[W, H, D]` (never floats or parentheses). Vary proportions across primary, secondary, and tertiary detail boxes.
-4. Child bones MUST attach cleanly via `attach(parent_box=<box>, anchor=[ax, ay, az], align=[lx, ly, lz])` so faces touch with 0 SAT penetration and 0 air gap.
-5. Every bone and box identifier MUST be unique; when a bone declares `mirror_x(right_name)`, NEVER declare a separate `bone right_name` block (`mirror_x` expands it automatically).
-6. Author complete artist-grade silhouettes (16–48 boxes for entities/creatures/vehicles): include distinct trunk/ribcage + pelvis/base, articulated neck + head/skull + muzzle/jaw/ears/crest, multi-segment tail or secondary appendages, 3-part limbs (thigh/upper + shin/lower + paw/foot), and layered armor/trim plates."""
+SYNCCRAFT_V32_COMPACT_RULES = (
+    "Mandatory SyncCraft Block-DSL v3.2 grammar & anti-toy rules:\n"
+    "1. `@meta` ONLY accepts `archetype` (`entity` | `prop` | `architecture` | `vehicle`), `target_profile` "
+    "(`bedrock_entity` | `bbmodel_5` | `java_modern` | `gltf_pbr`), `texel_density` (int), and optional `audit_profile` "
+    "(`strict` | `sculpted` | `authored`) — NEVER `format_version`, `version`, `domain`, or `entity:`.\n"
+    "2. Section order: `@meta`, `@palette`, `@rig`, optional `@materials`, optional `@style`, optional `@muscles`, optional `@kinematics`, optional `@behavior` (NEVER `@animation`).\n"
+    "3. `@palette` entries MUST use `<name>_mat: ramp(base_lch=[L, C, H], steps=6)` with `0<L<=1` — NEVER `oklch(...)` or `#hex`. "
+    "ALWAYS suffix `@palette` identifiers with `_mat` so they NEVER collide with `bone` or `box` names (all identifiers share ONE global namespace).\n"
+    "4. Box `size: [W, H, D]` MUST be 3 positive INTEGER literals in square brackets. Child boxes use `place(base_box=<box>, anchor=[ax,ay,az], align=[lx,ly,lz])`; "
+    "child bones use `attach(parent_box=<box>, anchor=[ax,ay,az], align=[lx,ly,lz])` with 0 SAT penetration and 0 air gap.\n"
+    "5. When a bone declares `mirror_x(<right_name>)`, NEVER declare a separate `bone <right_name>` block (in `@kinematics`, mirrored child bones are referenced as `<right_name>__<left_child>`).\n"
+    "6. Author rich 16–42 box artist silhouettes matching the requested subject: primary core + secondary taper/pelvis, neck/head/focal assembly, ears/crest/appendages, 3-part limbs, and 4–6 contrasting `_mat` ramps."
+)
+
+SYNCCRAFT_V32_GRAMMAR_SYSTEM_PROMPT = (
+    "You author valid, artist-grade SyncCraft Block-DSL v3.2 3D assets with rich structural hierarchy (never simplistic 5-9 box toys). "
+    "Follow this exact grammar skeleton (adapt bone/box topology, proportions, and colors to the requested subject):\n"
+    "```blockdsl\n"
+    "@meta { archetype: entity, target_profile: bedrock_entity, texel_density: 16, audit_profile: strict }\n"
+    "@palette {\n"
+    "  primary_mat: ramp(base_lch=[0.58, 0.10, 48], steps=6)\n"
+    "  under_mat: ramp(base_lch=[0.76, 0.05, 68], steps=6)\n"
+    "  armor_mat: ramp(base_lch=[0.42, 0.08, 245], steps=6)\n"
+    "  dark_mat: ramp(base_lch=[0.26, 0.03, 35], steps=6)\n"
+    "  accent_mat: ramp(base_lch=[0.80, 0.17, 78], steps=6, emissive=true)\n"
+    "}\n"
+    "@rig {\n"
+    "  root bone root_core {\n"
+    "    pivot_local: [0, 12, 0]\n"
+    "    box trunk_core { size: [6, 6, 7], material: primary_mat }\n"
+    "    box armor_shell place(base_box=trunk_core, anchor=[0, 1, -0.2], align=[0, -1, 0]) {\n"
+    "      size: [6, 1, 5], material: armor_mat, inflate: 0.2\n"
+    "    }\n"
+    "    bone neck_joint attach(parent_box=trunk_core, anchor=[0, 0.5, -1], align=[0, -0.5, 1]) {\n"
+    "      box neck_seg { size: [4, 4, 3], material: primary_mat }\n"
+    "      bone head_joint attach(parent_box=neck_seg, anchor=[0, 0.3, -1], align=[0, -0.5, 1]) {\n"
+    "        box cranium { size: [5, 4, 4], material: primary_mat }\n"
+    "        box snout place(base_box=cranium, anchor=[0, 0.1, -1], align=[0, 0, 1]) { size: [3, 2, 3], material: under_mat }\n"
+    "        bone left_crest attach(parent_box=cranium, anchor=[-0.8, 1, 0.4], align=[0, -1, 0]) mirror_x(right_crest) {\n"
+    "          box crest_fin { size: [1, 3, 2], material: dark_mat }\n"
+    "        }\n"
+    "      }\n"
+    "    }\n"
+    "    bone fl_upper attach(parent_box=trunk_core, anchor=[-1, -0.5, -0.6], align=[1, 1, 0]) mirror_x(fr_upper) {\n"
+    "      box fl_upper_seg { size: [2, 4, 2], material: armor_mat }\n"
+    "      bone fl_lower attach(parent_box=fl_upper_seg, anchor=[0, -1, 0], align=[0, 1, 0]) {\n"
+    "        box fl_lower_seg { size: [2, 4, 2], material: primary_mat }\n"
+    "        box fl_foot place(base_box=fl_lower_seg, anchor=[0, -1, -0.25], align=[0, 1, 0]) { size: [2, 1, 3], material: dark_mat }\n"
+    "      }\n"
+    "    }\n"
+    "  }\n"
+    "}\n"
+    "@kinematics {\n"
+    "  ik_chain fl_ik { upper: fl_upper, lower: fl_lower, effector: [0, -5, 0] }\n"
+    "  ik_chain fr_ik { upper: fr_upper, lower: fr_upper__fl_lower, effector: [0, -5, 0] }\n"
+    "}\n"
+    "@behavior {\n"
+    "  clip walk_cycle {\n"
+    "    duration_s: 1.6\n"
+    "    ik_drive fl_ik: foot_cycle(stride=1.5, lift=0.65, phase_deg=0)\n"
+    "    ik_drive fr_ik: foot_cycle(stride=1.5, lift=0.65, phase_deg=180)\n"
+    "  }\n"
+    "}\n"
+    "```\n"
+    + SYNCCRAFT_V32_COMPACT_RULES
+)
 
 
 def evaluate_3d_asset_aesthetics(
@@ -336,7 +306,16 @@ def _build_repair_prompt(
         f"Repair attempt: {attempt}",
     ]
     if feedback.get("error"):
-        lines.append(f"Compiler/audit error: {feedback['error']}")
+        err_s = str(feedback["error"])
+        lines.append(f"Compiler/audit error: {err_s}")
+        dup_m = re.search(r"duplicate identifier:\s*([A-Za-z0-9_]+)", err_s)
+        if dup_m:
+            dup_id = dup_m.group(1)
+            lines.append(
+                f"CRITICAL FIX: `{dup_id}` is declared more than once! `@palette` material names, `bone` names, and `box` names "
+                f"share ONE global namespace — rename the `@palette` ramp `{dup_id}:` to `{dup_id}_mat:` and update every "
+                f"`material: {dup_id}` to `material: {dup_id}_mat` (or rename the duplicate bone/box so every identifier is unique)."
+            )
     collisions = list(feedback.get("collision_pairs") or ())
     if collisions:
         formatted_cols = ", ".join(
@@ -656,17 +635,33 @@ class SyncCraftWorldPipeline:
 
             media = _prepare_media_from_pil_images(images)
             has_img = bool(media.get("images"))
-            # Direct non-thinking generation avoids exhausting token budget inside open-ended `<think>` blocks
-            use_think = bool(self.enable_thinking and attempt == 0 and self.config.get("pipeline_enable_thinking", False))
+            # Preserve exact trained SYSTEM_PROMPT when images are supplied so visual token RoPE positions match Stage-4/5 training!
+            eff_prompt = (
+                f"{prompt.rstrip()}\n\n{SYNCCRAFT_V32_COMPACT_RULES}"
+                if (has_img and "Mandatory SyncCraft Block-DSL v3.2" not in prompt)
+                else prompt
+            )
+            eff_sys = None if has_img else SYNCCRAFT_V32_GRAMMAR_SYSTEM_PROMPT
+            use_think = bool(
+                self.enable_thinking
+                and attempt == 0
+                and (has_img or bool(self.config.get("pipeline_enable_thinking", False)))
+            )
+            is_repair_sample = int(attempt) >= 1
             raw_text = str(
                 generate(
                     self.model_or_fn,
-                    prompt,
+                    eff_prompt,
                     media=media,
                     enable_thinking=use_think,
                     max_new_tokens=max_toks,
+                    max_think_tokens=384 if use_think else None,
+                    do_sample=is_repair_sample,
+                    temperature=min(0.65, 0.35 + 0.10 * int(attempt)) if is_repair_sample else 1.0,
+                    top_p=0.92 if is_repair_sample else 1.0,
+                    repetition_penalty=1.05 if is_repair_sample else 1.04,
                     task="synccraft_multiview_inverse_dsl" if has_img else "synccraft_artist_assistant",
-                    system_prompt=SYNCCRAFT_V32_GRAMMAR_SYSTEM_PROMPT,
+                    system_prompt=eff_sys,
                 )
             )
             tok_count = len(self.model_or_fn.tokenizer.encode(raw_text, add_special_tokens=False))
@@ -717,6 +712,11 @@ class SyncCraftWorldPipeline:
             raw_generations.append(txt)
             return txt, toks
 
+        is_authored_prof = bool(
+            re.search(r"audit_profile\s*[:=]\s*['\"]?authored['\"]?", prompt)
+        )
+        enforce_contact = not is_authored_prof
+
         repair_result = run_bounded_repair_policy(
             _initial_gen,
             prompt_spec if prompt_spec is not None else {},
@@ -724,7 +724,7 @@ class SyncCraftWorldPipeline:
             max_reaudits=int(max_reaudits),
             model_repair_fn=_repair_callback,
             max_projection_steps_per_reaudit=int(max_projection_steps_per_reaudit),
-            enforce_physical_contact=True,
+            enforce_physical_contact=enforce_contact,
         )
 
         aesthetic_eval: dict[str, Any] | None = None
@@ -759,7 +759,7 @@ class SyncCraftWorldPipeline:
                     + f"\n\nOriginal request:\n{prompt.strip()}\n\n"
                     f"Initial Block-DSL blockout:\n```blockdsl\n{format_program(repair_result['program'])}\n```\n\n"
                     "Upgrade this blockout into an artist-grade 18–42 box articulated SyncCraft Block-DSL v3.2 asset "
-                    "with complete cranial/head anatomy, tapered trunk/pelvis, secondary armor/trim, >=4 OKLCH ramps, "
+                    "with complete cranial/head anatomy, tapered trunk/pelvis, secondary armor/trim, >=4 OKLCH `_mat` ramps, "
                     "and zero 15-axis SAT collisions."
                 )
 
@@ -775,7 +775,7 @@ class SyncCraftWorldPipeline:
                     max_reaudits=rem_reaudits - 1,
                     model_repair_fn=_repair_callback,
                     max_projection_steps_per_reaudit=int(max_projection_steps_per_reaudit),
-                    enforce_physical_contact=True,
+                    enforce_physical_contact=enforce_contact,
                 )
                 if upgrade_res["passed"] and upgrade_res["program"] is not None:
                     cand_aes = evaluate_3d_asset_aesthetics(upgrade_res["program"], prompt=prompt)

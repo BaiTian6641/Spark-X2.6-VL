@@ -921,3 +921,53 @@ def test_vision_rsi_verifier_and_self_critique_no_leakage():
     assert diag_rich["score"] >= 0.85
 
 
+def test_adr002_rsi_collapse_scope_think_budget_and_neutral_grammar():
+    """Verify ADR-002 instruction-scoped collapse gate, KV-cached `<think>` budget forcing, and neutral 3D grammar."""
+    from colab.final.inference import empty_media
+    from colab.final.vision_rsi import audit_promotion_generation_health
+    from colab.final.world_pipeline import SYNCCRAFT_V32_GRAMMAR_SYSTEM_PROMPT, _build_repair_prompt
+
+    # 1. Neutral grammar must NOT contain hound-specific identifiers (`pelvis_root` / `ribcage`)
+    assert "pelvis_root" not in SYNCCRAFT_V32_GRAMMAR_SYSTEM_PROMPT
+    assert "ribcage" not in SYNCCRAFT_V32_GRAMMAR_SYSTEM_PROMPT
+    assert "primary_mat" in SYNCCRAFT_V32_GRAMMAR_SYSTEM_PROMPT
+
+    # 2. Targeted `duplicate identifier` repair prompt guidance
+    rep_p = _build_repair_prompt(
+        "Upgrade hound",
+        "@meta { archetype: entity, target_profile: bedrock_entity, texel_density: 16 }",
+        {"error": "syntax_or_validation_error: duplicate identifier: chest_armor"},
+        1,
+    )
+    assert "chest_armor_mat" in rep_p
+
+    # 3. `audit_promotion_generation_health` ignores raw Wikipedia `text_replay` loops while catching real instruction collapse
+    mock_report = {
+        "rows": [
+            {"id": "w1", "task": "text_replay", "prediction": " ".join(["wiki continuation phrase"] * 30)},
+            {"id": "v1", "task": "video_box_tracking", "prediction": '[{"timestamp_seconds": 0.0, "box_xyxy": [0,0,1,1], "visible": true}] ' * 8},
+            {"id": "i1", "task": "gpqa_extended_science", "prediction": "<think>\nDerive orbital parity step by step.\n</think>\nAnswer: (B)"},
+            {"id": "i2", "task": "factual_caption", "prediction": "A stone sculpture of two white birds sits beside a sunlit grassy hillside."},
+            {"id": "i3", "task": "sat_3d_perspective", "prediction": "<think>\nCamera rotates right 30 degrees.\n</think>\nleft of the table"},
+        ]
+    }
+    health = audit_promotion_generation_health(mock_report)
+    assert health["generated_count"] == 5
+    assert health["instruction_count"] == 3
+    assert health["healthy_rate"] == 1.0
+    assert health["think_close_rate"] == 1.0
+    assert health["anti_collapse_passed"] is True
+
+    # 4. KV-cached `max_think_tokens` budget forcing closes `</think>` cleanly
+    model = make_synthetic_spark_native({"visual_cross_attn_blocks": 3}, seed=17)
+    forced_out = model.answer(
+        {"_family": "text", "language": "en", "task": "gpqa_extended_science", "prompt": "Solve orbital energy."},
+        empty_media(),
+        max_new_tokens=28,
+        enable_thinking=True,
+        max_think_tokens=6,
+    )
+    assert "<think>" in forced_out and "</think>" in forced_out
+
+
+
