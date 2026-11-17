@@ -932,7 +932,11 @@ def test_adr002_rsi_collapse_scope_think_budget_and_neutral_grammar():
     assert "ribcage" not in SYNCCRAFT_V32_GRAMMAR_SYSTEM_PROMPT
     assert "primary_mat" in SYNCCRAFT_V32_GRAMMAR_SYSTEM_PROMPT
 
-    # 2. Targeted `duplicate identifier` repair prompt guidance
+    # 2. Targeted `duplicate identifier` & `mirror_x` repair prompt guidance + Terminal-Bench 4.0 pin
+    from colab.final.reasoning_agentic_corpus import TERMINAL_BENCH4_REPO_ID, TERMINAL_BENCH4_REVISION
+
+    assert TERMINAL_BENCH4_REPO_ID == "harborframework/terminal-bench"
+    assert len(TERMINAL_BENCH4_REVISION) == 40
     rep_p = _build_repair_prompt(
         "Upgrade hound",
         "@meta { archetype: entity, target_profile: bedrock_entity, texel_density: 16 }",
@@ -940,6 +944,13 @@ def test_adr002_rsi_collapse_scope_think_budget_and_neutral_grammar():
         1,
     )
     assert "chest_armor_mat" in rep_p
+    rep_mir = _build_repair_prompt(
+        "Upgrade hound",
+        "bone fl_upper attach(parent_box=trunk, anchor=[-1,0,0], align=[1,0,0]) mirror_x(fr_upper) {}\nbone fr_upper {}",
+        {"error": "syntax_or_validation_error: duplicate identifier: fr_upper"},
+        1,
+    )
+    assert "CRITICAL MIRROR_X FIX" in rep_mir
 
     # 3. `audit_promotion_generation_health` ignores raw Wikipedia `text_replay` loops while catching real instruction collapse
     mock_report = {

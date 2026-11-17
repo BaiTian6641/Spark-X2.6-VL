@@ -45,6 +45,9 @@ CLAUDE_FABLE5_CODE_REVISION = "7388ef96f3179f23b6b3618b96572f1aa9b84510"
 TERMINAL_BENCH3_REPO_ID = "harborframework/terminal-bench-3.0"
 TERMINAL_BENCH3_REVISION = "2ee5a897d6be85513b41f44b945c4ff4d3e04a1d"
 
+TERMINAL_BENCH4_REPO_ID = "harborframework/terminal-bench"
+TERMINAL_BENCH4_REVISION = "3b8d57a69a7d28b73238c7ce9ecc62c8c794bff9"  # Official immutable v4.0.0 tag (Apache-2.0)
+
 OPENTHOUGHTS_REPO_ID = "open-thoughts/OpenThoughts-114k"
 OPENTHOUGHTS_REVISION = "bd093c3994fd54d2390985b66988ddf282a55eb6"
 
@@ -582,20 +585,34 @@ def _build_terminal_bench_records(
     token: str | None,
     config: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], list[str]]:
-    """Build Terminal-Bench 3.0 (`Apache-2.0`) trajectories while holding out 1/3 of tasks strictly for evaluation."""
+    """Build Terminal-Bench 4.0 / 3.0 (`Apache-2.0`) trajectories while holding out 1/3 of tasks strictly for evaluation."""
     from huggingface_hub import HfApi
 
+    tb_ver = str(config.get("terminal_bench_version", "4.0")).strip()
+    sources: list[tuple[str, str, str]] = []
+    if tb_ver in ("4.0", "both"):
+        sources.append(("tb4", TERMINAL_BENCH4_REPO_ID, TERMINAL_BENCH4_REVISION))
+    if tb_ver in ("3.0", "both"):
+        sources.append(("tb3", TERMINAL_BENCH3_REPO_ID, TERMINAL_BENCH3_REVISION))
+    if not sources:
+        sources.append(("tb4", TERMINAL_BENCH4_REPO_ID, TERMINAL_BENCH4_REVISION))
+
     api = HfApi(token=token)
-    info = api.dataset_info(TERMINAL_BENCH3_REPO_ID, revision=TERMINAL_BENCH3_REVISION)
-    by_task: dict[str, set[str]] = defaultdict(set)
-    for sib in info.siblings or ():
-        parts = sib.rfilename.split("/")
-        if len(parts) >= 3 and parts[0] == "tasks":
-            by_task[parts[1]].add(sib.rfilename)
+    task_registry: dict[str, tuple[str, str, str, set[str]]] = {}
+    for tag_prefix, repo_id, rev in sources:
+        info = api.dataset_info(repo_id, revision=rev)
+        by_task: dict[str, set[str]] = defaultdict(set)
+        for sib in info.siblings or ():
+            parts = sib.rfilename.split("/")
+            if len(parts) >= 3 and parts[0] == "tasks":
+                by_task[parts[1]].add(sib.rfilename)
+        for tid, tfiles in sorted(by_task.items()):
+            if tid not in task_registry:
+                task_registry[tid] = (tag_prefix, repo_id, rev, tfiles)
 
     holdout_tasks: list[str] = []
     train_tasks: list[str] = []
-    for tid in sorted(by_task):
+    for tid in sorted(task_registry):
         bucket = int(hashlib.sha256(f"tb3_holdout_v1:{tid}".encode("utf-8")).hexdigest()[:8], 16) % 3
         if bucket == 0:
             holdout_tasks.append(tid)
@@ -604,7 +621,7 @@ def _build_terminal_bench_records(
 
     records: list[dict[str, Any]] = []
     for t_idx, tid in enumerate(train_tasks):
-        files = by_task[tid]
+        tag_prefix, repo_id, rev, files = task_registry[tid]
         inst_rel = f"tasks/{tid}/instruction.md"
         if inst_rel not in files:
             continue
@@ -615,9 +632,9 @@ def _build_terminal_bench_records(
             continue
 
         inst_txt = _hf_file(
-            TERMINAL_BENCH3_REPO_ID,
+            repo_id,
             inst_rel,
-            revision=TERMINAL_BENCH3_REVISION,
+            revision=rev,
             token=token,
         ).read_text(encoding="utf-8", errors="replace").strip()
 
@@ -625,9 +642,9 @@ def _build_terminal_bench_records(
         sol_names: list[str] = []
         for s_rel in sol_candidates[:2]:
             s_txt = _hf_file(
-                TERMINAL_BENCH3_REPO_ID,
+                repo_id,
                 s_rel,
-                revision=TERMINAL_BENCH3_REVISION,
+                revision=rev,
                 token=token,
             ).read_text(encoding="utf-8", errors="replace").strip()
             if not s_txt or len(s_txt) > 9000:
@@ -656,10 +673,10 @@ def _build_terminal_bench_records(
         )
         if sup_ans is None or len(inst_txt) > 7500:
             continue
-        gid = f"terminal-bench-3:{tid}"
+        gid = f"terminal-bench:{tid}"
         records.append(
             {
-                "id": f"tb3-train-{tid}",
+                "id": f"{tag_prefix}-train-{tid}",
                 "source_id": tid,
                 "source_group": gid,
                 "language": "en",
@@ -674,10 +691,11 @@ def _build_terminal_bench_records(
                 "answer": sup_ans,
                 "target": {"kind": "text", "text": ans_body},
                 "metadata": {
-                    "dataset": TERMINAL_BENCH3_REPO_ID,
-                    "revision": TERMINAL_BENCH3_REVISION,
+                    "dataset": repo_id,
+                    "revision": rev,
                     "license_spdx": "Apache-2.0",
                     "terminal_task_id": tid,
+                    "terminal_bench_tag": tag_prefix,
                     "real_text_corpus": True,
                     "grouping_keys": [gid],
                 },
