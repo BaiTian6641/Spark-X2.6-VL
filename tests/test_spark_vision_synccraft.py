@@ -1071,5 +1071,60 @@ def test_stage6_campaign_config_and_sculpted_vision_rsi():
     assert diag_good["score"] >= 0.90
 
 
+def test_stage6_1_priority_slice_and_disjoint_v4_supervision():
+    """Verify Stage-6.1 priority task weighting, repeat caps, and 0% overlap with held-out v4.0 benchmark items."""
+    from collections import Counter
+    from colab.final.common import HERE, read, validate_config
+    from colab.final.data import _stratified_epoch_slice
+    from colab.final.sculpted_style_corpus import build_sculpted_style_curriculum_records
+    from colab.final.synccraft_bridge import evaluate_synccraft_completion
+    from synccraft.world.assembly_world_tasks import build_modular_assembly_supervision_suite
+
+    cfg = validate_config(read(HERE / "campaign_rtx_pro_4000_stage6_1_sculpted_native.json"))
+    assert cfg["init_from_release_dir"] == "./work/spark-world-v40-stage6-sculpted-rsi/final-model"
+    assert cfg["learning_rate"] == 1.2e-5
+    st = cfg["stages"][0]
+    assert st["task_weight_multipliers"]["synccraft_sculpted_style_creation"] >= 8.0
+
+    recs, _ = build_sculpted_style_curriculum_records(
+        variants_per_family=2,
+        include_v4_assembly_tasks=True,
+        panel_size=(80, 80),
+    )
+    heldout_v4 = build_modular_assembly_supervision_suite()
+    heldout_ids = {x["task_id"] for x in heldout_v4}
+    heldout_prompts = {x["prompt"].strip() for x in heldout_v4}
+    v4_recs = [r for r in recs if r["task"] == "synccraft_v4_modular_assembly"]
+    assert len(v4_recs) >= 30
+    for r in v4_recs:
+        assert r["metadata"]["v4_spec"]["task_id"] not in heldout_ids
+        assert r["prompt"].strip() not in heldout_prompts
+        assert evaluate_synccraft_completion(r, r["answer"])["passed"] is True
+
+    fake_rows = [(f"r_{i}",) for i in range(600)]
+    task_map = {
+        f"r_{i}": (
+            "synccraft_sculpted_style_creation"
+            if i < 40
+            else ("synccraft_v4_modular_assembly" if i < 55 else ("terminal_bench_agent" if i < 80 else "text_replay"))
+        )
+        for i in range(600)
+    }
+    sl = _stratified_epoch_slice(
+        fake_rows,
+        220,
+        task_map,
+        [42, "s61", "text"],
+        0,
+        st["task_weight_multipliers"],
+        st["task_repeat_cap"],
+    )
+    counts = Counter(task_map[x[0]] for x in sl)
+    assert counts["synccraft_sculpted_style_creation"] >= 60
+    assert counts["synccraft_v4_modular_assembly"] >= 35
+    assert counts["terminal_bench_agent"] >= 35
+
+
+
 
 

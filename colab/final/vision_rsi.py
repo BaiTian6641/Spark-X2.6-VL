@@ -514,12 +514,12 @@ def _select_stratified_rsi_pool(
     has_sculpted = bool(buckets.get("sculpted_3d"))
     target_shares = (
         {
-            "sculpted_3d": max(6, round(total_records * 0.28)),
-            "uv_alpha": max(4, round(total_records * 0.14)),
-            "multiview_3d": max(4, round(total_records * 0.14)),
-            "artist_3d": max(4, round(total_records * 0.14)),
-            "sat_3d": max(4, round(total_records * 0.10)),
-            "fine_vision": max(4, round(total_records * 0.10)),
+            "sculpted_3d": max(8, round(total_records * 0.38)),
+            "uv_alpha": max(4, round(total_records * 0.12)),
+            "multiview_3d": max(4, round(total_records * 0.12)),
+            "artist_3d": max(4, round(total_records * 0.12)),
+            "sat_3d": max(4, round(total_records * 0.08)),
+            "fine_vision": max(4, round(total_records * 0.08)),
             "reasoning_code": max(4, round(total_records * 0.10)),
         }
         if has_sculpted

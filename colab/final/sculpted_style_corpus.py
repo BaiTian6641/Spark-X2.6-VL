@@ -2060,13 +2060,34 @@ def build_sculpted_style_curriculum_records(
             ans_dsl_block = f"```blockdsl\n{canonical_e}\n```"
             use_think = (v % 4 != 3)
 
-            # 1. Text -> Sculpted Block-DSL (`synccraft_sculpted_style_creation`)
+            # 1. Text -> Sculpted Block-DSL (`synccraft_sculpted_style_creation`) with diverse natural phrasings
             th_create = _trait_sheet_think(meta, ev_e, "synccraft_sculpted_style_creation")
             ver_clause = (
                 'using modular Block-DSL v4.0 (`@layout`, `@component`, `@assembly`, `audit_profile: sculpted`)'
                 if ev_e["dsl_version"] == "4.0"
                 else 'using Sculpted Block-DSL (`audit_profile: sculpted`, `size_step: 0.5`, `hue_shift` ramps, seated joints, and alpha-cutout `plane`s)'
             )
+            prompt_style = v % 4
+            if prompt_style == 0 or ev_e["dsl_version"] == "4.0":
+                create_prompt = (
+                    f"Design a vibrant, deliberately sculpted 3D Blockbench asset for: {meta['concept']} "
+                    f"({meta['tier']}), {ver_clause}. Avoid rigid grid-aligned boxes, straight pipe necks, or flat unpainted faces."
+                )
+            elif prompt_style == 1:
+                create_prompt = (
+                    f"Design a vibrant, deliberately sculpted 3D Blockbench asset for: {meta['concept']} "
+                    f"({meta['tier']}), using Sculpted Block-DSL (`audit_profile: sculpted`, `size_step: 0.5`)."
+                )
+            elif prompt_style == 2:
+                create_prompt = (
+                    f"Create a sculpted 3D Blockbench model in SyncCraft Block-DSL (`audit_profile: sculpted`, `size_step: 0.5`) "
+                    f"for {meta['concept']} featuring {meta['palette_plan']} and {meta['ratios']}."
+                )
+            else:
+                create_prompt = (
+                    f"Author a complete, collision-audited Sculpted Block-DSL (`target_profile: bbmodel_5`, `size_step: 0.5`, "
+                    f"`audit_profile: sculpted`) 3D Blockbench model for: {meta['concept']} ({meta['tier']})."
+                )
             records.append(
                 {
                     "id": f"{aid}#sculpted_create",
@@ -2075,10 +2096,7 @@ def build_sculpted_style_curriculum_records(
                     "task": "synccraft_sculpted_style_creation",
                     "enable_thinking": use_think,
                     "frames": [],
-                    "prompt": (
-                        f"Design a vibrant, deliberately sculpted 3D Blockbench asset for: {meta['concept']} "
-                        f"({meta['tier']}), {ver_clause}. Avoid rigid grid-aligned boxes, straight pipe necks, or flat unpainted faces."
-                    ),
+                    "prompt": create_prompt,
                     "answer": format_supervised_answer(ans_dsl_block, th_create, enable_thinking=use_think),
                     "target": {"kind": "text", "text": ans_dsl_block},
                     "provenance": prov,
@@ -2091,14 +2109,14 @@ def build_sculpted_style_curriculum_records(
                 }
             )
 
-            # Render studio turnaround views for the first `min(variants_per_family, 8)` variants per family
-            if v < 8:
+            # Render studio turnaround views for the first `min(variants_per_family, 10)` variants per family
+            if v < 10:
                 views = ("south", "right", "top", "iso")
                 pngs_e, _ = render_sculpted_turnaround_views(
                     prog_e,
                     views=views,
                     panel_size=panel_size,
-                    include_silhouette_sheet=(v < 4),
+                    include_silhouette_sheet=(v < 6),
                 )
                 e_paths = [f"sculpted_v6/{aid}_e_{vw}.png" for vw in views]
                 for i_vw, vw in enumerate(views):
@@ -2174,7 +2192,7 @@ def build_sculpted_style_curriculum_records(
                 )
 
                 # 4. Studio + Black Silhouette Self-Critique (`synccraft_sculpted_self_critique`) on BOTH stiff C & sculpted E!
-                if v < 4 and "silhouette_sheet" in pngs_e:
+                if v < 6 and "silhouette_sheet" in pngs_e:
                     sil_e_path = f"sculpted_v6/{aid}_e_sil.png"
                     media_blobs[sil_e_path] = pngs_e["silhouette_sheet"]
                     pngs_c_sil, _ = render_sculpted_turnaround_views(
@@ -2228,23 +2246,142 @@ def build_sculpted_style_curriculum_records(
                             }
                         )
 
-    # 5. Also integrate SyncCraft v4.0 `@layout/@component/@assembly` modular world-model tasks (`1f41187`) when available!
+    # 5. Integrate strictly DISJOINT SyncCraft v4.0 `@layout/@component/@assembly` modular world-model tasks
+    # (0% overlap with `build_modular_assembly_supervision_suite()`'s held-out `v4_wm_01..04` benchmark items!)
     if include_v4_assembly_tasks:
         try:
-            from synccraft.dsl.assembly_ir import override_layout_params
             from synccraft.audit.sync_audit import audit_scene
-            from synccraft.dsl.assembly_ir import audit_assembly_contracts
+            from synccraft.dsl.assembly_ir import (
+                AssemblySpec,
+                audit_assembly_contracts,
+                format_assembly_sections,
+                override_layout_params,
+            )
             from synccraft.kinematics.se3_chain import compile_geometry
             from synccraft.world.assembly_world_tasks import (
                 MODULAR_ARTILLERY_WALKER_V4_DSL,
                 MODULAR_SCULPTED_DRAGON_V4_DSL,
-                build_modular_assembly_supervision_suite,
+                _serialize_single_component_dsl,
             )
 
-            base_v4_suite = list(build_modular_assembly_supervision_suite())
-            # Add parametric chest_width / hull_width propagation variants + full modular walker synthesis
+            disjoint_v4_items: list[dict[str, Any]] = []
             dragon_prog_v4 = parse_program(MODULAR_SCULPTED_DRAGON_V4_DSL)
-            for cw in (11, 12, 15, 16):
+            walker_prog_v4 = parse_program(MODULAR_ARTILLERY_WALKER_V4_DSL)
+            wolf_v4_dsl, _, _ = build_sculpted_storm_wolf_dragon_v4_dsl(0)
+            wolf_prog_v4 = parse_program(wolf_v4_dsl)
+
+            # (A) Disjoint `@layout` planning tasks (`walker` & `storm_wolf_dragon`, never `ModularElderDragon` held-out!)
+            for lay_tag, lay_prog, lay_desc in (
+                (
+                    "walker_layout",
+                    walker_prog_v4,
+                    "4-legged mechanical steam artillery walker assembly with driving parameters hull_width, hull_length, and barrel_length, max_boxes <= 52, max_bones <= 32, and min_ground_y >= -0.5",
+                ),
+                (
+                    "wolf_dragon_layout",
+                    wolf_prog_v4,
+                    "fanged storm wolf-dragon assembly with driving parameters body_length and chest_width, derived pelvis_len, chest_len, and head_w, max_boxes <= 48, max_bones <= 28, and min_ground_y >= -1.0",
+                ),
+            ):
+                lay_spec = lay_prog.assembly_spec
+                req_p = [p.name for p in lay_spec.layout.params[:2]]
+                lay_dsl = "\n".join(format_assembly_sections(AssemblySpec(layout=lay_spec.layout, components=(), assembly=None)))
+                disjoint_v4_items.append(
+                    {
+                        "task_id": f"v4_train_layout_{lay_tag}",
+                        "task_type": "plan_layout_and_interfaces",
+                        "assembly_provenance": "authored",
+                        "required_params": req_p,
+                        "prompt": f"Design a top-down @layout block for a {lay_desc}.",
+                        "oracle_completion": f"```blockdsl\n{lay_dsl.strip()}\n```",
+                    }
+                )
+
+            # (B) Disjoint single-`@component` synthesis tasks (all components EXCEPT held-out `DragonSkull` & `RecoilBarrel`!)
+            heldout_comps = {"DragonSkull", "RecoilBarrel"}
+            for asm_label, src_prog, src_dsl_s in (
+                ("ModularElderDragon", dragon_prog_v4, MODULAR_SCULPTED_DRAGON_V4_DSL),
+                ("ModularArtilleryWalker", walker_prog_v4, MODULAR_ARTILLERY_WALKER_V4_DSL),
+                ("StormWolfDragon", wolf_prog_v4, wolf_v4_dsl),
+            ):
+                for comp in src_prog.assembly_spec.components:
+                    if comp.name in heldout_comps:
+                        continue
+                    c_dsl = _serialize_single_component_dsl(comp).strip()
+                    p_names = ", ".join(f"`{p.name}`" for p in comp.params) or "none"
+                    m_slots = "[" + ", ".join(s for s, _ in comp.material_slots) + "]"
+                    f_names = ", ".join(f"`{f.name}`" for f in comp.frames)
+                    disjoint_v4_items.append(
+                        {
+                            "task_id": f"v4_train_comp_{asm_label}_{comp.name}",
+                            "task_type": "synthesize_component_from_contract",
+                            "assembly_provenance": "authored",
+                            "parent_assembly_dsl": src_dsl_s,
+                            "target_component_name": comp.name,
+                            "required_frames": [f.name for f in comp.frames],
+                            "required_material_slots": [s for s, _ in comp.material_slots],
+                            "prompt": (
+                                f"Synthesize ONLY `@component {comp.name}` in its local namespace exposing parameters ({p_names}), "
+                                f"material_slots `{m_slots}`, and public attachment frames {f_names} so it mounts cleanly "
+                                f"into `{asm_label}` with 0 SAT collisions."
+                            ),
+                            "oracle_completion": f"```blockdsl\n{c_dsl}\n```",
+                        }
+                    )
+
+            # (C) Disjoint surgical `@component` swap tasks (on `TailSegment` and `SweptHorn` — NEVER held-out `RecoilBarrel`!)
+            tail_fin_swap = """@component TailSegment {
+  param w = 4 [2, 8]
+  param l = 6 [3, 12]
+  material_slots: [hide]
+  box caudal { size: [w, max(2, w - 1), l], material: hide }
+  plane dorsal_fin place(base_box=caudal, anchor=[0, 1, 0], align=[0, -1, 0]) {
+    size: [2, max(2, l - 1)], normal: x, material: hide
+  }
+  frame fore_mount { on_box: caudal, anchor: [0, 0, 1], rot: [0, 0, 0] }
+  frame aft_socket { on_box: caudal, anchor: [0, 0, -1], rot: [0, 0, 0] }
+}"""
+            disjoint_v4_items.append(
+                {
+                    "task_id": "v4_train_swap_dragon_tail_fin",
+                    "task_type": "surgical_component_swap_and_repair",
+                    "assembly_provenance": "authored",
+                    "base_assembly_dsl": MODULAR_SCULPTED_DRAGON_V4_DSL,
+                    "target_component_name": "TailSegment",
+                    "prompt": (
+                        "Upgrade `@component TailSegment` in `ModularElderDragon` by adding a dorsal `plane dorsal_fin` "
+                        "on top of `caudal` (`anchor=[0, 1, 0], align=[0, -1, 0], normal: x`) while preserving `fore_mount`, "
+                        "`aft_socket`, and all other dragon components unchanged."
+                    ),
+                    "oracle_completion": f"```blockdsl\n{tail_fin_swap}\n```",
+                }
+            )
+            horn_tine_swap = """@component SweptHorn {
+  param len = 6 [3, 12]
+  material_slots: [keratin]
+  box horn_beam { size: [2, 2, len], material: keratin }
+  box brow_tine place(base_box=horn_beam, anchor=[0, 1, 0.2], align=[0, -1, 0]) {
+    size: [1, 2, 2], material: keratin
+  }
+  frame base_mount { on_box: horn_beam, anchor: [0, 0, 1], rot: [-26, -18, 0] }
+}"""
+            disjoint_v4_items.append(
+                {
+                    "task_id": "v4_train_swap_dragon_horn_tine",
+                    "task_type": "surgical_component_swap_and_repair",
+                    "assembly_provenance": "authored",
+                    "base_assembly_dsl": MODULAR_SCULPTED_DRAGON_V4_DSL,
+                    "target_component_name": "SweptHorn",
+                    "prompt": (
+                        "Upgrade `@component SweptHorn` in `ModularElderDragon` by adding an upward `[1, 2, 2]` `brow_tine` "
+                        "atop `horn_beam` (`anchor=[0, 1, 0.2], align=[0, -1, 0]`) while preserving `base_mount` and all other components unchanged."
+                    ),
+                    "oracle_completion": f"```blockdsl\n{horn_tine_swap}\n```",
+                }
+            )
+
+            # (D) Disjoint `@layout` parameter propagation tasks (`chest_width` != 14 + `hull_width` overrides on Walker!)
+            for cw in (8, 9, 11, 12, 13, 15, 16):
                 pert = override_layout_params(dragon_prog_v4, {"chest_width": cw})
                 sc_p = compile_geometry(pert)
                 aud_p = audit_assembly_contracts(pert, sc_p)
@@ -2255,9 +2392,9 @@ def build_sculpted_style_curriculum_records(
                     "audit_passed": bool(sat_p["passed"] and aud_p["passed"]),
                     "world_span_x": round(float(aud_p["world_span"][0]), 4),
                 }
-                base_v4_suite.append(
+                disjoint_v4_items.append(
                     {
-                        "task_id": f"v4_wm_04_propagate_dragon_cw_{cw}",
+                        "task_id": f"v4_train_propagate_dragon_cw_{cw}",
                         "task_type": "propagate_layout_and_instance_controls",
                         "assembly_provenance": "authored",
                         "base_assembly_dsl": MODULAR_SCULPTED_DRAGON_V4_DSL,
@@ -2271,11 +2408,13 @@ def build_sculpted_style_curriculum_records(
                         "oracle_completion": json.dumps(gt_p, sort_keys=True),
                     }
                 )
+
+            # (E) Full modular assembly synthesis
             for mod_name, mod_dsl, mod_desc in (
                 ("modular_elder_dragon_v4", MODULAR_SCULPTED_DRAGON_V4_DSL, "4-legged winged sculpted dragon with `@layout`, `@component`, and `@assembly`"),
                 ("modular_artillery_walker_v4", MODULAR_ARTILLERY_WALKER_V4_DSL, "4-legged mechanical steam artillery walker with revolute turret and prismatic recoil barrel"),
             ):
-                base_v4_suite.append(
+                disjoint_v4_items.append(
                     {
                         "task_id": f"v4_wm_full_{mod_name}",
                         "task_type": "full_modular_assembly_synthesis",
@@ -2288,7 +2427,7 @@ def build_sculpted_style_curriculum_records(
                     }
                 )
 
-            for idx_v4, v4_item in enumerate(base_v4_suite):
+            for idx_v4, v4_item in enumerate(disjoint_v4_items):
                 p_txt = str(v4_item.get("prompt") or "").strip()
                 raw_oracle = str(v4_item.get("oracle_completion") or "").strip()
                 if not p_txt or not raw_oracle:

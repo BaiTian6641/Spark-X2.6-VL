@@ -252,10 +252,20 @@ def _stratified_group_shuffle(rids, group_by_rid, rng):
         group_keys = next_keys
     return out
 
-def _stratified_epoch_slice(fam_rows, target_n, task_by_rid, seed_prefix, epoch):
+def _stratified_epoch_slice(
+    fam_rows,
+    target_n,
+    task_by_rid,
+    seed_prefix,
+    epoch,
+    task_weight_multipliers=None,
+    task_repeat_cap=None,
+):
     """Draw a deterministic, task-balanced, cyclic-disjoint slice of size `target_n` for `epoch`."""
     target_n = int(target_n)
-    if target_n <= 0 or len(fam_rows) <= target_n:
+    mults = dict(task_weight_multipliers or {})
+    rep_caps = dict(task_repeat_cap or {})
+    if target_n <= 0 or (not mults and not rep_caps and len(fam_rows) <= target_n):
         return list(fam_rows)
     by_task = defaultdict(list)
     for r in fam_rows:
@@ -265,27 +275,36 @@ def _stratified_epoch_slice(fam_rows, target_n, task_by_rid, seed_prefix, epoch)
         t: sorted(by_task[t], key=lambda x: identity([*seed_prefix, 'task_pool', t, x[0]]))
         for t in tasks
     }
+    caps = {
+        t: len(pools[t]) * max(1, int(rep_caps.get(t, 1)))
+        for t in tasks
+    }
+    if sum(caps.values()) <= target_n:
+        target_n = sum(caps.values())
     quotas = {t: 0 for t in tasks}
     # Minimum floor so rare high-signal tasks are represented every epoch
     floor_each = max(1, target_n // max(2, 2 * len(tasks)))
     remaining = target_n
     for t in tasks:
-        give = min(len(pools[t]), floor_each, remaining)
+        give = min(caps[t], floor_each, remaining)
         quotas[t] = give
         remaining -= give
-    # Distribute remaining budget proportional to sqrt(pool_size) (anti-collapse temperature weighting)
+    # Distribute remaining budget proportional to sqrt(pool_size) * priority multiplier
     while remaining > 0:
-        avail = [t for t in tasks if quotas[t] < len(pools[t])]
+        avail = [t for t in tasks if quotas[t] < caps[t]]
         if not avail:
             break
-        weights = {t: math.sqrt(len(pools[t])) for t in avail}
+        weights = {
+            t: math.sqrt(len(pools[t])) * max(0.05, float(mults.get(t, 1.0)))
+            for t in avail
+        }
         w_sum = sum(weights.values()) or 1.0
         progressed = False
         for t in sorted(avail, key=lambda k: (-weights[k], k)):
             if remaining <= 0:
                 break
             share = max(1, int(round(remaining * weights[t] / w_sum)))
-            add = min(len(pools[t]) - quotas[t], share, remaining)
+            add = min(caps[t] - quotas[t], share, remaining)
             if add > 0:
                 quotas[t] += add
                 remaining -= add
@@ -361,7 +380,17 @@ class Catalogue:
                 for fam in sorted(by_fam_all):
                     f_cap=dyn_cap.get(fam) if isinstance(dyn_cap,dict) else int(dyn_cap)
                     if f_cap:
-                        epoch_rows.extend(_stratified_epoch_slice(by_fam_all[fam],f_cap,task_by_rid,[seed,stage.get('name',''),fam],epoch))
+                        epoch_rows.extend(
+                            _stratified_epoch_slice(
+                                by_fam_all[fam],
+                                f_cap,
+                                task_by_rid,
+                                [seed,stage.get('name',''),fam],
+                                epoch,
+                                task_weight_multipliers=stage.get('task_weight_multipliers'),
+                                task_repeat_cap=stage.get('task_repeat_cap'),
+                            )
+                        )
                     else:
                         epoch_rows.extend(by_fam_all[fam])
             else:
