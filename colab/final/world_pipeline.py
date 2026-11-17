@@ -298,7 +298,7 @@ def evaluate_3d_asset_aesthetics(
 
 
 def _extract_clean_blockdsl(raw_text: str) -> str:
-    """Strip closed/unclosed `<think>` wrappers and Markdown fences deterministically."""
+    """Strip closed/unclosed `<think>` wrappers, salvage truncated trailing lines, and close Markdown fences."""
     txt = str(raw_text or "")
     # 1. Prefer an explicit ```blockdsl ... ``` code fence anywhere after `</think>` (or in full text)
     after_think = txt.split("</think>", 1)[1] if "</think>" in txt else re.sub(r"^<think>\s*", "", txt)
@@ -313,10 +313,20 @@ def _extract_clean_blockdsl(raw_text: str) -> str:
             cleaned = re.sub(r"<think>.*?</think>", "", txt, flags=re.DOTALL | re.IGNORECASE).strip()
             meta_idx = cleaned.find("@meta")
             cand = cleaned[meta_idx:].replace("```", "").strip() if meta_idx >= 0 else cleaned.replace("```", "").strip()
+
     open_braces = cand.count("{")
     close_braces = cand.count("}")
-    if 0 < (open_braces - close_braces) <= 4:
-        cand = cand + ("\n}" * (open_braces - close_braces))
+    if open_braces > close_braces:
+        # Drop any trailing incomplete line(s) cut off mid-declaration by max_new_tokens before closing open scopes
+        lines = cand.splitlines()
+        while lines and not lines[-1].rstrip().endswith("}"):
+            lines.pop()
+        if lines:
+            cand = "\n".join(lines)
+            open_braces = cand.count("{")
+            close_braces = cand.count("}")
+        if 0 < (open_braces - close_braces) <= 8:
+            cand = cand + ("\n}" * (open_braces - close_braces))
     return cand
 
 
@@ -349,15 +359,29 @@ def _build_repair_prompt(
     feedback: Mapping[str, Any],
     attempt: int,
 ) -> str:
+    is_sculpted_cand = ("audit_profile: sculpted" in candidate_dsl) or ("size_step: 0.5" in candidate_dsl) or ("sculpted" in original_prompt.lower())
     lines = [
-        "Repair the SyncCraft v3.2 Block-DSL asset below so it compiles cleanly and passes all audits.",
-        "Keep every integer box `size` tuple discrete and unchanged when fixing small pose/offset collisions unless syntax/adherence requires adding missing parts.",
+        "Repair the SyncCraft Block-DSL asset below so it compiles cleanly and passes all audits.",
+        (
+            "Preserve `size_step: 0.5, audit_profile: sculpted`, `hue_shift` ramps, `plane` cutouts, and non-grid rotations while fixing syntax or overlap errors."
+            if is_sculpted_cand
+            else "Keep every integer box `size` tuple discrete and unchanged when fixing small pose/offset collisions unless syntax/adherence requires adding missing parts."
+        ),
         f"Original request:\n{original_prompt.strip()}",
         f"Repair attempt: {attempt}",
     ]
     if feedback.get("error"):
         err_s = str(feedback["error"])
         lines.append(f"Compiler/audit error: {err_s}")
+        if "got 'base'" in err_s or "expected 'parent_box'" in err_s or "expected 'anchor'" in err_s:
+            lines.append(
+                "CRITICAL ATTACH/PLACE FIX: Child bones MUST use `attach(parent_box=<box>, anchor=[ax,ay,az], align=[lx,ly,lz])` "
+                "(use `parent_box=`, NEVER `base=`), and sibling boxes MUST use `place(base_box=<box>, anchor=[ax,ay,az], align=[lx,ly,lz])`!"
+            )
+        if "rest_euler" in err_s or "expected box, plane, locator, bone" in err_s:
+            lines.append(
+                "CRITICAL ROOT BONE FIX: `root bone <name> { pivot_local: [x, y, z] ... }` ONLY accepts `pivot_local:` (NEVER `rest_euler:` on `root bone`; put `rotate: [...]` on the root box instead!)."
+            )
         dup_m = re.search(r"duplicate identifier:\s*([A-Za-z0-9_]+)", err_s)
         if dup_m:
             dup_id = dup_m.group(1)
@@ -369,9 +393,8 @@ def _build_repair_prompt(
                 )
             else:
                 lines.append(
-                    f"CRITICAL FIX: `{dup_id}` is declared more than once! `@palette` material names, `bone` names, and `box` names "
-                    f"share ONE global namespace — rename the `@palette` ramp `{dup_id}:` to `{dup_id}_mat:` and update every "
-                    f"`material: {dup_id}` to `material: {dup_id}_mat` (or rename the duplicate bone/box so every identifier is unique)."
+                    f"CRITICAL FIX: `{dup_id}` is declared more than once! Give each sibling box/bone a unique name (`{dup_id}_1`, `{dup_id}_2`, ...) "
+                    f"and ensure `@palette` material names end with `_mat` (`{dup_id}_mat`) so every identifier in the program is globally unique."
                 )
     collisions = list(feedback.get("collision_pairs") or ())
     if collisions:
@@ -396,9 +419,16 @@ def _build_repair_prompt(
     if adh:
         lines.append(f"Prompt adherence violations: {', '.join(str(v) for v in adh[:8])}")
     lines.append(f"Current candidate Block-DSL:\n```blockdsl\n{candidate_dsl.strip()}\n```")
-    lines.append(
-        "Output ONLY the complete repaired ```blockdsl ... ``` program obeying `@meta { archetype: ..., target_profile: ..., texel_density: ... }`, `ramp(base_lch=[...], steps=6)`, integer `size: [W, H, D]`, and `attach(parent_box=..., anchor=[...], align=[...])`."
-    )
+    if is_sculpted_cand:
+        lines.append(
+            "Output ONLY the complete repaired ```blockdsl ... ``` program obeying `@meta { ..., size_step: 0.5, audit_profile: sculpted }`, "
+            "`ramp(base_lch=[...], steps=6, hue_shift=[-14, 10])`, `size: [W, H, D]` multiples of `0.5` (`plane` `size: [W, H], normal: x|y|z`), "
+            "and `attach(parent_box=..., anchor=[...], align=[...])`."
+        )
+    else:
+        lines.append(
+            "Output ONLY the complete repaired ```blockdsl ... ``` program obeying `@meta { archetype: ..., target_profile: ..., texel_density: ... }`, `ramp(base_lch=[...], steps=6)`, integer `size: [W, H, D]`, and `attach(parent_box=..., anchor=[...], align=[...])`."
+        )
     return "\n\n".join(lines)
 
 
@@ -740,22 +770,27 @@ class SyncCraftWorldPipeline:
                     )
                 )
             )
-            compact_rules = SYNCCRAFT_SCULPTED_COMPACT_RULES if wants_sculpted else SYNCCRAFT_V32_COMPACT_RULES
-            # Preserve exact trained SYSTEM_PROMPT when images are supplied so visual token RoPE positions match training!
-            eff_prompt = (
-                f"{prompt.rstrip()}\n\n{compact_rules}"
-                if (has_img and "Mandatory " not in prompt)
-                else prompt
-            )
-            eff_sys = None if has_img else (SYNCCRAFT_SCULPTED_SYSTEM_PROMPT if wants_sculpted else SYNCCRAFT_V32_GRAMMAR_SYSTEM_PROMPT)
+            # Native Sculpted Style (`SCULPTED_STYLE_TASKS`) was trained directly under SparkNative's default SYSTEM_PROMPT
+            # (`system_prompt=None`) without injected 4-box grammar snippets! Preserve exact prompt/system parity on sculpted tasks.
+            if wants_sculpted:
+                eff_prompt = prompt
+                eff_sys = None
+            else:
+                eff_prompt = (
+                    f"{prompt.rstrip()}\n\n{SYNCCRAFT_V32_COMPACT_RULES}"
+                    if (has_img and "Mandatory " not in prompt)
+                    else prompt
+                )
+                eff_sys = None if has_img else SYNCCRAFT_V32_GRAMMAR_SYSTEM_PROMPT
             use_think = bool(
                 self.enable_thinking
                 and attempt == 0
                 and (has_img or wants_sculpted or bool(self.config.get("pipeline_enable_thinking", False)))
             )
             is_repair_sample = int(attempt) >= 1
+            is_stage_c_upgrade = wants_sculpted and has_img and ("stage-c" in p_low or "upgrade" in p_low or "blockout" in p_low)
             eff_task = (
-                ("synccraft_sculpted_multiview_inverse" if wants_sculpted else "synccraft_multiview_inverse_dsl")
+                ("synccraft_sculpted_stage_progression" if is_stage_c_upgrade else ("synccraft_sculpted_multiview_inverse" if wants_sculpted else "synccraft_multiview_inverse_dsl"))
                 if has_img
                 else ("synccraft_sculpted_style_creation" if wants_sculpted else "synccraft_artist_assistant")
             )
@@ -770,7 +805,7 @@ class SyncCraftWorldPipeline:
                     do_sample=is_repair_sample,
                     temperature=min(0.65, 0.35 + 0.10 * int(attempt)) if is_repair_sample else 1.0,
                     top_p=0.92 if is_repair_sample else 1.0,
-                    repetition_penalty=1.05 if is_repair_sample else 1.04,
+                    repetition_penalty=1.06 if (wants_sculpted or is_repair_sample) else 1.04,
                     task=eff_task,
                     system_prompt=eff_sys,
                 )
@@ -855,31 +890,53 @@ class SyncCraftWorldPipeline:
                 sculpted_eval = evaluate_sculpted_blockbench_style(repair_result["program"], prompt=prompt)
             except Exception:
                 sculpted_eval = None
-            if (
+            p_low_g = prompt.lower()
+            wants_sculpted_g = (not bool(re.search(r"audit_profile\s*[:=]\s*['\"]?strict['\"]?", p_low_g))) and (
+                str(self.config.get("style_mode", "")).lower() == "sculpted"
+                or any(kw in p_low_g for kw in ("sculpted", "blockbench", "vibrant", "dragon", "wyvern", "drake", "diorama", "size_step"))
+            )
+            needs_sculpted_upgrade = bool(
+                wants_sculpted_g
+                and sculpted_eval is not None
+                and (sculpted_eval["is_stiff_or_voxel_like"] or float(sculpted_eval["sculpted_score"]) < 0.70)
+            )
+            needs_aes_upgrade = bool(
                 eff_min_aes is not None
                 and (aesthetic_eval["is_toy_like"] or float(aesthetic_eval["aesthetic_score"]) < eff_min_aes)
-                and int(repair_result["reaudits_used"]) < int(max_reaudits)
-            ):
+            )
+            if (needs_sculpted_upgrade or needs_aes_upgrade) and int(repair_result["reaudits_used"]) < int(max_reaudits):
                 rem_reaudits = max(1, int(max_reaudits) - int(repair_result["reaudits_used"]))
                 preview_imgs = images
                 if not preview_imgs:
                     try:
-                        ws_prev = build_default_world_state_for_program(repair_result["program"], seed=seed)
-                        png_map, _, _, _ = render_world_views_rgba(ws_prev, panel_size=(144, 144))
+                        if wants_sculpted_g:
+                            from .sculpted_style_corpus import render_sculpted_turnaround_views
+
+                            png_map, _ = render_sculpted_turnaround_views(repair_result["program"], panel_size=(192, 192))
+                        else:
+                            ws_prev = build_default_world_state_for_program(repair_result["program"], seed=seed)
+                            png_map, _, _, _ = render_world_views_rgba(ws_prev, panel_size=(144, 144))
                         preview_imgs = [Image.open(io.BytesIO(png_map[v])) for v in ("south", "right", "top", "iso")]
                     except Exception:
                         preview_imgs = None
-                aes_prompt = (
-                    f"Your initial SyncCraft v3.2 asset compiled cleanly ({aesthetic_eval['box_count']} boxes, "
-                    f"aesthetic_score={aesthetic_eval['aesthetic_score']:.3f}, grade={aesthetic_eval['grade']!r}), "
-                    "but failed the artist-grade richness gate:\n"
-                    + "\n".join(f"- {n}" for n in aesthetic_eval["critique_notes"])
-                    + f"\n\nOriginal request:\n{prompt.strip()}\n\n"
-                    f"Initial Block-DSL blockout:\n```blockdsl\n{format_program(repair_result['program'])}\n```\n\n"
-                    "Upgrade this blockout into an artist-grade 18–42 box articulated SyncCraft Block-DSL v3.2 asset "
-                    "with complete cranial/head anatomy, tapered trunk/pelvis, secondary armor/trim, >=4 OKLCH `_mat` ramps, "
-                    "and zero 15-axis SAT collisions."
-                )
+                if wants_sculpted_g:
+                    aes_prompt = (
+                        "Critique this stiff Stage-C axis-aligned blockout from its 4 views (`south`, `right`, `top`, `iso`) "
+                        f"and upgrade it into a vibrant Stage-E sculpted Blockbench asset ({prompt.strip()}):\n"
+                        f"```blockdsl\n{format_program(repair_result['program']).strip()}\n```"
+                    )
+                else:
+                    aes_prompt = (
+                        f"Your initial SyncCraft v3.2 asset compiled cleanly ({aesthetic_eval['box_count']} boxes, "
+                        f"aesthetic_score={aesthetic_eval['aesthetic_score']:.3f}, grade={aesthetic_eval['grade']!r}), "
+                        "but failed the artist-grade richness gate:\n"
+                        + "\n".join(f"- {n}" for n in aesthetic_eval["critique_notes"])
+                        + f"\n\nOriginal request:\n{prompt.strip()}\n\n"
+                        f"Initial Block-DSL blockout:\n```blockdsl\n{format_program(repair_result['program'])}\n```\n\n"
+                        "Upgrade this blockout into an artist-grade 18–42 box articulated SyncCraft Block-DSL v3.2 asset "
+                        "with complete cranial/head anatomy, tapered trunk/pelvis, secondary armor/trim, >=4 OKLCH `_mat` ramps, "
+                        "and zero 15-axis SAT collisions."
+                    )
 
                 def _upgrade_gen(_spec: Any = None) -> tuple[str, int]:
                     txt, toks = self._invoke_model(aes_prompt, images=preview_imgs, attempt=0, max_new_tokens=max_new_tokens)
@@ -897,12 +954,26 @@ class SyncCraftWorldPipeline:
                 )
                 if upgrade_res["passed"] and upgrade_res["program"] is not None:
                     cand_aes = evaluate_3d_asset_aesthetics(upgrade_res["program"], prompt=prompt)
-                    if float(cand_aes["aesthetic_score"]) > float(aesthetic_eval["aesthetic_score"]):
+                    cand_sc = None
+                    try:
+                        from .sculpted_style_corpus import evaluate_sculpted_blockbench_style
+
+                        cand_sc = evaluate_sculpted_blockbench_style(upgrade_res["program"], prompt=prompt)
+                    except Exception:
+                        cand_sc = None
+                    improved_sc = (
+                        wants_sculpted_g
+                        and cand_sc is not None
+                        and sculpted_eval is not None
+                        and float(cand_sc["sculpted_score"]) > float(sculpted_eval["sculpted_score"])
+                    )
+                    if improved_sc or float(cand_aes["aesthetic_score"]) > float(aesthetic_eval["aesthetic_score"]):
                         repair_result = {
                             **upgrade_res,
                             "reaudits_used": int(repair_result["reaudits_used"]) + 1 + int(upgrade_res["reaudits_used"]),
                         }
                         aesthetic_eval = cand_aes
+                        sculpted_eval = cand_sc
                         aesthetic_upgraded = True
 
         bundle_report: dict[str, Any] | None = None
