@@ -72,9 +72,9 @@ SYNCCRAFT_SCULPTED_COMPACT_RULES = (
     "2. Vibrant 3+1 `@palette`: `<name>_mat: ramp(base_lch=[L, C, H], steps=6, hue_shift=[-14, 10])` so shadows shift cool and highlights drift warm; set `emissive=true` on 1 focal material (`3-15%` of elements).\n"
     "3. `@rig` hierarchy: `root bone <root_name> { pivot_local: [x, y, z] ... }` (`root bone` ONLY accepts `pivot_local:`, NEVER `rest_euler:`). "
     "Every child bone MUST use the keyword `bone` (NEVER `joint`!): `bone <name> attach(parent_box=<box>, anchor=[ax,ay,az], align=[lx,ly,lz]) { rest_euler: [rx, ry, rz] ... }` (optional `mirror_x(<right_name>)` — NEVER redeclare `<right_name>` explicitly, and NEVER nest a `box` inside another `box`!).\n"
-    "4. `box` & `plane` syntax: first box on a bone is `box <name> { size: [W, H, D], material: <mat>, rotate: [rx, ry, rz] }`; sibling boxes MUST use `box <name> place(base_box=<box>, anchor=[ax,ay,az], align=[lx,ly,lz]) { size: [W, H, D], material: <mat>, rotate: [rx, ry, rz] }` (`box` NEVER takes `offset:` inside `{ ... }`). "
+    "4. `box` & `plane` syntax: ONLY the FIRST `box` inside each `bone { ... }` omits `place(...)`! Every subsequent sibling `box` inside the same `bone` MUST have an explicit `place(base_box=<box>, anchor=[ax,ay,az], align=[lx,ly,lz])` (`box` NEVER takes `offset:` or `position:` inside `{ ... }`). "
     "Zero-thickness cutout `plane`s MUST use 2-number `size: [W, H]` and axis letter `normal: x` | `y` | `z`: `plane <name> place(base_box=<box>, anchor=[ax,ay,az], align=[lx,ly,lz]) { size: [W, H], normal: x, material: <mat> }` (NEVER 3-number `size` or vector `normal: [0,0,1]`!).\n"
-    "5. Deliberately sculpted 3D silhouette: build 22-55 elements across primary core masses, secondary anatomy/chamfers, and tertiary silhouette details (S-curved neck, jaw, horns/crests, 2-3 segment limbs/wings/wheels, `chain <name> attach(...) segments=4 taper=0.80 { axis: +z, rest_euler: [...], box seg { ... } }`, and 2+ `plane` cutouts) with 6-34 deg organic tilts and seated joints (`|anchor|` ~ `0.85..0.95`, protrusion >= `35%`)."
+    "5. Deliberately sculpted 3D silhouette & scale: use normal Blockbench unit sizes (`0.5..16` units, NEVER `50..160`), NEVER repeat numbered sibling clones (`plate_2..plate_20`), and articulate across >= 5 child `bone`s (S-curved `neck` -> `head` -> `jaw`, `horn_l mirror_x(horn_r)`, `wing_l mirror_x(wing_r)` or `bogie_fl mirror_x(bogie_fr)`, `fl_leg mirror_x(fr_leg)`, `hl_leg mirror_x(hr_leg)`, `chain tail ... segments=4 taper=0.80`) with 6-34 deg organic tilts and outer-face seating (`|anchor[k]| >= 0.85, align[k] = -0.5 * sign(anchor[k])` so >=35% of every box protrudes)."
 )
 
 SYNCCRAFT_SCULPTED_SYSTEM_PROMPT = (
@@ -394,9 +394,14 @@ def _build_repair_prompt(
                 "CRITICAL PLANE FIX: `plane <name> place(base_box=<box>, anchor=[...], align=[...]) { size: [W, H], normal: x, material: <mat> }` "
                 "MUST use a 2-number `size: [W, H]` and single axis letter `normal: x` | `y` | `z` (NEVER 3-number `size: [W, H, D]` and NEVER vector `normal: [0, 0, 1]`)!"
             )
-        if "field 'offset'" in err_s or "unexpected box" in err_s:
+        if "subsequent same-bone boxes require an explicit place clause" in err_s:
             lines.append(
-                "CRITICAL BOX OFFSET FIX: `box <name> { ... }` NEVER accepts `offset:` or `hinge:` inside `{ ... }`! "
+                "CRITICAL SAME-BONE PLACE FIX: Inside any `bone { ... }`, ONLY the very first `box` has no `place(...)`! "
+                "Every 2nd, 3rd, ... `box` or `plane` in that `bone` MUST include `place(base_box=<first_box>, anchor=[ax,ay,az], align=[lx,ly,lz])` (or move it onto a child `bone <name> attach(...) { ... }`)."
+            )
+        if "field 'offset'" in err_s or "field 'position'" in err_s or "unexpected box" in err_s:
+            lines.append(
+                "CRITICAL BOX OFFSET FIX: `box <name> { ... }` NEVER accepts `offset:`, `position:`, or `hinge:` inside `{ ... }`! "
                 "Position sibling boxes with `box <name> place(base_box=<box>, anchor=[ax,ay,az], align=[lx,ly,lz], offset=[ox,oy,oz]) { size: [...], material: ... }`, "
                 "or put articulated parts on a child `bone <name> attach(parent_box=<box>, anchor=[...], align=[...]) { ... }`."
             )
@@ -439,10 +444,14 @@ def _build_repair_prompt(
     contacts = list(feedback.get("contact_violations") or ())
     if contacts:
         formatted_ct = ", ".join(
-            f"{c.get('kind', 'violation')}:{c.get('bone') or c.get('box') or c}"
+            f"{c.get('violation') or c.get('kind', 'violation')}:{c.get('pair') or c.get('bone') or c.get('box') or c}"
             for c in contacts[:8]
         )
         lines.append(f"Physical contact violations: {formatted_ct}")
+        lines.append(
+            "CONTACT / BURIAL FIX: `swallowed_redundant_box` means a box is >65% buried inside its parent (e.g. `anchor=[0.5, 0.5, 0.5]`)! "
+            "Use normal Blockbench unit sizes (`0.5..16`), seat sibling boxes on outer faces (`anchor=[0, 0.92, 0], align=[0, -0.5, 0]`), and put wheels/limbs/wings on child `bone <name> attach(parent_box=<box>, anchor=[-1, -0.7, -0.4], align=[1, 0, 0]) mirror_x(...)` so >=35% of every box protrudes."
+        )
     adh = list(feedback.get("prompt_violations") or ())
     if adh:
         lines.append(f"Prompt adherence violations: {', '.join(str(v) for v in adh[:8])}")
@@ -778,9 +787,10 @@ class SyncCraftWorldPipeline:
             media = _prepare_media_from_pil_images(images)
             has_img = bool(media.get("images"))
             p_low = prompt.lower()
-            wants_strict = bool(re.search(r"audit_profile\s*[:=]\s*['\"]?strict['\"]?", p_low))
+            p_head = prompt.split("```", 1)[0].lower()
+            wants_strict = bool(re.search(r"audit_profile\s*[:=]\s*['\"]?strict['\"]?", p_head))
             has_sculpted_kw = any(
-                kw in p_low
+                kw in p_head
                 for kw in (
                     "sculpted",
                     "blockbench",
@@ -797,12 +807,10 @@ class SyncCraftWorldPipeline:
                     "@assembly",
                 )
             )
-            explicit_classic_v32 = (not has_sculpted_kw) and ("block-dsl v3.2" in p_low or "bedrock_entity" in p_low)
+            explicit_classic_v32 = (not has_sculpted_kw) and ("block-dsl v3.2" in p_head or "bedrock_entity" in p_head)
             wants_sculpted = (not wants_strict) and (not explicit_classic_v32) and (
                 has_sculpted_kw or str(self.config.get("style_mode", "")).lower() == "sculpted"
             )
-            # Native Sculpted Style (`SCULPTED_STYLE_TASKS`) was trained directly under SparkNative's default SYSTEM_PROMPT
-            # (`system_prompt=None`) without injected 4-box grammar snippets! Preserve exact prompt/system parity on sculpted tasks.
             if wants_sculpted:
                 eff_prompt = prompt
                 eff_sys = SYNCCRAFT_SCULPTED_COMPACT_RULES if attempt == 0 else None
@@ -921,10 +929,10 @@ class SyncCraftWorldPipeline:
                 sculpted_eval = evaluate_sculpted_blockbench_style(repair_result["program"], prompt=prompt)
             except Exception:
                 sculpted_eval = None
-            p_low_g = prompt.lower()
-            wants_sculpted_g = (not bool(re.search(r"audit_profile\s*[:=]\s*['\"]?strict['\"]?", p_low_g))) and (
+            p_head_g = prompt.split("```", 1)[0].lower()
+            wants_sculpted_g = (not bool(re.search(r"audit_profile\s*[:=]\s*['\"]?strict['\"]?", p_head_g))) and (
                 str(self.config.get("style_mode", "")).lower() == "sculpted"
-                or any(kw in p_low_g for kw in ("sculpted", "blockbench", "vibrant", "dragon", "wyvern", "drake", "diorama", "size_step"))
+                or any(kw in p_head_g for kw in ("sculpted", "blockbench", "vibrant", "dragon", "wyvern", "drake", "diorama", "size_step", "stage-c", "stage-e"))
             )
             needs_sculpted_upgrade = bool(
                 wants_sculpted_g

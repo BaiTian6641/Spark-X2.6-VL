@@ -746,11 +746,27 @@ def evaluate_sculpted_blockbench_style(
     score += 0.07 * (1.0 if (has_head_detail and has_limb_or_mech) else 0.3)
     score = round(min(1.0, score), 4)
 
+    from collections import Counter
+    stem_counts = Counter(
+        (b.bone_name, re.sub(r"_?[0-9]+$", "", str(b.name)))
+        for b in sc.boxes
+    )
+    max_same_bone_clone_run = max(stem_counts.values()) if stem_counts else 0
+    is_entity_or_veh = str(getattr(prog.meta, "archetype", "entity")) in ("entity", "vehicle")
+    has_clone_spam = max_same_bone_clone_run >= 7 or unique_sizes < 4
+    missing_rig_hierarchy = is_entity_or_veh and n_bones < 4
+    if has_clone_spam or missing_rig_hierarchy:
+        score = round(max(0.0, score - 0.26), 4)
+
     notes: list[str] = []
     if not aud["passed"]:
         notes.append(f"Static audit failed: collisions={len(aud['collision_pairs'])}, contact_violations={len(aud['contact_violations'])}.")
     if n_elems < 18:
         notes.append(f"Only {n_elems} elements; expand to >= 22 sculpted boxes & planes across primary/secondary/tertiary tiers.")
+    if missing_rig_hierarchy:
+        notes.append(f"Only {n_bones} bone(s) on an articulated subject; add child `bone <name> attach(...)` chains for neck/head/jaw, bilateral `mirror_x` limbs/wings/wheels, and tail.")
+    if has_clone_spam:
+        notes.append(f"Detected repetitive sibling clone stack (max_clones={max_same_bone_clone_run}, unique_sizes={unique_sizes}); replace numbered clone plates with distinct anatomical/mechanical parts and varied 0.5u dimensions.")
     if rotated_fraction < 0.18:
         notes.append(f"Rigid axis-aligned look (rotated_fraction={rotated_fraction:.2f}); tilt spine/neck/limbs/props by 7.5-30 deg + 3-8 deg wobble.")
     if plane_cnt == 0 and thin_slab_cnt < 2:
@@ -760,11 +776,17 @@ def evaluate_sculpted_blockbench_style(
     if emissive_share > 0.30:
         notes.append(f"Emissive glow covers {emissive_share:.0%} of elements; concentrate glow to 3-15% near focal eyes/crystals/lamps.")
 
-    is_stiff_or_voxel = (n_elems < 16) or (rotated_fraction < 0.12) or (len(used_mats) < 3)
+    is_stiff_or_voxel = (
+        (n_elems < 16)
+        or (rotated_fraction < 0.12)
+        or (len(used_mats) < 3)
+        or has_clone_spam
+        or missing_rig_hierarchy
+    )
     grade = (
         "sculpted_master_tier"
         if (aud["passed"] and score >= 0.82 and not is_stiff_or_voxel)
-        else ("sculpted_standard" if (aud["passed"] and score >= 0.68) else "stiff_blockout")
+        else ("sculpted_standard" if (aud["passed"] and score >= 0.68 and not is_stiff_or_voxel) else "stiff_blockout")
     )
     return {
         "sculpted_score": score,
