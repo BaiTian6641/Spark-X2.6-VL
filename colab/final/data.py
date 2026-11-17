@@ -103,6 +103,8 @@ PURE_TEXT_TASKS={
     'openthoughts_reasoning',
     'gpqa_extended_science',
     'hle_text_reasoning',
+    'synccraft_sculpted_style_creation',
+    'synccraft_v4_modular_assembly',
 }
 
 def family(row):

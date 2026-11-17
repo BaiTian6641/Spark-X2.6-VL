@@ -202,7 +202,7 @@ def evaluate(model,catalogue,reader,config,split,path,generate=False,ids=None):
                 else:
                     cfg_max=config.get('evaluation_max_new_tokens')
                     eff_eval_max=(max(int(cfg_max),1536) if (is_synccraft and cfg_max is not None and int(cfg_max)>=128) else cfg_max)
-                    prediction=model.answer(row,media,eff_eval_max)
+                    prediction=model.answer(row,media,eff_eval_max,repetition_penalty=1.03)
                     item.update(prediction=prediction,reference=row['answer'])
                     if is_synccraft:
                         from .synccraft_bridge import evaluate_synccraft_completion

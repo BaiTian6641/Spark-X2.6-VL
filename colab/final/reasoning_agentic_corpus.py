@@ -701,6 +701,45 @@ def _build_terminal_bench_records(
                 },
             }
         )
+        # Emit an explicit Terminal-Bench 4.0 fenced-script framing inside the same `source_group`
+        if bool(config.get("augment_terminal_bench4_framings", False)) or tb_ver in ("4.0", "both"):
+            clean_fence_ans = "\n\n".join(
+                re.sub(r"^### `[^`]+`\n", "", blk).strip() for blk in sol_blocks
+            )
+            sup_tb4_think = sanitize_and_bound_think_trace(
+                think_summary,
+                clean_fence_ans,
+                enable_thinking=True,
+                max_think_chars=1800,
+                max_answer_chars=10500,
+            )
+            if sup_tb4_think is not None:
+                records.append(
+                    {
+                        "id": f"{tag_prefix}-train-{tid}#v4fence",
+                        "source_id": tid,
+                        "source_group": gid,
+                        "language": "en",
+                        "task": "terminal_bench_agent",
+                        "frames": [],
+                        "enable_thinking": True,
+                        "prompt": (
+                            f"[Terminal-Bench 4.0 Task: {tid}]\n{inst_txt}\n\n"
+                            "Author a complete, non-interactive solution inside a ```bash ... ``` or ```python ... ``` code block."
+                        ),
+                        "answer": sup_tb4_think,
+                        "target": {"kind": "text", "text": clean_fence_ans},
+                        "metadata": {
+                            "dataset": repo_id,
+                            "revision": rev,
+                            "license_spdx": "Apache-2.0",
+                            "terminal_task_id": tid,
+                            "terminal_bench_tag": tag_prefix,
+                            "real_text_corpus": True,
+                            "grouping_keys": [gid],
+                        },
+                    }
+                )
 
     return records, holdout_tasks
 

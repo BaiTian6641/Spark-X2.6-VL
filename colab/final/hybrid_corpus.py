@@ -197,9 +197,10 @@ def _select_spark_mm_packets(
         fetch(lock["catalogue_url"], raw_cat, lock["catalogue"], token)
 
     scale = float(config.get("hybrid_spark_mm_scale", 1.0))
+    docci_bonus = float(config.get("hybrid_docci_scale_bonus", 1.0))
     packet_quotas = {
-        "vision-core": max(24, int(round(850 * scale))),
-        "docci": max(24, int(round(650 * scale))),
+        "vision-core": max(24, int(round(850 * scale * max(1.0, 0.5 + 0.5 * docci_bonus)))),
+        "docci": max(24, int(round(650 * scale * docci_bonus))),
         "ocr": max(24, int(round(650 * scale))),
         "timelapse": max(16, int(round(72 * scale))),
         "video": max(20, int(round(140 * scale))),
@@ -1258,6 +1259,8 @@ def prepare_hybrid_world_v32_data(root: str | Path, token: str | None, config: d
             "dataset_mode": "hybrid_world_v32",
             "stage5_reasoning_mix": bool(config.get("enable_stage5_reasoning_mix", False)),
         }
+        if bool(config.get("enable_stage6_sculpted_style", False)):
+            expected["stage6_sculpted_style"] = True
         saved_meta = read(build_meta)
         # Backward compatibility when Stage 1-4 BUILD.json omitted stage5_reasoning_mix=False
         if "stage5_reasoning_mix" not in saved_meta and not expected["stage5_reasoning_mix"]:
@@ -1268,6 +1271,7 @@ def prepare_hybrid_world_v32_data(root: str | Path, token: str | None, config: d
 
     seed = int(config["seed"])
     use_stage5_mix = bool(config.get("enable_stage5_reasoning_mix", False))
+    use_stage6_sculpted = bool(config.get("enable_stage6_sculpted_style", False))
     emit("hybrid_corpus_stage", stage="spark_mm_selection")
     spark_mm_packets, spark_mm_comps = _select_spark_mm_packets(root, token, config)
 
@@ -1308,6 +1312,51 @@ def prepare_hybrid_world_v32_data(root: str | Path, token: str | None, config: d
     ]
     if hle_comp_entry is not None:
         handoff_comps.append(hle_comp_entry)
+
+    sculpted_records: list[dict[str, Any]] = []
+    sculpted_comp_entry: dict[str, Any] | None = None
+    sculpted_transport: dict[str, dict[str, Any]] = {}
+    if use_stage6_sculpted:
+        from .sculpted_style_corpus import (
+            build_human_artist_sculpted_studio_records,
+            build_sculpted_style_curriculum_records,
+        )
+
+        emit("hybrid_corpus_stage", stage="sculpted_blockbench_style_v6")
+        sc_v6_recs, sc_v6_blobs = build_sculpted_style_curriculum_records(
+            variants_per_family=int(config.get("sculpted_variants_per_family", 12)),
+            include_v4_assembly_tasks=True,
+            panel_size=(192, 192),
+        )
+        sculpted_records.extend(sc_v6_recs)
+        merged_sculpted_blobs = dict(sc_v6_blobs)
+
+        human_studio_cap = int(config.get("hybrid_human_artist_sculpted_studio_rigs", 48))
+        if human_studio_cap > 0:
+            human_p = _hf_cached_file(
+                SYNCCRAFT_ARTIST_REPO_ID,
+                "permissive_cc/train.jsonl",
+                revision=SYNCCRAFT_ARTIST_REVISION,
+                token=token,
+            )
+            raw_human = [json.loads(ln) for ln in human_p.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            h_studio_recs, h_studio_blobs = build_human_artist_sculpted_studio_records(
+                raw_human,
+                max_assets=human_studio_cap,
+                seed=seed,
+                panel_size=(192, 192),
+            )
+            sculpted_records.extend(h_studio_recs)
+            merged_sculpted_blobs.update(h_studio_blobs)
+
+        if merged_sculpted_blobs:
+            sculpted_comp_entry, sculpted_transport = _write_local_tar_component(
+                root,
+                "sculpted_style_v6",
+                merged_sculpted_blobs,
+                seed=seed,
+            )
+            handoff_comps.append(sculpted_comp_entry)
 
     handoff_doc = {
         "schema_version": 1,
@@ -1360,6 +1409,23 @@ def prepare_hybrid_world_v32_data(root: str | Path, token: str | None, config: d
         else:
             all_packets.append({"component": "stage5_reasoning_agentic", "record": rec, "transport": None})
 
+    for rec in sculpted_records:
+        frame_names = list(rec.get("frames") or ())
+        if frame_names:
+            if not sculpted_transport or any(m not in sculpted_transport for m in frame_names):
+                continue
+            shards_used = {sculpted_transport[m]["shard"] for m in frame_names}
+            if len(shards_used) != 1:
+                continue
+            shard_name = next(iter(shards_used))
+            transport = {
+                "shard": shard_name,
+                "media": [dict(sculpted_transport[m]["entry"]) for m in frame_names],
+            }
+            all_packets.append({"component": "sculpted_style_v6", "record": rec, "transport": transport})
+        else:
+            all_packets.append({"component": "sculpted_style_v6", "record": rec, "transport": None})
+
     # Enforce qualified context policy across 100% of rows before freezing catalogue
     all_packets, context_filter_stats = _filter_packets_to_context_policy(all_packets, root, config)
 
@@ -1383,6 +1449,7 @@ def prepare_hybrid_world_v32_data(root: str | Path, token: str | None, config: d
         "compositional_vqa_records": len(comp_records),
         "synccraft_world_v32_records": len(sc_records),
         "stage5_reasoning_and_agentic_records": len(stage5_records),
+        "stage6_sculpted_style_records": len(sculpted_records),
         "stage5_holdout_manifest_summary": (
             {
                 "gpqa_diamond_held_out_100_percent": stage5_holdout_manifest["gpqa_diamond_held_out_100_percent"],
@@ -1398,16 +1465,16 @@ def prepare_hybrid_world_v32_data(root: str | Path, token: str | None, config: d
         "task_distribution": dict(sorted(task_counts.items())),
     }
     write(db.with_suffix(".report.json"), report)
-    write(
-        build_meta,
-        {
-            "catalogue_sha256": sha(cat),
-            "split": config["split_percent"],
-            "seed": config["seed"],
-            "dataset_mode": "hybrid_world_v32",
-            "stage5_reasoning_mix": use_stage5_mix,
-        },
-    )
+    build_doc = {
+        "catalogue_sha256": sha(cat),
+        "split": config["split_percent"],
+        "seed": config["seed"],
+        "dataset_mode": "hybrid_world_v32",
+        "stage5_reasoning_mix": use_stage5_mix,
+    }
+    if use_stage6_sculpted:
+        build_doc["stage6_sculpted_style"] = True
+    write(build_meta, build_doc)
     emit(
         "hybrid_corpus_ready",
         packets=len(all_packets),

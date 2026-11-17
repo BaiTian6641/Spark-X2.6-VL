@@ -981,4 +981,95 @@ def test_adr002_rsi_collapse_scope_think_budget_and_neutral_grammar():
     assert "<think>" in forced_out and "</think>" in forced_out
 
 
+def test_sculpted_blockbench_style_v6_and_v4_curriculum():
+    """Verify all 8 clean-room Sculpted Blockbench Style archetypes, RGBA studio painter, and v4.0 assembly oracle."""
+    from colab.final.data import family
+    from colab.final.sculpted_style_corpus import (
+        SCULPTED_ARCHETYPE_BUILDERS,
+        build_sculpted_style_curriculum_records,
+        evaluate_sculpted_blockbench_style,
+        render_sculpted_turnaround_views,
+    )
+    from colab.final.synccraft_bridge import evaluate_synccraft_completion, validate_synccraft_license_record
+    from synccraft.dsl.parser import parse_program
+
+    for builder in SCULPTED_ARCHETYPE_BUILDERS:
+        stage_e, stage_c, meta = builder(0)
+        prog_e = parse_program(stage_e)
+        prog_c = parse_program(stage_c)
+        ev_e = evaluate_sculpted_blockbench_style(prog_e)
+        ev_c = evaluate_sculpted_blockbench_style(prog_c)
+        assert ev_e["audit_passed"] is True
+        assert ev_e["grade"] == "sculpted_master_tier"
+        assert ev_e["sculpted_score"] >= 0.90
+        assert ev_c["grade"] == "stiff_blockout"
+
+    # Verify vibrant studio RGBA cutout atlas + silhouette sheet rendering
+    se0, _, _ = SCULPTED_ARCHETYPE_BUILDERS[0](0)
+    pngs, baked = render_sculpted_turnaround_views(
+        parse_program(se0),
+        views=("south", "right", "top", "iso"),
+        panel_size=(96, 96),
+        include_silhouette_sheet=True,
+    )
+    assert set(pngs.keys()) == {"south", "right", "top", "iso", "silhouette_sheet"}
+    assert int((baked["atlas_rgba"][..., 3] == 0).sum()) > 0  # RGBA alpha=0 cutout pixels exist
+
+    recs, blobs = build_sculpted_style_curriculum_records(
+        variants_per_family=1,
+        include_v4_assembly_tasks=True,
+        panel_size=(96, 96),
+    )
+    assert len(recs) >= 40 and len(blobs) >= 64
+    for r in recs:
+        validate_synccraft_license_record(r, allow_research_nc=False)
+        fam_t = family(r)
+        assert fam_t in ("text", "image")
+        assert evaluate_synccraft_completion(r, r["answer"])["passed"] is True
+
+
+def test_stage6_campaign_config_and_sculpted_vision_rsi():
+    """Verify Stage-6 JSON config and Sculpted Blockbench Style Vision RSI self-critique without label leakage."""
+    from colab.final.common import HERE, read, validate_config
+    from colab.final.sculpted_style_corpus import build_sculpted_crimson_western_dragon_dsl
+    from colab.final.synccraft_bridge import make_clean_room_provenance
+    from colab.final.vision_rsi import build_self_critique_turn, score_rsi_candidate
+
+    cfg = validate_config(read(HERE / "campaign_rtx_pro_4000_stage6_sculpted_rsi.json"))
+    assert cfg["enable_stage6_sculpted_style"] is True
+    assert cfg["init_from_release_dir"] == "./work/spark-world-v32-stage5-rsi/final-model-rsi2"
+    assert cfg["rsi_mode"] == "vision_self_improvement"
+    assert cfg["vision_rsi_rounds"] == 2
+
+    stage_e, stage_c, _ = build_sculpted_crimson_western_dragon_dsl(0)
+    secret_tag = "STAGE6_HIDDEN_ORACLE_TAG"
+    row = {
+        "id": "sculpted_rsi_01",
+        "task": "synccraft_sculpted_style_creation",
+        "language": "en",
+        "enable_thinking": True,
+        "frames": [],
+        "prompt": "Design a vibrant sculpted Blockbench western dragon.",
+        "answer": f"<think>\n{secret_tag}\n</think>\n```blockdsl\n{stage_e}\n```",
+        "target": {"kind": "text", "text": f"```blockdsl\n{stage_e}\n```"},
+        "provenance": make_clean_room_provenance("sculpted_rsi_01"),
+        "metadata": {"expected_audit_profile": "sculpted", "min_sculpted_score": 0.72},
+    }
+    stiff_cand = f"<think>\nDraft simple stiff boxes.\n</think>\n```blockdsl\n{stage_c}\n```"
+    diag_stiff = score_rsi_candidate(row, stiff_cand)
+    assert diag_stiff["verified"] is False
+
+    turn = build_self_critique_turn(row, {"images": []}, stiff_cand, diag_stiff)
+    assert turn is not None
+    crit_row, crit_media = turn
+    assert secret_tag not in crit_row["prompt"]
+    assert len(crit_media["images"]) == 4
+
+    good_cand = f"<think>\nSculpted S-neck, 0.5u steps, hue-shifted ramps, and membrane cutout planes.\n</think>\n```blockdsl\n{stage_e}\n```"
+    diag_good = score_rsi_candidate(row, good_cand)
+    assert diag_good["verified"] is True
+    assert diag_good["score"] >= 0.90
+
+
+
 

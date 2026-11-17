@@ -65,6 +65,44 @@ SYNCCRAFT_V32_COMPACT_RULES = (
     "6. Author rich 16–42 box artist silhouettes matching the requested subject: primary core + secondary taper, neck/head/focal assembly, appendages, 3-part limbs, and 4–6 contrasting `_mat` ramps."
 )
 
+SYNCCRAFT_SCULPTED_COMPACT_RULES = (
+    "Mandatory Sculpted Blockbench Style + SyncCraft Block-DSL (`v3.2` / `v4.0`) rules:\n"
+    "1. `@meta`: use `dsl_version: \"3.2\", size_step: 0.5, audit_profile: sculpted` (or `dsl_version: \"4.0\"` when `@layout/@component/@assembly` is requested).\n"
+    "2. Vibrant 3+1 `@palette`: use `hue_shift=[-14, 10]` on `ramp(base_lch=[L, C, H], steps=6, hue_shift=[-14, 10])` so shadows shift cool (violet/blue) and highlights drift warm; concentrate `emissive=true` to 1 focal material (eyes/crystal/lantern).\n"
+    "3. Deliberately sculpted 3D flow: tilt neck/spine/limbs/props by 6–34 deg (`rest_euler` on child `bone`s or `rotate: [rx, ry, rz]` on `box`/`plane`s — NOTE: `root bone` accepts `pivot_local:` ONLY, NEVER `rest_euler:`!).\n"
+    "4. Seat child joints slightly inside parents (`anchor` ~ `0.85..0.95`, overlap <= `0.85 * min_thickness`) and use zero-thickness `plane <name> place(...) { size: [W, H], normal: x|y|z, material: ... }` for wing membrane bays, spike/fur fringes, tooth skirts, or leaves.\n"
+    "5. `mirror_x(<right_name>)` auto-generates `<right_name>` — NEVER also declare `bone <right_name>` explicitly!\n"
+    "6. Build 22–65 elements across primary masses, secondary anatomy/chamfers, and tertiary silhouette details."
+)
+
+SYNCCRAFT_SCULPTED_SYSTEM_PROMPT = (
+    "You author vibrant, deliberately sculpted 3D Blockbench models in SyncCraft Block-DSL (`blockbench-sculpted-style` v6). "
+    "Combine flowing S-curved/tilted poses, 0.5-step chamfered proportions, hue-shifted cel ramps, seated joint overlaps, "
+    "and RGBA alpha-cutout `plane`s (never stiff grid-aligned boxes or 5-9 box toys):\n"
+    "```blockdsl\n"
+    "@meta { archetype: entity, target_profile: bbmodel_5, texel_density: 16, dsl_version: \"3.2\", size_step: 0.5, audit_profile: sculpted }\n"
+    "@palette {\n"
+    "  hide_mat: ramp(base_lch=[0.58, 0.15, 22], steps=6, hue_shift=[-15, 10])\n"
+    "  cream_mat: ramp(base_lch=[0.82, 0.06, 68], steps=6, hue_shift=[-12, 8])\n"
+    "  horn_mat: ramp(base_lch=[0.84, 0.06, 78], steps=6, hue_shift=[-10, 6])\n"
+    "  eye_glow_mat: ramp(base_lch=[0.84, 0.18, 58], steps=6, hue_shift=[-6, 12], emissive=true)\n"
+    "}\n"
+    "@rig {\n"
+    "  root bone hips_root {\n"
+    "    pivot_local: [0, 12, 3]\n"
+    "    box pelvis_mass { size: [7, 6, 6.5], material: hide_mat, rotate: [-4, 0, 0] }\n"
+    "    bone chest_seg attach(parent_box=pelvis_mass, anchor=[0, 0.15, -0.75], align=[0, 0, 0.8]) {\n"
+    "      rest_euler: [8, 0, 0]\n"
+    "      box chest_core { size: [9, 7, 8], material: hide_mat }\n"
+    "      box sternum place(base_box=chest_core, anchor=[0, -0.84, -0.1], align=[0, 0.5, 0]) { size: [7, 1.5, 6.5], material: cream_mat, rotate: [-5, 0, 0] }\n"
+    "      plane dorsal_fringe place(base_box=chest_core, anchor=[0, 1, 0], align=[0, -1, 0], offset=[0.25, 0, 0]) { size: [2.5, 6], normal: x, material: horn_mat }\n"
+    "    }\n"
+    "  }\n"
+    "}\n"
+    "```\n"
+    + SYNCCRAFT_SCULPTED_COMPACT_RULES
+)
+
 SYNCCRAFT_V32_GRAMMAR_SYSTEM_PROMPT = (
     "You author valid, artist-grade SyncCraft Block-DSL v3.2 3D assets with rich structural hierarchy (never simplistic 5-9 box toys). "
     "Follow this exact grammar skeleton (adapt bone/box topology, proportions, and colors to the requested subject):\n"
@@ -144,7 +182,7 @@ def evaluate_3d_asset_aesthetics(
     n_palettes = len(prog.palettes)
     n_materials = len(getattr(prog, "materials", ()) or ())
     used_materials = {b.material for b in scene.boxes}
-    unique_sizes = {tuple(int(x) for x in b.size) for b in scene.boxes}
+    unique_sizes = {tuple(round(float(x), 3) for x in b.size) for b in scene.boxes}
 
     all_names_low = " ".join([*(b.name.lower() for b in scene.boxes), *(bn.name.lower() for bn in scene.bones)])
     is_entity = prog.meta.archetype == "entity" or any(
@@ -594,16 +632,37 @@ def export_program_bundle(
                         written_files[f"labpbr_{key_name}"] = str(lp)
 
     preview_views: dict[str, str] = {}
+    studio_views: dict[str, str] = {}
     if render_preview_views and out_path is not None:
         renders, _, _, _ = render_world_views_rgba(ws, panel_size=(192, 192))
         for vid, png_bytes in renders.items():
             vp = out_path / f"{slug}_preview_{vid}.png"
             vp.write_bytes(png_bytes)
             preview_views[vid] = str(vp)
+        try:
+            from .sculpted_style_corpus import render_sculpted_turnaround_views
+
+            studio_pngs, baked_studio = render_sculpted_turnaround_views(
+                prog,
+                views=("south", "right", "top", "iso"),
+                panel_size=(256, 256),
+                include_silhouette_sheet=True,
+            )
+            studio_atlas_p = out_path / f"{slug}_studio_atlas.png"
+            studio_atlas_p.write_bytes(baked_studio["atlas_png"])
+            written_files["studio_rgba_atlas_png"] = str(studio_atlas_p)
+            for k_v, b_png in studio_pngs.items():
+                sp = out_path / f"{slug}_studio_{k_v}.png"
+                sp.write_bytes(b_png)
+                studio_views[k_v] = str(sp)
+        except Exception:
+            pass
 
     return {
         "asset_name": slug,
         "audit_profile": getattr(prog.meta, "audit_profile", "strict"),
+        "dsl_version": getattr(prog.meta, "dsl_version", "3.2"),
+        "size_step": float(getattr(prog.meta, "size_step", 1.0)),
         "target_profile": prog.meta.target_profile,
         "boxes": len(scene.boxes),
         "bones": len(scene.bones),
@@ -626,6 +685,7 @@ def export_program_bundle(
         "exports": exported,
         "written_files": written_files,
         "preview_views": preview_views,
+        "studio_views": studio_views,
     }
 
 
@@ -659,19 +719,46 @@ class SyncCraftWorldPipeline:
 
             media = _prepare_media_from_pil_images(images)
             has_img = bool(media.get("images"))
-            # Preserve exact trained SYSTEM_PROMPT when images are supplied so visual token RoPE positions match Stage-4/5 training!
+            p_low = prompt.lower()
+            wants_strict = bool(re.search(r"audit_profile\s*[:=]\s*['\"]?strict['\"]?", p_low))
+            wants_sculpted = (not wants_strict) and (
+                str(self.config.get("style_mode", "")).lower() == "sculpted"
+                or any(
+                    kw in p_low
+                    for kw in (
+                        "sculpted",
+                        "blockbench",
+                        "vibrant",
+                        "dragon",
+                        "wyvern",
+                        "drake",
+                        "diorama",
+                        "size_step",
+                        "dsl_version: \"4.0\"",
+                        "dsl_version: '4.0'",
+                        "@assembly",
+                    )
+                )
+            )
+            compact_rules = SYNCCRAFT_SCULPTED_COMPACT_RULES if wants_sculpted else SYNCCRAFT_V32_COMPACT_RULES
+            # Preserve exact trained SYSTEM_PROMPT when images are supplied so visual token RoPE positions match training!
             eff_prompt = (
-                f"{prompt.rstrip()}\n\n{SYNCCRAFT_V32_COMPACT_RULES}"
-                if (has_img and "Mandatory SyncCraft Block-DSL v3.2" not in prompt)
+                f"{prompt.rstrip()}\n\n{compact_rules}"
+                if (has_img and "Mandatory " not in prompt)
                 else prompt
             )
-            eff_sys = None if has_img else SYNCCRAFT_V32_GRAMMAR_SYSTEM_PROMPT
+            eff_sys = None if has_img else (SYNCCRAFT_SCULPTED_SYSTEM_PROMPT if wants_sculpted else SYNCCRAFT_V32_GRAMMAR_SYSTEM_PROMPT)
             use_think = bool(
                 self.enable_thinking
                 and attempt == 0
-                and (has_img or bool(self.config.get("pipeline_enable_thinking", False)))
+                and (has_img or wants_sculpted or bool(self.config.get("pipeline_enable_thinking", False)))
             )
             is_repair_sample = int(attempt) >= 1
+            eff_task = (
+                ("synccraft_sculpted_multiview_inverse" if wants_sculpted else "synccraft_multiview_inverse_dsl")
+                if has_img
+                else ("synccraft_sculpted_style_creation" if wants_sculpted else "synccraft_artist_assistant")
+            )
             raw_text = str(
                 generate(
                     self.model_or_fn,
@@ -684,7 +771,7 @@ class SyncCraftWorldPipeline:
                     temperature=min(0.65, 0.35 + 0.10 * int(attempt)) if is_repair_sample else 1.0,
                     top_p=0.92 if is_repair_sample else 1.0,
                     repetition_penalty=1.05 if is_repair_sample else 1.04,
-                    task="synccraft_multiview_inverse_dsl" if has_img else "synccraft_artist_assistant",
+                    task=eff_task,
                     system_prompt=eff_sys,
                 )
             )
@@ -752,6 +839,7 @@ class SyncCraftWorldPipeline:
         )
 
         aesthetic_eval: dict[str, Any] | None = None
+        sculpted_eval: dict[str, Any] | None = None
         aesthetic_upgraded = False
         eff_min_aes = (
             float(min_aesthetic_score)
@@ -761,6 +849,12 @@ class SyncCraftWorldPipeline:
 
         if repair_result["passed"] and repair_result["program"] is not None:
             aesthetic_eval = evaluate_3d_asset_aesthetics(repair_result["program"], prompt=prompt)
+            try:
+                from .sculpted_style_corpus import evaluate_sculpted_blockbench_style
+
+                sculpted_eval = evaluate_sculpted_blockbench_style(repair_result["program"], prompt=prompt)
+            except Exception:
+                sculpted_eval = None
             if (
                 eff_min_aes is not None
                 and (aesthetic_eval["is_toy_like"] or float(aesthetic_eval["aesthetic_score"]) < eff_min_aes)
@@ -834,6 +928,7 @@ class SyncCraftWorldPipeline:
             "bones": int(repair_result["bones"]),
             "aesthetic_upgraded": aesthetic_upgraded,
             "aesthetic_evaluation": aesthetic_eval,
+            "sculpted_evaluation": sculpted_eval,
             "canonical_ast_sha256": repair_result["canonical_ast_sha256"],
             "final_dsl": repair_result["final_dsl"],
             "raw_generation_count": len(raw_generations),

@@ -2033,6 +2033,11 @@ def compute_scene_render_iou(
 def evaluate_synccraft_completion(record: dict[str, Any], completion_text: str) -> dict[str, Any]:
     """Evaluate a Spark-X2.6-VL completion against SyncCraft's compiler, 15-axis SAT, UV, world-ladder, and motion oracles."""
     task = str(record.get("task", ""))
+    from .sculpted_style_corpus import SCULPTED_STYLE_TASKS, evaluate_sculpted_task_completion
+
+    if task in SCULPTED_STYLE_TASKS:
+        return evaluate_sculpted_task_completion(record, completion_text)
+
     meta = record.get("metadata", {}) if isinstance(record.get("metadata"), dict) else {}
     think_trace, body = strip_think_block(completion_text)
     result: dict[str, Any] = {

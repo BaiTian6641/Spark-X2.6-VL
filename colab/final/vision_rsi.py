@@ -87,15 +87,35 @@ def score_rsi_candidate(
     think_trace, body = strip_think_block(completion_text)
     meta = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
 
-    # 1. SyncCraft 3D World & Human-Artist Aesthetic tasks
+    # 1. SyncCraft 3D World, Sculpted Blockbench Style & Human-Artist Aesthetic tasks
     if task.startswith("synccraft_"):
         sc = evaluate_synccraft_completion(row, completion_text)
         if not sc.get("passed"):
+            sc_ev_sub = sc.get("sculpted_eval") or {}
+            partial = float(
+                sc.get("field_accuracy")
+                or sc.get("silhouette_iou")
+                or sc.get("ladder_score")
+                or sc_ev_sub.get("sculpted_score")
+                or 0.0
+            ) * 0.5
             return {
                 "verified": False,
-                "score": float(sc.get("field_accuracy") or sc.get("silhouette_iou") or sc.get("ladder_score") or 0.0) * 0.5,
+                "score": partial,
                 "reason": str(sc.get("error") or "synccraft_oracle_failed"),
                 "synccraft_eval": sc,
+                "collapse_health": health,
+            }
+
+        if "sculpted_eval" in sc:
+            sc_style = sc["sculpted_eval"]
+            s_val = float(sc_style.get("sculpted_score", 0.8))
+            return {
+                "verified": True,
+                "score": max(0.86, round(s_val, 5)),
+                "reason": "sculpted_style_and_sat_verified",
+                "synccraft_eval": sc,
+                "aesthetic_eval": sc_style,
                 "collapse_health": health,
             }
 
@@ -299,9 +319,9 @@ def build_self_critique_turn(
     if not prev_body:
         return None
 
-    if task.startswith("synccraft_") and task not in ("synccraft_uv_alpha_diagnosis", "synccraft_part_grounding"):
+    if task.startswith("synccraft_") and task not in ("synccraft_uv_alpha_diagnosis", "synccraft_part_grounding", "synccraft_sculpted_self_critique"):
         sc_ev = diag.get("synccraft_eval") or {}
-        aes_ev = diag.get("aesthetic_eval") or {}
+        aes_ev = diag.get("aesthetic_eval") or sc_ev.get("sculpted_eval") or {}
         notes: list[str] = [f"Verifier status: `{diag.get('reason')}`."]
         if sc_ev.get("error"):
             notes.append(f"Compiler/SAT diagnostic: {sc_ev['error']}")
@@ -310,28 +330,39 @@ def build_self_critique_turn(
         if sc_ev.get("contact_violation_count"):
             notes.append(f"P1-02 contact violation count: {sc_ev['contact_violation_count']} (must be 0).")
         if aes_ev:
-            notes.append(
-                f"Aesthetic readiness={aes_ev.get('aesthetic_score', 0.0):.3f}, "
-                f"boxes={aes_ev.get('box_count')}, bones={aes_ev.get('bone_count')}, "
-                f"is_toy_like={aes_ev.get('is_toy_like')}."
-            )
+            if "sculpted_score" in aes_ev:
+                notes.append(
+                    f"Sculpted style score={aes_ev.get('sculpted_score', 0.0):.3f}, grade={aes_ev.get('grade')}, "
+                    f"elements={aes_ev.get('element_count')}, planes={aes_ev.get('plane_count')}, "
+                    f"rotated_fraction={aes_ev.get('rotated_element_fraction')}."
+                )
+            else:
+                notes.append(
+                    f"Aesthetic readiness={aes_ev.get('aesthetic_score', 0.0):.3f}, "
+                    f"boxes={aes_ev.get('box_count')}, bones={aes_ev.get('bone_count')}, "
+                    f"is_toy_like={aes_ev.get('is_toy_like')}."
+                )
             for cn in (aes_ev.get("critique_notes") or ())[:4]:
                 notes.append(f"- Upgrade required: {cn}")
 
         critique_media = media
-        # If text-to-3D candidate compiled, render its own 4-view RGBA preview so Spark visually critiques its own shape!
+        # If text-to-3D candidate compiled, render its own 4-view studio turnaround so Spark visually critiques its own silhouette!
         if not media.get("images"):
             try:
+                from .sculpted_style_corpus import render_sculpted_turnaround_views
                 from synccraft.dsl.parser import parse_program
 
                 cand_prog = parse_program(_extract_clean_blockdsl(failed_completion))
-                ws = build_default_world_state_for_program(cand_prog, seed=17)
-                png_map, _, _, _ = render_world_views_rgba(ws, panel_size=(144, 144))
+                if "sculpted" in task:
+                    png_map, _ = render_sculpted_turnaround_views(cand_prog, panel_size=(160, 160))
+                else:
+                    ws = build_default_world_state_for_program(cand_prog, seed=17)
+                    png_map, _, _, _ = render_world_views_rgba(ws, panel_size=(144, 144))
                 pil_views = [Image.open(io.BytesIO(png_map[v])) for v in ("south", "right", "top", "iso")]
                 critique_media = _prepare_media_from_pil_images(pil_views, view_names=("south", "right", "top", "iso"))
                 notes.append(
-                    "Attached are the 4 orthographic views (south, right, top, iso) rendered from your previous attempt — "
-                    "inspect the silhouette proportions, missing anatomical/structural parts, and joint contacts directly."
+                    "Attached are the 4 studio views (south, right, top, iso) rendered from your previous attempt — "
+                    "inspect the silhouette proportions, tilted gesture flow, alpha-cutout planes, and joint contacts directly."
                 )
             except Exception:
                 critique_media = media
@@ -451,7 +482,15 @@ def _select_stratified_rsi_pool(
 
     for rid, fam, lang, task in db_rows:
         t = str(task or "")
-        if t == "synccraft_uv_alpha_diagnosis":
+        if t in (
+            "synccraft_sculpted_style_creation",
+            "synccraft_sculpted_stage_progression",
+            "synccraft_sculpted_multiview_inverse",
+            "synccraft_sculpted_self_critique",
+            "synccraft_v4_modular_assembly",
+        ):
+            buckets["sculpted_3d"].append(rid)
+        elif t == "synccraft_uv_alpha_diagnosis":
             buckets["uv_alpha"].append(rid)
         elif t in ("synccraft_multiview_inverse_dsl", "synccraft_part_grounding", "synccraft_visual_aesthetic_judgment"):
             buckets["multiview_3d"].append(rid)
@@ -472,17 +511,35 @@ def _select_stratified_rsi_pool(
     for b in anchor_buckets.values():
         rng.shuffle(b)
 
-    target_shares = {
-        "uv_alpha": max(6, round(total_records * 0.20)),
-        "multiview_3d": max(6, round(total_records * 0.22)),
-        "artist_3d": max(6, round(total_records * 0.20)),
-        "sat_3d": max(6, round(total_records * 0.16)),
-        "fine_vision": max(4, round(total_records * 0.12)),
-        "reasoning_code": max(4, round(total_records * 0.10)),
-    }
+    has_sculpted = bool(buckets.get("sculpted_3d"))
+    target_shares = (
+        {
+            "sculpted_3d": max(6, round(total_records * 0.28)),
+            "uv_alpha": max(4, round(total_records * 0.14)),
+            "multiview_3d": max(4, round(total_records * 0.14)),
+            "artist_3d": max(4, round(total_records * 0.14)),
+            "sat_3d": max(4, round(total_records * 0.10)),
+            "fine_vision": max(4, round(total_records * 0.10)),
+            "reasoning_code": max(4, round(total_records * 0.10)),
+        }
+        if has_sculpted
+        else {
+            "uv_alpha": max(6, round(total_records * 0.20)),
+            "multiview_3d": max(6, round(total_records * 0.22)),
+            "artist_3d": max(6, round(total_records * 0.20)),
+            "sat_3d": max(6, round(total_records * 0.16)),
+            "fine_vision": max(4, round(total_records * 0.12)),
+            "reasoning_code": max(4, round(total_records * 0.10)),
+        }
+    )
     selected: list[str] = []
     seen: set[str] = set()
-    for key in ("uv_alpha", "multiview_3d", "artist_3d", "sat_3d", "fine_vision", "reasoning_code"):
+    bucket_order = (
+        ("sculpted_3d", "uv_alpha", "multiview_3d", "artist_3d", "sat_3d", "fine_vision", "reasoning_code")
+        if has_sculpted
+        else ("uv_alpha", "multiview_3d", "artist_3d", "sat_3d", "fine_vision", "reasoning_code")
+    )
+    for key in bucket_order:
         quota = target_shares[key]
         for rid in buckets.get(key, ()):
             if len(selected) >= total_records or quota <= 0:
