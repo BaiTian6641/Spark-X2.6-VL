@@ -66,13 +66,15 @@ SYNCCRAFT_V32_COMPACT_RULES = (
 )
 
 SYNCCRAFT_SCULPTED_COMPACT_RULES = (
-    "Mandatory Sculpted Blockbench Style + SyncCraft Block-DSL (`v3.2` / `v4.0`) rules:\n"
-    "1. `@meta`: use `dsl_version: \"3.2\", size_step: 0.5, audit_profile: sculpted` (or `dsl_version: \"4.0\"` when `@layout/@component/@assembly` is requested).\n"
-    "2. Vibrant 3+1 `@palette`: use `hue_shift=[-14, 10]` on `ramp(base_lch=[L, C, H], steps=6, hue_shift=[-14, 10])` so shadows shift cool (violet/blue) and highlights drift warm; concentrate `emissive=true` to 1 focal material (eyes/crystal/lantern).\n"
-    "3. Deliberately sculpted 3D flow: tilt neck/spine/limbs/props by 6–34 deg (`rest_euler` on child `bone`s or `rotate: [rx, ry, rz]` on `box`/`plane`s — NOTE: `root bone` accepts `pivot_local:` ONLY, NEVER `rest_euler:`!).\n"
-    "4. Seat child joints slightly inside parents (`anchor` ~ `0.85..0.95`, overlap <= `0.85 * min_thickness`) and use zero-thickness `plane <name> place(...) { size: [W, H], normal: x|y|z, material: ... }` for wing membrane bays, spike/fur fringes, tooth skirts, or leaves.\n"
-    "5. `mirror_x(<right_name>)` auto-generates `<right_name>` — NEVER also declare `bone <right_name>` explicitly!\n"
-    "6. Build 22–65 elements across primary masses, secondary anatomy/chamfers, and tertiary silhouette details."
+    "You author vibrant, deliberately sculpted 3D Blockbench models in SyncCraft Block-DSL (`blockbench-sculpted-style` v6). "
+    "Obey these exact grammar & style rules (adapt all part/material names and anatomy to the requested subject):\n"
+    "1. `@meta`: `@meta { archetype: entity, target_profile: bbmodel_5, texel_density: 16, dsl_version: \"3.2\", size_step: 0.5, audit_profile: sculpted }` (use `archetype: vehicle` or `prop` when appropriate).\n"
+    "2. Vibrant 3+1 `@palette`: `<name>_mat: ramp(base_lch=[L, C, H], steps=6, hue_shift=[-14, 10])` so shadows shift cool and highlights drift warm; set `emissive=true` on 1 focal material (`3-15%` of elements).\n"
+    "3. `@rig` hierarchy: `root bone <root_name> { pivot_local: [x, y, z] ... }` (`root bone` ONLY accepts `pivot_local:`, NEVER `rest_euler:`). "
+    "Every child bone MUST use the keyword `bone` (NEVER `joint`!): `bone <name> attach(parent_box=<box>, anchor=[ax,ay,az], align=[lx,ly,lz]) { rest_euler: [rx, ry, rz] ... }` (optional `mirror_x(<right_name>)` — NEVER redeclare `<right_name>` explicitly, and NEVER nest a `box` inside another `box`!).\n"
+    "4. `box` & `plane` syntax: first box on a bone is `box <name> { size: [W, H, D], material: <mat>, rotate: [rx, ry, rz] }`; sibling boxes MUST use `box <name> place(base_box=<box>, anchor=[ax,ay,az], align=[lx,ly,lz]) { size: [W, H, D], material: <mat>, rotate: [rx, ry, rz] }` (`box` NEVER takes `offset:` inside `{ ... }`). "
+    "Zero-thickness cutout `plane`s MUST use 2-number `size: [W, H]` and axis letter `normal: x` | `y` | `z`: `plane <name> place(base_box=<box>, anchor=[ax,ay,az], align=[lx,ly,lz]) { size: [W, H], normal: x, material: <mat> }` (NEVER 3-number `size` or vector `normal: [0,0,1]`!).\n"
+    "5. Deliberately sculpted 3D silhouette: build 22-55 elements across primary core masses, secondary anatomy/chamfers, and tertiary silhouette details (S-curved neck, jaw, horns/crests, 2-3 segment limbs/wings/wheels, `chain <name> attach(...) segments=4 taper=0.80 { axis: +z, rest_euler: [...], box seg { ... } }`, and 2+ `plane` cutouts) with 6-34 deg organic tilts and seated joints (`|anchor|` ~ `0.85..0.95`, protrusion >= `35%`)."
 )
 
 SYNCCRAFT_SCULPTED_SYSTEM_PROMPT = (
@@ -378,9 +380,19 @@ def _build_repair_prompt(
                 "CRITICAL ATTACH/PLACE FIX: Child bones MUST use `attach(parent_box=<box>, anchor=[ax,ay,az], align=[lx,ly,lz])` "
                 "(use `parent_box=`, NEVER `base=`), and sibling boxes MUST use `place(base_box=<box>, anchor=[ax,ay,az], align=[lx,ly,lz])`!"
             )
-        if "rest_euler" in err_s or "expected box, plane, locator, bone" in err_s:
+        if "rest_euler" in err_s:
             lines.append(
                 "CRITICAL ROOT BONE FIX: `root bone <name> { pivot_local: [x, y, z] ... }` ONLY accepts `pivot_local:` (NEVER `rest_euler:` on `root bone`; put `rotate: [...]` on the root box instead!)."
+            )
+        if "expected box, plane, locator, bone" in err_s or re.search(r"\bjoint\s+[A-Za-z_]", candidate_dsl):
+            lines.append(
+                "CRITICAL BONE KEYWORD FIX: Replace every `joint <name> attach(...)` with `bone <name> attach(...)` (Block-DSL uses `bone`, NEVER `joint`!), "
+                "and NEVER nest a `box` inside another `box { ... }` (use `bone <name> attach(...) { box ... }` or sibling `box <name> place(...) { size: [...], material: ... }`)."
+            )
+        if "plane" in err_s or re.search(r"normal\s*:\s*\[", candidate_dsl):
+            lines.append(
+                "CRITICAL PLANE FIX: `plane <name> place(base_box=<box>, anchor=[...], align=[...]) { size: [W, H], normal: x, material: <mat> }` "
+                "MUST use a 2-number `size: [W, H]` and single axis letter `normal: x` | `y` | `z` (NEVER 3-number `size: [W, H, D]` and NEVER vector `normal: [0, 0, 1]`)!"
             )
         if "field 'offset'" in err_s or "unexpected box" in err_s:
             lines.append(
@@ -793,7 +805,7 @@ class SyncCraftWorldPipeline:
             # (`system_prompt=None`) without injected 4-box grammar snippets! Preserve exact prompt/system parity on sculpted tasks.
             if wants_sculpted:
                 eff_prompt = prompt
-                eff_sys = None
+                eff_sys = SYNCCRAFT_SCULPTED_COMPACT_RULES if attempt == 0 else None
             else:
                 eff_prompt = (
                     f"{prompt.rstrip()}\n\n{SYNCCRAFT_V32_COMPACT_RULES}"
