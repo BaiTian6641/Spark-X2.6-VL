@@ -1125,6 +1125,49 @@ def test_stage6_1_priority_slice_and_disjoint_v4_supervision():
     assert counts["terminal_bench_agent"] >= 35
 
 
+def test_sculpted_domain_system_prompts_and_meta_enum_rules():
+    """Verify all 3 domain sculpted system prompts compile cleanly with 0 collisions/contacts and valid `@meta` enums."""
+    import synccraft.backends  # noqa: F401
+    from colab.final.sculpted_style_corpus import evaluate_sculpted_blockbench_style
+    from colab.final.world_pipeline import (
+        SYNCCRAFT_SCULPTED_DIORAMA_SYSTEM_PROMPT,
+        SYNCCRAFT_SCULPTED_SYSTEM_PROMPT,
+        SYNCCRAFT_SCULPTED_VEHICLE_SYSTEM_PROMPT,
+        _build_repair_prompt,
+        _extract_clean_blockdsl,
+        _select_sculpted_system_prompt,
+    )
+    from synccraft.audit.sync_audit import audit_scene
+    from synccraft.dsl.ast_nodes import ARCHETYPES, PROFILES, validate_program
+    from synccraft.dsl.parser import parse_program
+    from synccraft.kinematics.se3_chain import compile_geometry
 
+    assert _select_sculpted_system_prompt("Design a crimson dragon") == SYNCCRAFT_SCULPTED_SYSTEM_PROMPT
+    assert _select_sculpted_system_prompt("Design a six-wheeled polar expedition crawler truck") == SYNCCRAFT_SCULPTED_VEHICLE_SYSTEM_PROMPT
+    assert _select_sculpted_system_prompt("Design a cosy alchemist workbench alcove diorama scene") == SYNCCRAFT_SCULPTED_DIORAMA_SYSTEM_PROMPT
 
+    for sys_p in (
+        SYNCCRAFT_SCULPTED_SYSTEM_PROMPT,
+        SYNCCRAFT_SCULPTED_VEHICLE_SYSTEM_PROMPT,
+        SYNCCRAFT_SCULPTED_DIORAMA_SYSTEM_PROMPT,
+    ):
+        dsl = _extract_clean_blockdsl(sys_p)
+        prog = validate_program(parse_program(dsl))
+        assert prog.meta.archetype in ARCHETYPES
+        assert prog.meta.target_profile in PROFILES
+        sc = compile_geometry(prog)
+        aud = audit_scene(sc, enforce_physical_contact=True)
+        assert aud["passed"] is True
+        ev = evaluate_sculpted_blockbench_style(prog)
+        assert ev["grade"] == "sculpted_master_tier"
+        assert ev["sculpted_score"] >= 0.90
+
+    rep = _build_repair_prompt(
+        "Design a cosy diorama",
+        "@meta { archetype: prop, target_profile: bbmodel_5, texel_density: 16 }",
+        {"error": "syntax_or_validation_error: unknown archetype or target_profile"},
+        1,
+    )
+    assert "block_multipart" in rep and "entity" in rep
+    assert "NEVER `vehicle`, `prop`, or `architecture`" in rep
 

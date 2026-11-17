@@ -54,9 +54,9 @@ SYNCCRAFT_V32_COMPACT_RULES = (
     "  }\n"
     "}\n"
     "```\n"
-    "1. `@meta` ONLY accepts `archetype` (`entity` | `prop` | `architecture` | `vehicle`), `target_profile` "
-    "(`bedrock_entity` | `bbmodel_5` | `java_modern` | `gltf_pbr`), `texel_density` (int), and optional `audit_profile` "
-    "(`strict` | `sculpted` | `authored`) — NEVER `format_version`, `version`, `domain`, or `entity:`.\n"
+    "1. `@meta` ONLY accepts `archetype` (`entity` | `block_multipart` | `weapon_3d` | `item_extruded`), `target_profile` "
+    "(`bedrock_entity` | `bbmodel_5` | `geckolib` | `java_modern` | `java_legacy`), `texel_density` (int), and optional `audit_profile` "
+    "(`strict` | `sculpted` | `authored`) — NEVER `vehicle`, `prop`, `architecture`, `gltf_pbr`, `format_version`, `version`, `domain`, or `entity:`.\n"
     "2. Section order: `@meta`, `@palette`, `@rig` (`root bone <name> { box <name> { ... } }`), optional `@materials`, optional `@style`, optional `@muscles`, optional `@kinematics`, optional `@behavior`.\n"
     "3. `@palette` entries MUST use `<name>_mat: ramp(base_lch=[L, C, H], steps=6)` (`0<L<=1`) — ALWAYS suffix `@palette` identifiers with `_mat`.\n"
     "4. Box `size: [W, H, D]` MUST be 3 positive INTEGER literals in square brackets. NEVER use `root_bone: bone(...)`. "
@@ -68,7 +68,8 @@ SYNCCRAFT_V32_COMPACT_RULES = (
 SYNCCRAFT_SCULPTED_COMPACT_RULES = (
     "You author vibrant, deliberately sculpted 3D Blockbench models in SyncCraft Block-DSL (`blockbench-sculpted-style` v6). "
     "Obey these exact grammar & style rules (adapt all part/material names and anatomy to the requested subject):\n"
-    "1. `@meta`: `@meta { archetype: entity, target_profile: bbmodel_5, texel_density: 16, dsl_version: \"3.2\", size_step: 0.5, audit_profile: sculpted }` (`archetype` MUST be `entity`, `prop`, or `architecture` — use `entity` for vehicles/machines, NEVER `vehicle`!).\n"
+    "1. `@meta`: `@meta { archetype: entity, target_profile: bbmodel_5, texel_density: 16, dsl_version: \"3.2\", size_step: 0.5, audit_profile: sculpted }` "
+    "(`archetype` MUST be `entity` for creatures/characters/vehicles/mechs, `block_multipart` for dioramas/furniture/scenes, or `weapon_3d` — NEVER `vehicle`, `prop`, or `architecture`!).\n"
     "2. Vibrant 3+1 `@palette`: `<name>_mat: ramp(base_lch=[L, C, H], steps=6, hue_shift=[-14, 10])` so shadows shift cool and highlights drift warm; set `emissive=true` on 1 focal material (`3-15%` of elements).\n"
     "3. `@rig` hierarchy: `root bone <root_name> { pivot_local: [x, y, z] ... }` (`root bone` ONLY accepts `pivot_local:`, NEVER `rest_euler:`). "
     "Every child bone MUST use the keyword `bone` (NEVER `joint`!): `bone <name> attach(parent_box=<box>, anchor=[ax,ay,az], align=[lx,ly,lz]) { rest_euler: [rx, ry, rz] ... }` (optional `mirror_x(<right_name>)` — NEVER redeclare `<right_name>` explicitly, and NEVER nest a `box` inside another `box`!).\n"
@@ -148,6 +149,122 @@ SYNCCRAFT_SCULPTED_SYSTEM_PROMPT = (
     "```\n"
     + SYNCCRAFT_SCULPTED_COMPACT_RULES
 )
+
+SYNCCRAFT_SCULPTED_VEHICLE_SYSTEM_PROMPT = (
+    "You author vibrant, deliberately sculpted 3D Blockbench hard-surface vehicles and automatons in SyncCraft Block-DSL (`blockbench-sculpted-style` v6). "
+    "Follow this exact multi-bone hard-surface sculpted grammar skeleton (`archetype: entity`), adapting all material colors, hull proportions, wheels/legs, and greebles to the requested vehicle or machine:\n"
+    "```blockdsl\n"
+    "@meta { archetype: entity, target_profile: bbmodel_5, texel_density: 16, dsl_version: \"3.2\", size_step: 0.5, audit_profile: sculpted }\n"
+    "@palette {\n"
+    "  chassis_mat: ramp(base_lch=[0.50, 0.08, 138], steps=6, hue_shift=[-14, 8])\n"
+    "  top_slab_mat: ramp(base_lch=[0.84, 0.04, 95], steps=6, hue_shift=[-12, 8])\n"
+    "  trim_mat: ramp(base_lch=[0.68, 0.16, 54], steps=6, hue_shift=[-10, 10])\n"
+    "  tread_mat: ramp(base_lch=[0.28, 0.03, 245], steps=6, hue_shift=[-8, 6])\n"
+    "  lamp_glow_mat: ramp(base_lch=[0.86, 0.16, 195], steps=6, hue_shift=[-6, 12], emissive=true)\n"
+    "}\n"
+    "@rig {\n"
+    "  root bone chassis_root {\n"
+    "    pivot_local: [0, 7, 0]\n"
+    "    box main_hull { size: [10, 5.5, 15], material: chassis_mat, rotate: [-1.5, 0, 0] }\n"
+    "    box roof_slab place(base_box=main_hull, anchor=[0, 1, 0.05], align=[0, -0.85, 0]) { size: [9, 1.5, 13.5], material: top_slab_mat, rotate: [1.5, 0, 0] }\n"
+    "    box rack_rail_l place(base_box=roof_slab, anchor=[-0.92, 1, 0.1], align=[0.4, -0.85, 0]) { size: [0.5, 1, 11], material: trim_mat }\n"
+    "    box rack_rail_r place(base_box=roof_slab, anchor=[0.92, 1, 0.1], align=[-0.4, -0.85, 0]) { size: [0.5, 1, 11], material: trim_mat }\n"
+    "    box side_rung place(base_box=main_hull, anchor=[-1, 0.05, 0.25], align=[0.85, 0, 0]) { size: [0.5, 4.5, 2], material: trim_mat, rotate: [0, 0, 5] }\n"
+    "    plane mast_vane place(base_box=roof_slab, anchor=[0.55, 0.95, 0.55], align=[0, -0.85, 0]) { size: [2.5, 4.5], normal: x, material: trim_mat }\n"
+    "    plane rear_guard place(base_box=main_hull, anchor=[0, -0.45, 1], align=[0, 0.65, 0]) { size: [8, 2.5], normal: z, material: tread_mat }\n"
+    "    bone cab_unit attach(parent_box=main_hull, anchor=[0, 0.1, -0.88], align=[0, 0, 0.82]) {\n"
+    "      rest_euler: [6, 0, 0]\n"
+    "      box cab_shell { size: [8.5, 4.5, 5.5], material: chassis_mat }\n"
+    "      box cab_cap place(base_box=cab_shell, anchor=[0, 0.95, -0.1], align=[0, -0.75, 0]) { size: [7.5, 1, 4.5], material: top_slab_mat, rotate: [10, 0, 0] }\n"
+    "      box headlamp_l place(base_box=cab_shell, anchor=[-0.72, -0.2, -1], align=[0, 0, 0.65]) { size: [1.5, 1, 0.5], material: lamp_glow_mat }\n"
+    "      box headlamp_r place(base_box=cab_shell, anchor=[0.72, -0.2, -1], align=[0, 0, 0.65]) { size: [1.5, 1, 0.5], material: lamp_glow_mat }\n"
+    "      box front_guard place(base_box=cab_shell, anchor=[0, -0.88, -0.92], align=[0, 0.5, 0.65]) { size: [8, 1.5, 1.5], material: trim_mat, rotate: [-12, 0, 0] }\n"
+    "    }\n"
+    "    bone wheel_fl attach(parent_box=main_hull, anchor=[-1, -0.78, -0.68], align=[0.75, 0.35, 0]) mirror_x(wheel_fr) {\n"
+    "      rest_euler: [0, 6, 0]\n"
+    "      box front_tire { size: [2.5, 4.5, 4.5], material: tread_mat }\n"
+    "      box front_hub place(base_box=front_tire, anchor=[-1, 0, 0], align=[0.6, 0, 0]) { size: [0.5, 3, 3], material: trim_mat, rotate: [45, 0, 0] }\n"
+    "    }\n"
+    "    bone wheel_ml attach(parent_box=main_hull, anchor=[-1, -0.78, 0.0], align=[0.75, 0.35, 0]) mirror_x(wheel_mr) {\n"
+    "      box mid_tire { size: [2.5, 4.5, 4.5], material: tread_mat }\n"
+    "      box mid_hub place(base_box=mid_tire, anchor=[-1, 0, 0], align=[0.6, 0, 0]) { size: [0.5, 3, 3], material: trim_mat, rotate: [45, 0, 0] }\n"
+    "    }\n"
+    "    bone wheel_rl attach(parent_box=main_hull, anchor=[-1, -0.78, 0.68], align=[0.75, 0.35, 0]) mirror_x(wheel_rr) {\n"
+    "      box rear_tire { size: [2.5, 4.5, 4.5], material: tread_mat }\n"
+    "      box rear_hub place(base_box=rear_tire, anchor=[-1, 0, 0], align=[0.6, 0, 0]) { size: [0.5, 3, 3], material: trim_mat, rotate: [45, 0, 0] }\n"
+    "    }\n"
+    "  }\n"
+    "}\n"
+    "```\n"
+    + SYNCCRAFT_SCULPTED_COMPACT_RULES
+)
+
+SYNCCRAFT_SCULPTED_DIORAMA_SYSTEM_PROMPT = (
+    "You author vibrant, deliberately sculpted 3D Blockbench diorama scenes and architectural alcoves in SyncCraft Block-DSL (`blockbench-sculpted-style` v6). "
+    "Follow this exact sculpted diorama grammar skeleton (`archetype: block_multipart`), adapting all material colors, furniture, skewed props, warm focal glow, and cutout foliage `plane`s to the requested scene:\n"
+    "```blockdsl\n"
+    "@meta { archetype: block_multipart, target_profile: bbmodel_5, texel_density: 16, dsl_version: \"3.2\", size_step: 0.5, audit_profile: sculpted }\n"
+    "@palette {\n"
+    "  wall_mat: ramp(base_lch=[0.42, 0.07, 268], steps=6, hue_shift=[-14, 8])\n"
+    "  wood_mat: ramp(base_lch=[0.55, 0.11, 58], steps=6, hue_shift=[-16, 10])\n"
+    "  plant_mat: ramp(base_lch=[0.64, 0.15, 146], steps=6, hue_shift=[-14, 12])\n"
+    "  ceramic_mat: ramp(base_lch=[0.66, 0.13, 196], steps=6, hue_shift=[-10, 10])\n"
+    "  paper_mat: ramp(base_lch=[0.88, 0.05, 84], steps=6, hue_shift=[-10, 8])\n"
+    "  warm_glow_mat: ramp(base_lch=[0.86, 0.19, 76], steps=6, hue_shift=[-6, 12], emissive=true)\n"
+    "}\n"
+    "@rig {\n"
+    "  root bone diorama_root {\n"
+    "    pivot_local: [0, 0, 0]\n"
+    "    box plinth_floor { size: [16, 1.5, 14], material: wall_mat }\n"
+    "    box back_wall place(base_box=plinth_floor, anchor=[0, 1, 0.88], align=[0, -0.92, -0.5]) { size: [16, 13, 1.5], material: wall_mat }\n"
+    "    box side_column place(base_box=plinth_floor, anchor=[-0.88, 1, 0.15], align=[0.5, -0.92, 0]) { size: [2, 12.5, 11], material: wall_mat }\n"
+    "    box main_bench place(base_box=plinth_floor, anchor=[0.12, 1, 0.22], align=[0, -0.95, 0]) { size: [11, 5, 5.5], material: wood_mat, rotate: [0, 3, 0] }\n"
+    "    box bench_stool place(base_box=plinth_floor, anchor=[0.05, 1, -0.45], align=[0, -0.95, 0]) { size: [3.5, 3, 3.5], material: wood_mat, rotate: [0, -14, 0] }\n"
+    "    box wall_shelf place(base_box=back_wall, anchor=[0.12, 0.42, -0.92], align=[0, 0, 0.85]) { size: [10.5, 1, 3], material: wood_mat, rotate: [0, 0, -2] }\n"
+    "    box spine_tall place(base_box=wall_shelf, anchor=[-0.65, 1, 0], align=[0, -0.92, 0]) { size: [1, 3.5, 2.5], material: ceramic_mat, rotate: [0, 0, 9] }\n"
+    "    box spine_lean place(base_box=wall_shelf, anchor=[-0.42, 1, 0.05], align=[0, -0.92, 0]) { size: [1, 3, 2], material: paper_mat, rotate: [0, 4, 14] }\n"
+    "    box stack_flat place(base_box=wall_shelf, anchor=[0.58, 1, 0], align=[0, -0.90, 0]) { size: [3, 1, 2], material: wood_mat, rotate: [0, -8, 0] }\n"
+    "    box bottle_jar place(base_box=wall_shelf, anchor=[0.12, 1, 0], align=[0, -0.92, 0]) { size: [1.5, 2.5, 1.5], material: ceramic_mat, rotate: [0, 12, 0] }\n"
+    "    box desk_sheet place(base_box=main_bench, anchor=[-0.32, 1, -0.15], align=[0, -0.85, 0]) { size: [3.5, 0.5, 2.5], material: paper_mat, rotate: [2, -8, 0] }\n"
+    "    box vessel_flask place(base_box=main_bench, anchor=[-0.68, 1, 0.18], align=[0, -0.92, 0]) { size: [2, 2.5, 2], material: ceramic_mat, rotate: [0, 18, 0] }\n"
+    "    box stone_basin place(base_box=main_bench, anchor=[0.24, 1, -0.1], align=[0, -0.92, 0]) { size: [2, 1.5, 2], material: wall_mat, rotate: [0, 15, 0] }\n"
+    "    box basin_tool place(base_box=stone_basin, anchor=[0.15, 0.92, 0], align=[0, -0.85, 0]) { size: [0.5, 2, 0.5], material: paper_mat, rotate: [18, 0, -22] }\n"
+    "    box wall_frame place(base_box=back_wall, anchor=[-0.22, -0.05, -1], align=[0, 0, 0.65]) { size: [4, 3, 0.5], material: paper_mat, rotate: [0, 0, -4] }\n"
+    "    box floor_crate place(base_box=plinth_floor, anchor=[-0.52, 1, -0.52], align=[0, -0.95, 0]) { size: [3, 2, 2.5], material: wood_mat, rotate: [0, 16, 0] }\n"
+    "    bone lamp_bracket attach(parent_box=back_wall, anchor=[0.62, 0.68, -0.92], align=[0, 0, 0.88]) {\n"
+    "      rest_euler: [4, -6, 0]\n"
+    "      box bracket_arm { size: [1, 1, 3.5], material: wood_mat }\n"
+    "      box lamp_lantern place(base_box=bracket_arm, anchor=[0, -0.92, -0.75], align=[0, 0.92, 0]) { size: [2, 3, 2], material: warm_glow_mat, rotate: [0, 12, 3] }\n"
+    "      box lamp_cap place(base_box=lamp_lantern, anchor=[0, 0.95, 0], align=[0, -0.85, 0]) { size: [2.5, 0.5, 2.5], material: wood_mat }\n"
+    "    }\n"
+    "    bone planter_box attach(parent_box=plinth_floor, anchor=[0.74, 1, -0.58], align=[0, -0.95, 0]) {\n"
+    "      rest_euler: [0, -14, 0]\n"
+    "      box pot_base { size: [2.5, 2.5, 2.5], material: wood_mat }\n"
+    "      plane frond_n place(base_box=pot_base, anchor=[0, 0.92, -0.35], align=[0, -0.85, 0]) { size: [2.5, 3.5], normal: z, material: plant_mat, rotate: [-22, 8, 0] }\n"
+    "      plane frond_e place(base_box=pot_base, anchor=[0.35, 0.92, 0], align=[0, -0.85, 0]) { size: [2.5, 3.5], normal: x, material: plant_mat, rotate: [6, 0, -24] }\n"
+    "      plane frond_w place(base_box=pot_base, anchor=[-0.35, 0.92, 0], align=[0, -0.85, 0]) { size: [2.5, 3], normal: x, material: plant_mat, rotate: [-8, 0, 26] }\n"
+    "    }\n"
+    "  }\n"
+    "}\n"
+    "```\n"
+    + SYNCCRAFT_SCULPTED_COMPACT_RULES
+)
+
+
+def _select_sculpted_system_prompt(prompt: str) -> str:
+    """Select the domain-appropriate `blockbench-sculpted-style` v6 grammar skeleton."""
+    p_head = str(prompt or "").split("```", 1)[0].lower()
+    if any(
+        kw in p_head
+        for kw in ("diorama", "alcove", "workbench", "workshop", "shrine", "room", "interior", "block_multipart")
+    ):
+        return SYNCCRAFT_SCULPTED_DIORAMA_SYSTEM_PROMPT
+    if any(
+        kw in p_head
+        for kw in ("vehicle", "crawler", "truck", "rover", "tank", "wheeled", "car", "locomotive", "mech", "automaton")
+    ):
+        return SYNCCRAFT_SCULPTED_VEHICLE_SYSTEM_PROMPT
+    return SYNCCRAFT_SCULPTED_SYSTEM_PROMPT
 
 SYNCCRAFT_V32_GRAMMAR_SYSTEM_PROMPT = (
     "You author valid, artist-grade SyncCraft Block-DSL v3.2 3D assets with rich structural hierarchy (never simplistic 5-9 box toys). "
@@ -426,8 +543,9 @@ def _build_repair_prompt(
             )
         if "unknown archetype or target_profile" in err_s:
             lines.append(
-                "CRITICAL META ENUM FIX: `archetype` MUST be `entity`, `prop`, or `architecture` (use `entity` for vehicles/machines — NEVER `vehicle`!), "
-                "and `target_profile` MUST be `bbmodel_5`, `bedrock_entity`, `java_modern`, or `gltf_pbr`."
+                "CRITICAL META ENUM FIX: `archetype` MUST be `entity` (for creatures, characters, vehicles, and mechs!), "
+                "`block_multipart` (for dioramas, alcoves, furniture, and architectural scenes!), `weapon_3d`, or `item_extruded` "
+                "— NEVER `vehicle`, `prop`, or `architecture`! And `target_profile` MUST be `bbmodel_5`, `bedrock_entity`, `geckolib`, `java_modern`, or `java_legacy` (NEVER `gltf_pbr`)."
             )
         if "rest_euler" in err_s:
             lines.append(
@@ -860,9 +978,10 @@ class SyncCraftWorldPipeline:
             wants_sculpted = (not wants_strict) and (not explicit_classic_v32) and (
                 has_sculpted_kw or str(self.config.get("style_mode", "")).lower() == "sculpted"
             )
+            is_stage_c_upgrade = wants_sculpted and has_img and ("stage-c" in p_low or "upgrade" in p_low or "blockout" in p_low)
             if wants_sculpted:
                 eff_prompt = prompt
-                eff_sys = SYNCCRAFT_SCULPTED_SYSTEM_PROMPT if attempt == 0 else None
+                eff_sys = None if (attempt > 0 or is_stage_c_upgrade) else _select_sculpted_system_prompt(prompt)
             else:
                 eff_prompt = (
                     f"{prompt.rstrip()}\n\n{SYNCCRAFT_V32_COMPACT_RULES}"
@@ -876,7 +995,6 @@ class SyncCraftWorldPipeline:
                 and (has_img or wants_sculpted or bool(self.config.get("pipeline_enable_thinking", False)))
             )
             is_repair_sample = int(attempt) >= 1
-            is_stage_c_upgrade = wants_sculpted and has_img and ("stage-c" in p_low or "upgrade" in p_low or "blockout" in p_low)
             eff_task = (
                 ("synccraft_sculpted_stage_progression" if is_stage_c_upgrade else ("synccraft_sculpted_multiview_inverse" if wants_sculpted else "synccraft_multiview_inverse_dsl"))
                 if has_img
@@ -1008,11 +1126,21 @@ class SyncCraftWorldPipeline:
                     except Exception:
                         preview_imgs = None
                 if wants_sculpted_g:
-                    aes_prompt = (
-                        "Critique this stiff Stage-C axis-aligned blockout from its 4 views (`south`, `right`, `top`, `iso`) "
-                        f"and upgrade it into a vibrant Stage-E sculpted Blockbench asset ({prompt.strip()}):\n"
-                        f"```blockdsl\n{format_program(repair_result['program']).strip()}\n```"
+                    goal_head = prompt.split("```", 1)[0].strip()
+                    pal_cues = ", ".join(
+                        f"{p.name}: base_lch=[{p.base_lch[0]:.2f}, {p.base_lch[1]:.2f}, {p.base_lch[2]:.1f}]"
+                        for p in getattr(repair_result["program"], "palettes", ())[:4]
                     )
+                    sc_notes = list((sculpted_eval or {}).get("critique_notes") or ())
+                    aes_prompt = (
+                        f"Design a vibrant, deliberately sculpted 3D Blockbench Stage-E asset upgrading the stiff "
+                        f"{int((sculpted_eval or {}).get('element_count', repair_result['boxes']))}-box blockout for:\n"
+                        f"{goal_head}\n"
+                        + (f"Preserve the blockout's base color identity ({pal_cues}) using `hue_shift=[-14, 10]` ramps plus accent trim and 1 `emissive=true` focal material.\n" if pal_cues else "")
+                        + ("Fix every Stage-C blockout defect:\n" + "\n".join(f"- {n}" for n in sc_notes) + "\n" if sc_notes else "")
+                        + "Do NOT echo the stiff axis-aligned Stage-C rig; author a complete 22-30 element sculpted Block-DSL (`audit_profile: sculpted`, `size_step: 0.5`)."
+                    )
+                    upgrade_imgs = None
                 else:
                     aes_prompt = (
                         f"Your initial SyncCraft v3.2 asset compiled cleanly ({aesthetic_eval['box_count']} boxes, "
@@ -1025,9 +1153,10 @@ class SyncCraftWorldPipeline:
                         "with complete cranial/head anatomy, tapered trunk/pelvis, secondary armor/trim, >=4 OKLCH `_mat` ramps, "
                         "and zero 15-axis SAT collisions."
                     )
+                    upgrade_imgs = preview_imgs
 
                 def _upgrade_gen(_spec: Any = None) -> tuple[str, int]:
-                    txt, toks = self._invoke_model(aes_prompt, images=preview_imgs, attempt=0, max_new_tokens=max_new_tokens)
+                    txt, toks = self._invoke_model(aes_prompt, images=upgrade_imgs, attempt=0, max_new_tokens=max_new_tokens)
                     raw_generations.append(txt)
                     return txt, toks
 
