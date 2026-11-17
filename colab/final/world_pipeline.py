@@ -382,6 +382,22 @@ def _build_repair_prompt(
             lines.append(
                 "CRITICAL ROOT BONE FIX: `root bone <name> { pivot_local: [x, y, z] ... }` ONLY accepts `pivot_local:` (NEVER `rest_euler:` on `root bone`; put `rotate: [...]` on the root box instead!)."
             )
+        if "field 'offset'" in err_s or "unexpected box" in err_s:
+            lines.append(
+                "CRITICAL BOX OFFSET FIX: `box <name> { ... }` NEVER accepts `offset:` or `hinge:` inside `{ ... }`! "
+                "Position sibling boxes with `box <name> place(base_box=<box>, anchor=[ax,ay,az], align=[lx,ly,lz], offset=[ox,oy,oz]) { size: [...], material: ... }`, "
+                "or put articulated parts on a child `bone <name> attach(parent_box=<box>, anchor=[...], align=[...]) { ... }`."
+            )
+        if "expected ',', got" in err_s or "unexpected @meta field" in err_s or "@part" in candidate_dsl:
+            lines.append(
+                "CRITICAL GRAMMAR FIX: Every vector MUST use comma-separated numbers `[a, b, c]` (NEVER space-separated `[a b c]`). "
+                "Top-level sections MUST be `@meta { archetype: ..., target_profile: ..., texel_density: 16 }`, `@palette { ... }`, and `@rig { root bone <name> { ... } }` (NEVER `@part` or `@ramp`)."
+            )
+        if "expected integer literal" in err_s:
+            lines.append(
+                "CRITICAL SIZE_STEP FIX: Add `dsl_version: \"3.2\", size_step: 0.5, audit_profile: sculpted` inside `@meta { ... }` if using `0.5`-step sizes, "
+                "or round every `size: [W, H, D]` to positive integers when `size_step` is `1`."
+            )
         dup_m = re.search(r"duplicate identifier:\s*([A-Za-z0-9_]+)", err_s)
         if dup_m:
             dup_id = dup_m.group(1)
@@ -751,24 +767,27 @@ class SyncCraftWorldPipeline:
             has_img = bool(media.get("images"))
             p_low = prompt.lower()
             wants_strict = bool(re.search(r"audit_profile\s*[:=]\s*['\"]?strict['\"]?", p_low))
-            wants_sculpted = (not wants_strict) and (
-                str(self.config.get("style_mode", "")).lower() == "sculpted"
-                or any(
-                    kw in p_low
-                    for kw in (
-                        "sculpted",
-                        "blockbench",
-                        "vibrant",
-                        "dragon",
-                        "wyvern",
-                        "drake",
-                        "diorama",
-                        "size_step",
-                        "dsl_version: \"4.0\"",
-                        "dsl_version: '4.0'",
-                        "@assembly",
-                    )
+            has_sculpted_kw = any(
+                kw in p_low
+                for kw in (
+                    "sculpted",
+                    "blockbench",
+                    "vibrant",
+                    "dragon",
+                    "wyvern",
+                    "drake",
+                    "diorama",
+                    "size_step",
+                    "stage-c",
+                    "stage-e",
+                    "dsl_version: \"4.0\"",
+                    "dsl_version: '4.0'",
+                    "@assembly",
                 )
+            )
+            explicit_classic_v32 = (not has_sculpted_kw) and ("block-dsl v3.2" in p_low or "bedrock_entity" in p_low)
+            wants_sculpted = (not wants_strict) and (not explicit_classic_v32) and (
+                has_sculpted_kw or str(self.config.get("style_mode", "")).lower() == "sculpted"
             )
             # Native Sculpted Style (`SCULPTED_STYLE_TASKS`) was trained directly under SparkNative's default SYSTEM_PROMPT
             # (`system_prompt=None`) without injected 4-box grammar snippets! Preserve exact prompt/system parity on sculpted tasks.

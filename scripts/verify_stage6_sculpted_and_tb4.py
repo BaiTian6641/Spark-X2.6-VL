@@ -68,13 +68,13 @@ def _collect_tb4_holdout_bucket0(token: str | None, limit: int = 16) -> list[str
 
 
 def _validate_terminal_response(body: str, tid: str) -> tuple[bool, str]:
-    code_re = re.compile(r"```(bash|sh|shell|zsh|python|py|json)[ \t]*\r?\n(.*?)```", re.DOTALL | re.IGNORECASE)
+    code_re = re.compile(r"```(bash|sh|shell|zsh|python3|python|py|json)[ \t]*\r?\n(.*?)```", re.DOTALL | re.IGNORECASE)
     blocks = code_re.findall(body)
     if blocks:
         valid_any = False
         for lang, snippet in blocks:
             lt = lang.lower()
-            if lt in ("python", "py"):
+            if lt in ("python", "python3", "py"):
                 try:
                     compile(snippet, f"<{tid}>", "exec")
                     valid_any = True

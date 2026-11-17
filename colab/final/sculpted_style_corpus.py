@@ -820,10 +820,10 @@ def build_sculpted_crimson_western_dragon_dsl(variant: int = 0) -> tuple[str, st
     box hip_belly place(base_box=pelvis_mass, anchor=[0, -0.82, 0], align=[0, 0.5, 0]) {{
       size: [{chest_w - 2.5}, 1.5, 6], material: cream_mat
     }}
-    box haunch_l place(base_box=pelvis_mass, anchor=[-0.78, -0.1, 0.1], align=[0.5, 0, 0]) {{
+    box haunch_l place(base_box=pelvis_mass, anchor=[-0.88, -0.1, 0.1], align=[0.5, 0, 0]) {{
       size: [2.5, 5, 5], material: hide_mat, rotate: [8, 0, -6]
     }}
-    box haunch_r place(base_box=pelvis_mass, anchor=[0.78, -0.1, 0.1], align=[-0.5, 0, 0]) {{
+    box haunch_r place(base_box=pelvis_mass, anchor=[0.88, -0.1, 0.1], align=[-0.5, 0, 0]) {{
       size: [2.5, 5, 5], material: hide_mat, rotate: [8, 0, 6]
     }}
 
@@ -873,10 +873,10 @@ def build_sculpted_crimson_western_dragon_dsl(variant: int = 0) -> tuple[str, st
             bone head attach(parent_box=neck_2, anchor=[0, 0.15, -0.72], align=[0, -0.1, 0.8]) {{
               rest_euler: [-12, 0, 3]
               box skull {{ size: [5.5, 4.5, 5.5], material: hide_mat }}
-              box brow_l place(base_box=skull, anchor=[-0.75, 0.65, -0.35], align=[0.3, -0.5, 0]) {{
+              box brow_l place(base_box=skull, anchor=[-0.88, 0.82, -0.35], align=[0.3, -0.5, 0]) {{
                 size: [2, 1, 3.5], material: hide_mat, rotate: [0, 6, -8]
               }}
-              box brow_r place(base_box=skull, anchor=[0.75, 0.65, -0.35], align=[-0.3, -0.5, 0]) {{
+              box brow_r place(base_box=skull, anchor=[0.88, 0.82, -0.35], align=[-0.3, -0.5, 0]) {{
                 size: [2, 1, 3.5], material: hide_mat, rotate: [0, -6, 8]
               }}
               box eye_l place(base_box=skull, anchor=[-1, 0.15, -0.35], align=[0.6, 0, 0]) {{
@@ -997,7 +997,7 @@ def build_sculpted_crimson_western_dragon_dsl(variant: int = 0) -> tuple[str, st
       axis: +z
       rest_euler: [8, 5, 0]
       box caudal {{ size: [4.5, 4, 5.5], material: hide_mat }}
-      box caudal_belly place(base_box=caudal, anchor=[0, -0.82, 0], align=[0, 0.5, 0]) {{
+      box caudal_belly place(base_box=caudal, anchor=[0, -0.92, 0], align=[0, 0.4, 0]) {{
         size: [3, 1, 5], material: cream_mat
       }}
     }}
@@ -1096,10 +1096,10 @@ def build_sculpted_glacial_crystal_drake_dsl(variant: int = 0) -> tuple[str, str
         bone head attach(parent_box=neck_block, anchor=[0, 0.1, -0.72], align=[0, -0.05, 0.8]) {{
           rest_euler: [-10, 5, 0]
           box heavy_skull {{ size: [8, 6, 6.5], material: glacier_mat }}
-          box brow_shelf_l place(base_box=heavy_skull, anchor=[-0.78, 0.62, -0.35], align=[0.3, -0.5, 0]) {{
+          box brow_shelf_l place(base_box=heavy_skull, anchor=[-0.88, 0.82, -0.35], align=[0.3, -0.5, 0]) {{
             size: [2.5, 1.5, 4], material: glacier_mat, rotate: [0, 8, -10]
           }}
-          box brow_shelf_r place(base_box=heavy_skull, anchor=[0.78, 0.62, -0.35], align=[-0.3, -0.5, 0]) {{
+          box brow_shelf_r place(base_box=heavy_skull, anchor=[0.88, 0.82, -0.35], align=[-0.3, -0.5, 0]) {{
             size: [2.5, 1.5, 4], material: glacier_mat, rotate: [0, -8, 10]
           }}
           box deep_eye_l place(base_box=heavy_skull, anchor=[-1, 0.12, -0.32], align=[0.6, 0, 0]) {{
@@ -1820,7 +1820,7 @@ def build_sculpted_expedition_crawler_dsl(variant: int = 0) -> tuple[str, str, d
     box roof_rail_r place(base_box=cargo_module, anchor=[0.88, 1, 0], align=[0, -1, 0]) {{
       size: [0.5, 1.5, 9.5], material: hazard_orange_mat
     }}
-    box side_ladder place(base_box=cargo_module, anchor=[0.95, -0.05, 0.25], align=[-0.5, 0, 0]) {{
+    box side_ladder place(base_box=cargo_module, anchor=[0.98, -0.05, 0.25], align=[-0.65, 0, 0]) {{
       size: [0.5, 6.5, 2], material: hazard_orange_mat
     }}
     plane expedition_pennant place(base_box=roof_rail_l, anchor=[0, 1, 0.7], align=[0, -1, 0], offset=[-0.25, 0, 0]) {{
