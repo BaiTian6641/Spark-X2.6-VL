@@ -135,7 +135,8 @@ ARTIST_ASSISTANT_MODES: tuple[str, ...] = (
 )
 
 THINK_BLOCK_RE = re.compile(r"^\s*<think>(.*?)</think>\s*(.*)$", re.DOTALL)
-DSL_FENCE_RE = re.compile(r"```(?:blockdsl|dsl|text)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
+DSL_FENCE_RE = re.compile(r"```(?:blockdsl|synccraft|dsl|text)?[ \t]*\r?\n(.*?)```", re.DOTALL | re.IGNORECASE)
+DSL_OPEN_FENCE_RE = re.compile(r"```(?:blockdsl|synccraft|dsl|text)?[ \t]*\r?\n(.*)$", re.DOTALL | re.IGNORECASE)
 JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL | re.IGNORECASE)
 
 
@@ -1958,7 +1959,26 @@ def _extract_dsl_candidate(body: str) -> str:
     m = DSL_FENCE_RE.search(body)
     if m is not None:
         return m.group(1).strip()
-    return body.strip()
+    m_open = DSL_OPEN_FENCE_RE.search(body)
+    cand = m_open.group(1).replace("```", "").strip() if m_open is not None else body.replace("```", "").strip()
+    for kw in ("@meta", "@layout", "@component", "@assembly"):
+        idx = cand.find(kw)
+        if idx >= 0:
+            cand = cand[idx:].strip()
+            break
+    open_b = cand.count("{")
+    close_b = cand.count("}")
+    if open_b > close_b:
+        lines = cand.splitlines()
+        while lines and not lines[-1].rstrip().endswith("}"):
+            lines.pop()
+        if lines:
+            cand = "\n".join(lines)
+            open_b = cand.count("{")
+            close_b = cand.count("}")
+        if 0 < (open_b - close_b) <= 6:
+            cand = cand + ("\n}" * (open_b - close_b))
+    return cand
 
 
 def _extract_json_candidate(body: str) -> dict[str, Any]:

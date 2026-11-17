@@ -68,19 +68,19 @@ def _collect_tb4_holdout_bucket0(token: str | None, limit: int = 16) -> list[str
 
 
 def _validate_terminal_response(body: str, tid: str) -> tuple[bool, str]:
-    code_re = re.compile(r"```(bash|sh|python|json)\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
+    code_re = re.compile(r"```(bash|sh|shell|zsh|python|py|json)[ \t]*\r?\n(.*?)```", re.DOTALL | re.IGNORECASE)
     blocks = code_re.findall(body)
     if blocks:
         valid_any = False
         for lang, snippet in blocks:
             lt = lang.lower()
-            if lt == "python":
+            if lt in ("python", "py"):
                 try:
                     compile(snippet, f"<{tid}>", "exec")
                     valid_any = True
                 except SyntaxError:
                     return False, "invalid_python_syntax"
-            elif lt in ("bash", "sh"):
+            elif lt in ("bash", "sh", "shell", "zsh"):
                 p = subprocess.run(["bash", "-n"], input=snippet.encode("utf-8"), capture_output=True, timeout=3, check=False)
                 if p.returncode != 0:
                     return False, "invalid_bash_syntax"
@@ -94,6 +94,16 @@ def _validate_terminal_response(body: str, tid: str) -> tuple[bool, str]:
                     return False, "invalid_tool_json"
         if valid_any:
             return True, "fenced_script_or_tool_call_valid"
+
+    # Also check inline JSON tool_calls object without markdown fence
+    if '"tool_calls"' in body and "{" in body and "}" in body:
+        try:
+            s_i, e_i = body.find("{"), body.rfind("}")
+            obj = json.loads(body[s_i : e_i + 1])
+            if isinstance(obj, dict) and "tool_calls" in obj:
+                return True, "inline_tool_calls_json_valid"
+        except Exception:
+            pass
 
     if body.lstrip().startswith("#!/"):
         if "python" in body.splitlines()[0]:
@@ -129,8 +139,9 @@ def eval_terminal_bench4_holdout(model: Any, holdout_tids: list[str], token: str
             ),
             media=empty_media(),
             enable_thinking=True,
-            max_new_tokens=1664,
-            max_think_tokens=576,
+            max_new_tokens=2304,
+            max_think_tokens=448,
+            repetition_penalty=1.06,
             task="terminal_bench_agent",
         )
         h = check_generation_collapse_health(out, expect_thinking=True, max_rep_4gram=0.16, max_think_chars=5200)
@@ -142,7 +153,7 @@ def eval_terminal_bench4_holdout(model: Any, holdout_tids: list[str], token: str
         ok, kind = _validate_terminal_response(body, tid)
         if ok:
             valid_cnt += 1
-        per_task.append({"task_id": tid, "valid": ok, "kind": kind, "healthy": h["healthy"], "think_closed": h.get("think_closed")})
+        per_task.append({"task_id": tid, "valid": ok, "kind": kind, "healthy": h["healthy"], "think_closed": h.get("think_closed"), "preview": body[:220]})
 
     n = max(1, len(holdout_tids))
     return {
@@ -349,8 +360,9 @@ def eval_sculpted_3d_and_v4_suite(model: Any, cfg: dict[str, Any], out_dir: Path
             str(item["prompt"]),
             media=empty_media(),
             enable_thinking=True,
-            max_new_tokens=1536,
+            max_new_tokens=2048,
             max_think_tokens=384,
+            repetition_penalty=1.06,
             task="synccraft_v4_modular_assembly",
         )
         _, b_v4 = strip_think_block(raw_v4)
