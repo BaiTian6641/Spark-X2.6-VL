@@ -68,7 +68,7 @@ SYNCCRAFT_V32_COMPACT_RULES = (
 SYNCCRAFT_SCULPTED_COMPACT_RULES = (
     "You author vibrant, deliberately sculpted 3D Blockbench models in SyncCraft Block-DSL (`blockbench-sculpted-style` v6). "
     "Obey these exact grammar & style rules (adapt all part/material names and anatomy to the requested subject):\n"
-    "1. `@meta`: `@meta { archetype: entity, target_profile: bbmodel_5, texel_density: 16, dsl_version: \"3.2\", size_step: 0.5, audit_profile: sculpted }` (use `archetype: vehicle` or `prop` when appropriate).\n"
+    "1. `@meta`: `@meta { archetype: entity, target_profile: bbmodel_5, texel_density: 16, dsl_version: \"3.2\", size_step: 0.5, audit_profile: sculpted }` (`archetype` MUST be `entity`, `prop`, or `architecture` — use `entity` for vehicles/machines, NEVER `vehicle`!).\n"
     "2. Vibrant 3+1 `@palette`: `<name>_mat: ramp(base_lch=[L, C, H], steps=6, hue_shift=[-14, 10])` so shadows shift cool and highlights drift warm; set `emissive=true` on 1 focal material (`3-15%` of elements).\n"
     "3. `@rig` hierarchy: `root bone <root_name> { pivot_local: [x, y, z] ... }` (`root bone` ONLY accepts `pivot_local:`, NEVER `rest_euler:`). "
     "Every child bone MUST use the keyword `bone` (NEVER `joint`!): `bone <name> attach(parent_box=<box>, anchor=[ax,ay,az], align=[lx,ly,lz]) { rest_euler: [rx, ry, rz] ... }` (optional `mirror_x(<right_name>)` — NEVER redeclare `<right_name>` explicitly, and NEVER nest a `box` inside another `box`!).\n"
@@ -423,6 +423,11 @@ def _build_repair_prompt(
             lines.append(
                 "CRITICAL ATTACH/PLACE FIX: Child bones MUST use `attach(parent_box=<box>, anchor=[ax,ay,az], align=[lx,ly,lz])` "
                 "(use `parent_box=`, NEVER `base=`), and sibling boxes MUST use `place(base_box=<box>, anchor=[ax,ay,az], align=[lx,ly,lz])`!"
+            )
+        if "unknown archetype or target_profile" in err_s:
+            lines.append(
+                "CRITICAL META ENUM FIX: `archetype` MUST be `entity`, `prop`, or `architecture` (use `entity` for vehicles/machines — NEVER `vehicle`!), "
+                "and `target_profile` MUST be `bbmodel_5`, `bedrock_entity`, `java_modern`, or `gltf_pbr`."
             )
         if "rest_euler" in err_s:
             lines.append(
