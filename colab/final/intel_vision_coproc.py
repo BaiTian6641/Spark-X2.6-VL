@@ -1113,27 +1113,39 @@ def _run_xpu_daemon(args: argparse.Namespace) -> None:
             "unfrozen_layers": unfrozen_layers,
         }
 
+    def _empty_dev_cache() -> None:
+        if device.type == "xpu" and hasattr(torch, "xpu"):
+            torch.xpu.empty_cache()
+        elif device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     def _exec_forward_train(pv: torch.Tensor, pam: torch.Tensor, ss: torch.Tensor, slot_id: int) -> torch.Tensor:
-        live_patches = sum(
-            int(s[1].shape[0]) * int(s[1].shape[1])
-            for s in saved_slots.values()
-            if s[0] == "live"
-        )
+        live_count = sum(1 for s in saved_slots.values() if s[0] == "live")
         cur_patches = int(pv.shape[0]) * int(pv.shape[1])
+        # Cap uncheckpointed live 27L autograd graphs on `16 GB` Arc Pro B50 to at most 1 slot (`<= 2048` patches = ~3.8 GiB);
+        # any overlapping prefetch or multiview/video extra frames store compact inputs on CPU (`0 GiB` XPU idle)
+        # and recompute with `gradient_checkpointing_enable` (`~0.35 GiB`), capping XPU peak at ~11.4 GiB / 15.92 GiB!
         can_keep_live = (
             trainable_params > 0
-            and (live_patches + cur_patches) < grad_ckpt_tokens
-            and len(saved_slots) < 4
+            and live_count == 0
+            and len(saved_slots) == 0
+            and cur_patches <= min(grad_ckpt_tokens, 2048)
         )
         if can_keep_live:
-            with torch.enable_grad(), _amp_ctx():
-                feat = vision(
-                    pixel_values=pv,
-                    pixel_attention_mask=pam,
-                    spatial_shapes=ss,
-                ).last_hidden_state
-            saved_slots[slot_id] = ("live", feat)
-            return feat.detach()
+            try:
+                with torch.enable_grad(), _amp_ctx():
+                    feat = vision(
+                        pixel_values=pv,
+                        pixel_attention_mask=pam,
+                        spatial_shapes=ss,
+                    ).last_hidden_state
+                saved_slots[slot_id] = ("live", feat)
+                return feat.detach()
+            except RuntimeError as exc:
+                if "out of memory" not in str(exc).lower():
+                    raise
+                vision.zero_grad(set_to_none=True)
+                _empty_dev_cache()
         rng_st = _get_rng()
         with torch.no_grad(), _amp_ctx():
             feat = vision(
@@ -1141,7 +1153,13 @@ def _run_xpu_daemon(args: argparse.Namespace) -> None:
                 pixel_attention_mask=pam,
                 spatial_shapes=ss,
             ).last_hidden_state
-        saved_slots[slot_id] = ("recompute", pv, pam, ss, rng_st)
+        saved_slots[slot_id] = (
+            "recompute",
+            pv.detach().cpu(),
+            pam.detach().cpu(),
+            ss.detach().cpu(),
+            rng_st,
+        )
         return feat
 
     def _exec_backward_slot(slot_id: int, grad_out: torch.Tensor, mb_weight: float) -> None:
@@ -1157,24 +1175,30 @@ def _run_xpu_daemon(args: argparse.Namespace) -> None:
             loss_surrogate.backward()
             del live_out, loss_surrogate
         else:
-            _, pv, pam, ss, rng_st = slot
-            use_ckpt = int(pv.shape[0]) * int(pv.shape[1]) >= grad_ckpt_tokens
-            if use_ckpt and getattr(vision, "supports_gradient_checkpointing", False):
+            _, pv_cpu, pam_cpu, ss_cpu, rng_st = slot
+            pv_d = pv_cpu.to(device=device, dtype=vis_dtype)
+            pam_d = pam_cpu.to(device=device)
+            ss_d = ss_cpu.to(device=device)
+            del pv_cpu, pam_cpu, ss_cpu
+            has_ckpt = bool(getattr(vision, "supports_gradient_checkpointing", False))
+            if has_ckpt:
                 vision.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
             try:
                 _set_rng(rng_st)
                 with torch.enable_grad(), _amp_ctx():
                     out = vision(
-                        pixel_values=pv,
-                        pixel_attention_mask=pam,
-                        spatial_shapes=ss,
+                        pixel_values=pv_d,
+                        pixel_attention_mask=pam_d,
+                        spatial_shapes=ss_d,
                     ).last_hidden_state
                     loss_surrogate = (out.float() * grad_out.float()).sum()
                 loss_surrogate.backward()
             finally:
-                if use_ckpt and hasattr(vision, "gradient_checkpointing_disable"):
+                if has_ckpt and hasattr(vision, "gradient_checkpointing_disable"):
                     vision.gradient_checkpointing_disable()
-            del pv, pam, ss
+            del pv_d, pam_d, ss_d
+            if len(saved_slots) > 0:
+                _empty_dev_cache()
         with torch.no_grad():
             for n, p in vision.named_parameters():
                 if p.requires_grad and p.grad is not None:
