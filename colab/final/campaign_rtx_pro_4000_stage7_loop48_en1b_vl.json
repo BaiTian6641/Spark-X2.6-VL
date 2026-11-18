@@ -90,7 +90,7 @@
   "early_stopping_patience": 2,
   "early_stopping_min_rel_delta": 0.004,
   "enforce_stage_promotion_gate": false,
-  "optimizer_profile": "apollo_coat_fp8_moments",
+  "optimizer_profile": "apollo_coat",
   "optimizer_ablation_profiles": [
     "bf16_adamw",
     "apollo_merged",
@@ -109,7 +109,7 @@
   "apollo_include_embeddings": true,
   "coat_activation_fp8": true,
   "coat_activation_group_size": 16,
-  "coat_moment_fp8": true,
+  "coat_moment_fp8": false,
   "coat_fp8_linear_forward": false,
   "merged_grad_norm_mode": "per_example",
   "visual_cross_attn_blocks": 3,

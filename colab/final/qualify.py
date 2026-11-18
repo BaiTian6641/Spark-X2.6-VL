@@ -42,15 +42,17 @@ def check_kernel_gradient_parity(reference_grads,reference_norms,named_parameter
         if not math.isfinite(reference_norm) or not math.isfinite(candidate_norm):
             raise RuntimeError('Nonfinite kernel parity gradient norm: '+name)
         difference=reference-candidate;sample_l2=float(difference.norm());reference_sample_norm=float(reference.norm())
+        # Scalar/1D residual gates (`numel <= 16`) reduce `T * D` (~1.5M) BF16 products into a single cancelled scalar.
+        eff_atol=atol*4.0 if p.grad.numel()<=16 else atol
         rms_slice_scale=max(reference_sample_norm,reference_norm*math.sqrt(reference.numel()/max(1,p.grad.numel())))
-        sample_allowed=atol*math.sqrt(reference.numel())+rtol*rms_slice_scale
+        sample_allowed=eff_atol*math.sqrt(reference.numel())+rtol*rms_slice_scale
         if sample_l2>sample_allowed:
             raise RuntimeError(f'Spark BF16 gradient sample L2 parity failed for {name}: error={sample_l2} allowed={sample_allowed} max_abs={float(difference.abs().max())}')
         max_sample_l2=max(max_sample_l2,sample_l2)
         error=float(difference.abs().max())
         if error>max_sample_error: max_sample_error=error;worst=name
         norm_error=abs(reference_norm-candidate_norm);max_norm_error=max(max_norm_error,norm_error)
-        allowed=atol+rtol*reference_norm
+        allowed=eff_atol+rtol*reference_norm
         if norm_error>allowed:
             raise RuntimeError(f'Spark BF16 full-tensor gradient norm parity failed for {name}: error={norm_error} allowed={allowed} sample_l2={sample_l2} sample_allowed={sample_allowed}')
         checked+=1
