@@ -126,6 +126,10 @@ def validate_config(c):
         raise ValueError('rsi_mode must be instructor, vision_self_improvement, or teacher_subagent_v8')
     if 'enable_loop_engram' in c and type(c['enable_loop_engram']) is not bool:
         raise ValueError('enable_loop_engram must be an explicit boolean')
+    if 'intel_arc_vision_offload' in c and type(c['intel_arc_vision_offload']) is not bool:
+        raise ValueError('intel_arc_vision_offload must be an explicit boolean')
+    if 'intel_arc_openvino_eval' in c and type(c['intel_arc_openvino_eval']) is not bool:
+        raise ValueError('intel_arc_openvino_eval must be an explicit boolean')
     if 'loop_passes' in c and (type(c['loop_passes']) is not int or not 1 <= c['loop_passes'] <= 4):
         raise ValueError('loop_passes must be an integer between 1 and 4')
     if any(k in c for k in ('HF_TOKEN','OPENCODE_API_KEY','token','api_key')): raise ValueError('Secrets do not belong in configuration')

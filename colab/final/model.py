@@ -590,6 +590,8 @@ def _unpack_fp8_sub_lsb_residual(
 
 def export_spark_native_fp8_safetensors(model: nn.Module, path: str | Path) -> dict[str, Any]:
     """Export `SparkNative` with Spark linear projections quantized to `F8_E4M3` + `weight_scale` + packed `INT4` sub-LSB residual."""
+    if hasattr(model, 'sync_intel_vision_to_host'):
+        model.sync_intel_vision_to_host()
     fp8_max = 448.0
     out_tensors: dict[str, torch.Tensor] = {}
     seen_ptrs: set[tuple[int, tuple[int, ...], tuple[int, ...]]] = set()
@@ -671,6 +673,8 @@ def load_spark_native_safetensors(
                     raise RuntimeError(f'Unexpected parameters when loading SparkNative safetensors: {sorted(unexpected_sf)[:8]}')
                 if hasattr(model, '_ensure_tier1b_cpu_pinned'):
                     model._ensure_tier1b_cpu_pinned()
+                if hasattr(model, 'sync_host_vision_to_intel'):
+                    model.sync_host_vision_to_intel()
                 return
 
             loaded: set[str] = set()
@@ -731,6 +735,8 @@ def load_spark_native_safetensors(
         model.spark.tie_weights()
     if hasattr(model, '_ensure_tier1b_cpu_pinned'):
         model._ensure_tier1b_cpu_pinned()
+    if hasattr(model, 'sync_host_vision_to_intel'):
+        model.sync_host_vision_to_intel()
     expected_all = set(param_map.keys()) | {k for k in buf_map if k.endswith('tier1b_cold_weight')}
     missing = expected_all - loaded - {'spark.lm_head.weight'}
     if allow_missing_loop_engram:
@@ -857,13 +863,48 @@ class SparkNative(nn.Module):
             # Move Spark + SigLIP2 preserving their configured dtypes; keep connectors/adapters in float32.
             self.spark.to(device=device,dtype=spark_dtype)
             if hasattr(self.spark,'tie_weights'): self.spark.tie_weights()
-            self.vision.to(device=device,dtype=vision_dtype)
+            self._intel_vision_bridge = None
+            self._openvino_vision_runner = None
+            self._intel_vision_trainable = False
+            self._intel_vision_base_lr = float(
+                policy.get('vision_lr', policy.get('vision_learning_rate', float(policy.get('learning_rate', 6e-5)) * 0.5))
+            )
+            want_b50_xpu = bool(policy.get('intel_arc_vision_offload', False)) and paths is not None and 'vision' in paths
+            want_b50_ov = (not want_b50_xpu) and bool(policy.get('intel_arc_openvino_eval', False))
+            if want_b50_xpu:
+                from .intel_vision_coproc import IntelArcXpuVisionBridge
+                self.vision.to(device='cpu', dtype=vision_dtype)
+                self._intel_vision_bridge = IntelArcXpuVisionBridge(
+                    paths['vision'],
+                    xpu_python=policy.get('intel_arc_xpu_python'),
+                    device_spec=str(policy.get('intel_arc_device', 'xpu:0')),
+                    vision_dtype=str(policy.get('vision_dtype', default_backbone_dtype)),
+                    weight_decay=float(policy.get('weight_decay', 0.01)),
+                    grad_checkpoint_token_threshold=int(policy.get('intel_arc_grad_ckpt_tokens', 2304)),
+                )
+                self._intel_vision_bridge.sync_from_host(self.vision)
+            elif want_b50_ov:
+                from .intel_vision_coproc import OpenVinoArcVisionRunner
+                self.vision.to(device='cpu', dtype=vision_dtype)
+                ov_cache = Path(policy['work_root']) / 'ov-vision-cache' if policy.get('work_root') else None
+                self._openvino_vision_runner = OpenVinoArcVisionRunner(
+                    self.vision,
+                    preferred_device=str(policy.get('intel_arc_openvino_device', 'GPU.0')),
+                    cache_dir=ov_cache,
+                )
+            else:
+                self.vision.to(device=device,dtype=vision_dtype)
             for conn in self._connector_modules():
                 conn.to(device=device,dtype=torch.float32)
             if self.enable_loop_engram:
                 self.loop_controllers.to(device=device, dtype=torch.float32)
                 self.engram_anchors.to(device=device)
 
+        if not hasattr(self, '_intel_vision_bridge'):
+            self._intel_vision_bridge = None
+            self._openvino_vision_runner = None
+            self._intel_vision_trainable = False
+            self._intel_vision_base_lr = float(policy.get('vision_lr', 3e-5))
         self.freeze_infrastructure()
         self.gradient_checkpointing_enable()
 
@@ -977,6 +1018,75 @@ class SparkNative(nn.Module):
     def step_tier1b_sparse_adam(self, *, lr: float = 1.2e-4, denom: float = 1.0) -> None:
         for mod in self.engram_anchors.values():
             mod.step_tier1b_sparse_adam(lr=lr, denom=denom)
+
+    def has_intel_vision_bridge(self) -> bool:
+        return getattr(self, '_intel_vision_bridge', None) is not None
+
+    def sync_intel_vision_to_host(self, *, force: bool = False) -> bool:
+        bridge = getattr(self, '_intel_vision_bridge', None)
+        if bridge is not None and getattr(self, 'vision', None) is not None:
+            synced = bridge.sync_to_host(self.vision, force=force)
+            if synced and getattr(self, '_openvino_vision_runner', None) is not None:
+                self._openvino_vision_runner.invalidate()
+            return synced
+        return False
+
+    def sync_host_vision_to_intel(self) -> None:
+        bridge = getattr(self, '_intel_vision_bridge', None)
+        if bridge is not None and getattr(self, 'vision', None) is not None:
+            bridge.sync_from_host(self.vision)
+        ov_runner = getattr(self, '_openvino_vision_runner', None)
+        if ov_runner is not None:
+            ov_runner.invalidate()
+
+    def zero_intel_vision_buffers(self) -> None:
+        bridge = getattr(self, '_intel_vision_bridge', None)
+        if bridge is not None:
+            bridge.zero_grad()
+
+    def step_intel_vision_xpu(
+        self,
+        *,
+        lr_scale: float = 1.0,
+        lr_override: float | None = None,
+        max_grad_norm: float = 1.0,
+        post_scale: float = 1.0,
+    ) -> dict[str, Any]:
+        bridge = getattr(self, '_intel_vision_bridge', None)
+        if bridge is None or not getattr(self, '_intel_vision_trainable', False):
+            return {'applied': False, 'finite': True, 'vision_grad_norm': 0.0}
+        base_lr = float(lr_override if lr_override is not None else getattr(self, '_intel_vision_base_lr', 3e-5))
+        return bridge.step(lr=base_lr * float(lr_scale), max_grad_norm=max_grad_norm, post_scale=post_scale)
+
+    def has_intel_vision_optim_state(self) -> bool:
+        return self.has_intel_vision_bridge() and bool(getattr(self, '_intel_vision_trainable', False))
+
+    def intel_vision_optim_state_dict(self) -> dict[str, Any]:
+        bridge = getattr(self, '_intel_vision_bridge', None)
+        return bridge.optim_state_dict() if bridge is not None else {}
+
+    def load_intel_vision_optim_state_dict(self, state: dict[str, Any]) -> None:
+        bridge = getattr(self, '_intel_vision_bridge', None)
+        if bridge is not None and isinstance(state, dict):
+            bridge.load_optim_state_dict(state)
+
+    def intel_vision_telemetry(self) -> dict[str, Any]:
+        bridge = getattr(self, '_intel_vision_bridge', None)
+        ov_runner = getattr(self, '_openvino_vision_runner', None)
+        if bridge is not None:
+            return {'backend': 'intel_arc_xpu', **bridge.telemetry()}
+        if ov_runner is not None:
+            return {
+                'backend': 'openvino_arc',
+                'device': ov_runner.device_name,
+                'device_name': ov_runner.full_device_name,
+            }
+        return {'backend': 'resident_cuda'}
+
+    def close_coprocessors(self) -> None:
+        bridge, self._intel_vision_bridge = getattr(self, '_intel_vision_bridge', None), None
+        if bridge is not None:
+            bridge.close()
 
     def loop_engram_telemetry(self) -> dict[str, Any]:
         if not self.enable_loop_engram:
@@ -1288,6 +1398,7 @@ class SparkNative(nn.Module):
         self.freeze_infrastructure()
         self._freeze_unused_loop_pass_params()
 
+        bridge = getattr(self, '_intel_vision_bridge', None)
         if mode == 'defrost_loop_engram':
             for name in ('spark', 'vision', 'motion', 'speech_in', 'sound_in'):
                 mod = getattr(self, name, None)
@@ -1299,7 +1410,11 @@ class SparkNative(nn.Module):
             sound_out = getattr(self, 'sound_out', None)
             if sound_out is not None and getattr(sound_out, 'dit', None) is not None:
                 sound_out.dit.requires_grad_(False)
-            if unfreeze_vision_last_n_layers > 0:
+            if bridge is not None:
+                want_v = int(unfreeze_vision_last_n_layers) > 0
+                bridge.configure_trainability(trainable=want_v, unfreeze_last_n_layers=int(unfreeze_vision_last_n_layers))
+                self._intel_vision_trainable = want_v
+            elif unfreeze_vision_last_n_layers > 0:
                 self._unfreeze_late_vision_layers(unfreeze_vision_last_n_layers)
             return
 
@@ -1316,7 +1431,11 @@ class SparkNative(nn.Module):
                 sound_out.dit.requires_grad_(False)
             if mode == 'frozen_spark_connector' and getattr(self, 'visual_cross_attn', None) is not None:
                 self.visual_cross_attn.requires_grad_(False)
-            if unfreeze_vision_last_n_layers > 0:
+            if bridge is not None:
+                want_v = int(unfreeze_vision_last_n_layers) > 0
+                bridge.configure_trainability(trainable=want_v, unfreeze_last_n_layers=int(unfreeze_vision_last_n_layers))
+                self._intel_vision_trainable = want_v
+            elif unfreeze_vision_last_n_layers > 0:
                 self._unfreeze_late_vision_layers(unfreeze_vision_last_n_layers)
             return
 
@@ -1325,13 +1444,27 @@ class SparkNative(nn.Module):
                 mod = getattr(self, name, None)
                 if mod is not None:
                     mod.requires_grad_(False)
-            if getattr(self, 'vision', None) is not None:
+            if bridge is not None:
+                if getattr(self, 'vision', None) is not None:
+                    self.vision.requires_grad_(False)
+                n_unfreeze = max(1, int(unfreeze_vision_last_n_layers or 27))
+                bridge.configure_trainability(trainable=True, unfreeze_last_n_layers=n_unfreeze)
+                self._intel_vision_trainable = True
+            elif getattr(self, 'vision', None) is not None:
                 self._unfreeze_late_vision_layers(max(1, int(unfreeze_vision_last_n_layers or 2)))
             return
 
         if mode == 'full_spark':
-            # In vision_text 24GB profile, keep SigLIP2 frozen unless explicitly unfrozen via unfreeze_vision_last_n_layers.
-            if getattr(self, 'modalities', 'omni') == 'vision_text' and getattr(self, 'vision', None) is not None:
+            if bridge is not None:
+                if getattr(self, 'vision', None) is not None:
+                    self.vision.requires_grad_(False)
+                full_defrost = bool(getattr(self, 'policy', {}).get('intel_arc_vision_full_defrost', True))
+                n_unfreeze = int(unfreeze_vision_last_n_layers) if unfreeze_vision_last_n_layers > 0 else (27 if full_defrost else 0)
+                want_v = n_unfreeze > 0 or bool(getattr(self, 'policy', {}).get('unfreeze_vision_in_full_spark', False))
+                bridge.configure_trainability(trainable=want_v, unfreeze_last_n_layers=max(1, n_unfreeze) if want_v else 0)
+                self._intel_vision_trainable = want_v
+            elif getattr(self, 'modalities', 'omni') == 'vision_text' and getattr(self, 'vision', None) is not None:
+                # In single-GPU vision_text 24GB profile, keep SigLIP2 frozen unless explicitly unfrozen via unfreeze_vision_last_n_layers.
                 if unfreeze_vision_last_n_layers > 0:
                     self._unfreeze_late_vision_layers(unfreeze_vision_last_n_layers)
                 elif not getattr(self, 'policy', {}).get('unfreeze_vision_in_full_spark', False):
@@ -1344,10 +1477,13 @@ class SparkNative(nn.Module):
 
     def frozen_parameter_hashes(self) -> dict[str, str]:
         """Compute exact raw-byte SHA256 hashes for all frozen (`not requires_grad`) parameters."""
+        offload_vis_active = self.has_intel_vision_bridge() and bool(getattr(self, '_intel_vision_trainable', False))
         hashes: dict[str, str] = {}
         seen: set[int] = set()
         for name, p in self.named_parameters():
             if p.requires_grad or id(p) in seen:
+                continue
+            if offload_vis_active and name.startswith('vision.'):
                 continue
             seen.add(id(p))
             raw = p.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
@@ -1452,15 +1588,42 @@ class SparkNative(nn.Module):
         vis_dtype=next(self.vision.parameters()).dtype
         proj_dtype=self.vision_projector[0].weight.dtype
 
+        bridge = getattr(self, '_intel_vision_bridge', None)
+        ov_runner = getattr(self, '_openvino_vision_runner', None)
         for _,items in sorted(groups.items()):
-            batch={
-                k:torch.cat([u['batch'][k] for _,u in items],dim=0).to(
-                    self.device,
-                    dtype=vis_dtype if k=='pixel_values' else None,
+            if bridge is not None:
+                batch={
+                    k:torch.cat([u['batch'][k] for _,u in items],dim=0).to(
+                        dtype=vis_dtype if k=='pixel_values' else None,
+                    )
+                    for k in ('pixel_values','pixel_attention_mask','spatial_shapes')
+                }
+                features=bridge.forward(
+                    batch,
+                    training_mode=self.training,
+                    out_device=self.device,
+                    out_dtype=vis_dtype,
                 )
-                for k in ('pixel_values','pixel_attention_mask','spatial_shapes')
-            }
-            features=self.vision(**batch).last_hidden_state
+            elif ov_runner is not None and not self.training:
+                batch={
+                    k:torch.cat([u['batch'][k] for _,u in items],dim=0)
+                    for k in ('pixel_values','pixel_attention_mask','spatial_shapes')
+                }
+                features=ov_runner.forward(
+                    batch,
+                    out_device=self.device,
+                    out_dtype=vis_dtype,
+                )
+            else:
+                vis_dev=next(self.vision.parameters()).device
+                batch={
+                    k:torch.cat([u['batch'][k] for _,u in items],dim=0).to(
+                        vis_dev,
+                        dtype=vis_dtype if k=='pixel_values' else None,
+                    )
+                    for k in ('pixel_values','pixel_attention_mask','spatial_shapes')
+                }
+                features=self.vision(**batch).last_hidden_state.to(self.device)
             for position,(index,unit) in enumerate(items):
                 fi,vi,box,u_meta=unit['frame'],unit['view'],unit['box'],unit['meta']
                 hh,ww=(int(x) for x in batch['spatial_shapes'][position])

@@ -22,11 +22,17 @@ def set_rng(s):
         torch.cuda.set_rng_state_all(s['cuda'])
 
 def sample_parameters(model):
+    if hasattr(model,'sync_intel_vision_to_host'):
+        model.sync_intel_vision_to_host()
     return {n:p.detach().flatten()[:16].float().cpu().tolist() for n,p in model.named_parameters()}
 def sample_hash(model): return identity(sample_parameters(model))
 def census(model):
     groups=defaultdict(lambda:{'parameters':0,'trainable':0})
     for group,name,p in model.named_groups(): groups[group]['parameters']+=p.numel(); groups[group]['trainable']+=p.numel() if p.requires_grad else 0
+    if hasattr(model,'has_intel_vision_bridge') and model.has_intel_vision_bridge() and 'vision' in groups:
+        tel=model.intel_vision_telemetry()
+        groups['vision']['intel_arc_xpu_trainable']=int(tel.get('trainable_parameters',0))
+        groups['vision']['intel_arc_device']=str(tel.get('device_name',tel.get('device','xpu:0')))
     return dict(groups)
 
 def binding(config,source_sha):
@@ -323,10 +329,14 @@ def checkpoint(model,optimizer,scheduler,state,root,config,bound,store,defer_upl
     disk_guard(root,pending=estimate,reserve=estimate if not existing else 0,min_free_bytes=free_floor)
     directory.mkdir(parents=True); write(directory/'INTENT.json',{'binding':bound,'stage':state['stage'],'updates':state.get('updates',0)}); started=time.monotonic()
     if torch.cuda.is_available(): torch.cuda.synchronize()
+    if hasattr(model,'sync_intel_vision_to_host'):
+        model.sync_intel_vision_to_host()
     _save_model_safetensors(model, directory/'model.safetensors')
     torch.save(optimizer.state_dict(),directory/'optimizer.pt'); torch.save(scheduler.state_dict(),directory/'scheduler.pt'); torch.save(rng_state(),directory/'rng.pt')
     if hasattr(model,'has_tier1b_state') and model.has_tier1b_state():
         torch.save(model.tier1b_state_dict(),directory/'tier1b_optim.pt')
+    if hasattr(model,'has_intel_vision_optim_state') and model.has_intel_vision_optim_state():
+        torch.save(model.intel_vision_optim_state_dict(),directory/'intel_vision_optim.pt')
     write(directory/'STATE.json',state); write(directory/'config.json',config); write(directory/'BINDING.json',bound); write(directory/'PARAMETERS.json',{'sample_sha256':sample_hash(model),'census':census(model)})
     copy_reload_assets(model,directory)
     for name in ('corpus.report.json','BUILD.json'):
@@ -380,6 +390,8 @@ def load_checkpoint(directory,config,bound,model=None,load_optimizer=True,device
     has_tie=hasattr(getattr(model,'spark',None),'tie_weights')
     _load_model_safetensors(model, directory/'model.safetensors', strict=not has_tie, device='cpu')
     if has_tie: model.spark.tie_weights()
+    if hasattr(model,'sync_host_vision_to_intel'):
+        model.sync_host_vision_to_intel()
     # Rebuild any cached COAT FP8 weights immediately after loading model weights!
     coat_ctrl=ensure_coat_for_model(model,config)
     if coat_ctrl is not None:
@@ -398,6 +410,8 @@ def load_checkpoint(directory,config,bound,model=None,load_optimizer=True,device
         optimizer.load_state_dict(torch.load(directory/'optimizer.pt',map_location='cpu',weights_only=True)); scheduler.load_state_dict(torch.load(directory/'scheduler.pt',map_location='cpu',weights_only=True))
         if (directory/'tier1b_optim.pt').is_file() and hasattr(model,'load_tier1b_state_dict'):
             model.load_tier1b_state_dict(torch.load(directory/'tier1b_optim.pt',map_location='cpu',weights_only=True))
+        if (directory/'intel_vision_optim.pt').is_file() and hasattr(model,'load_intel_vision_optim_state_dict'):
+            model.load_intel_vision_optim_state_dict(torch.load(directory/'intel_vision_optim.pt',map_location='cpu',weights_only=True))
     set_rng(torch.load(directory/'rng.pt',map_location='cpu',weights_only=True))
     return model,optimizer,scheduler,state
 
@@ -529,6 +543,7 @@ class Campaign:
             if k in stage
         }
         stage_cfg={**self.c,**stage_opt_overrides}
+        self.model._intel_vision_base_lr=_lr_for_group_and_name('vision','vision.vision_model',stage_cfg)
         self.model.set_stage(
             stage.get('alignment_only',False),
             stage_mode=stage_mode,
@@ -556,12 +571,16 @@ class Campaign:
             for group,lr in zip(optimizer.param_groups,lrs): group['lr']=lr; group['initial_lr']=lr
             if (saved/'tier1b_optim.pt').is_file() and hasattr(self.model,'load_tier1b_state_dict'):
                 self.model.load_tier1b_state_dict(torch.load(saved/'tier1b_optim.pt',map_location='cpu',weights_only=True))
+            if (saved/'intel_vision_optim.pt').is_file() and hasattr(self.model,'load_intel_vision_optim_state_dict'):
+                self.model.load_intel_vision_optim_state_dict(torch.load(saved/'intel_vision_optim.pt',map_location='cpu',weights_only=True))
         if resume:
             saved=Path(self.state['last_checkpoint_local'])
             optimizer.load_state_dict(torch.load(saved/'optimizer.pt',map_location='cpu',weights_only=True))
             scheduler.load_state_dict(torch.load(saved/'scheduler.pt',map_location='cpu',weights_only=True))
             if (saved/'tier1b_optim.pt').is_file() and hasattr(self.model,'load_tier1b_state_dict'):
                 self.model.load_tier1b_state_dict(torch.load(saved/'tier1b_optim.pt',map_location='cpu',weights_only=True))
+            if (saved/'intel_vision_optim.pt').is_file() and hasattr(self.model,'load_intel_vision_optim_state_dict'):
+                self.model.load_intel_vision_optim_state_dict(torch.load(saved/'intel_vision_optim.pt',map_location='cpu',weights_only=True))
             set_rng(torch.load(saved/'rng.pt',map_location='cpu',weights_only=True))
 
         self.state.update(
@@ -750,6 +769,16 @@ class Campaign:
                 if self.direct_deadline and time.monotonic()>self.direct_deadline:
                     self.stop_reason='direct_wall_hours'
                 if step_index%10==0 or batch is None or self.stop_reason:
+                    extra_gpu_kw={}
+                    if hasattr(self.model,'has_intel_vision_bridge') and self.model.has_intel_vision_bridge():
+                        tel=self.model.intel_vision_telemetry()
+                        lst=tel.get('last_step') or {}
+                        extra_gpu_kw['intel_arc_vision']={
+                            'device':tel.get('device_name',tel.get('device','xpu:0')),
+                            'trainable_params':tel.get('trainable_parameters',0),
+                            'vision_grad_norm':round(float(lst.get('vision_grad_norm',0.0)),5),
+                            'xpu_peak_gib':round(float(lst.get('xpu_peak_bytes',0))/(1024**3),3),
+                        }
                     emit(
                         'training',
                         stage=stage['name'],
@@ -758,6 +787,7 @@ class Campaign:
                         records=len(order),
                         grad_norm=round(step_stats.grad_norm,5),
                         raw_stratum_losses={k:v[0]/v[1] for k,v in losses_by_stratum.items() if v[1]>0},
+                        **extra_gpu_kw,
                     )
                     losses_by_stratum.clear()
 
@@ -782,7 +812,14 @@ class Campaign:
                             best_dev_score=dev_score
                             best_epoch=cur_epoch
                             no_improve_epochs=0
-                            best_trainable_cpu={n:p.detach().cpu().clone() for n,p in self.model.named_parameters() if p.requires_grad}
+                            if hasattr(self.model,'sync_intel_vision_to_host'):
+                                self.model.sync_intel_vision_to_host()
+                            offload_vis_tr=hasattr(self.model,'has_intel_vision_bridge') and self.model.has_intel_vision_bridge() and getattr(self.model,'_intel_vision_trainable',False)
+                            best_trainable_cpu={
+                                n:p.detach().cpu().clone()
+                                for n,p in self.model.named_parameters()
+                                if p.requires_grad or (offload_vis_tr and n.startswith('vision.'))
+                            }
                         else:
                             no_improve_epochs+=1
                         ep_entry={
@@ -827,6 +864,8 @@ class Campaign:
                         param_map[name].copy_(cpu_t.to(device=param_map[name].device,dtype=param_map[name].dtype))
                 if hasattr(getattr(self.model,'spark',None),'tie_weights'):
                     self.model.spark.tie_weights()
+                if hasattr(self.model,'sync_host_vision_to_intel'):
+                    self.model.sync_host_vision_to_intel()
                 if inv_fn is not None:
                     inv_fn()
             emit(

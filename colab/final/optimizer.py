@@ -957,6 +957,8 @@ class MergedGradientAccumulator:
         return _hook
 
     def close(self) -> None:
+        if hasattr(self.model, "zero_intel_vision_buffers") and self.model.has_intel_vision_bridge():
+            self.model.zero_intel_vision_buffers()
         for p in self.params:
             if hasattr(p, "_immediate_accum_fn"):
                 delattr(p, "_immediate_accum_fn")
@@ -971,6 +973,8 @@ class MergedGradientAccumulator:
         return sum(buf.numel() * buf.element_size() for buf in self.buffers.values())
 
     def zero_buffers(self) -> None:
+        if hasattr(self.model, "zero_intel_vision_buffers") and self.model.has_intel_vision_bridge():
+            self.model.zero_intel_vision_buffers()
         for p in self.params:
             p.grad = None
         for buf in self.buffers.values():
@@ -990,10 +994,16 @@ class MergedGradientAccumulator:
         def __enter__(self) -> "MergedGradientAccumulator._MicrobatchScope":
             self.prev_weight = self.owner._active_weight
             self.owner._active_weight = self.weight
+            bridge = getattr(self.owner.model, "_intel_vision_bridge", None)
+            if bridge is not None:
+                bridge.active_microbatch_weight = self.weight
             return self
 
         def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
             self.owner._active_weight = self.prev_weight
+            bridge = getattr(self.owner.model, "_intel_vision_bridge", None)
+            if bridge is not None:
+                bridge.active_microbatch_weight = self.prev_weight
             if exc_type is None:
                 if not self.owner._handles:
                     self.owner.merge_existing_grads(weight=self.weight)
@@ -1085,6 +1095,12 @@ class MergedGradientAccumulator:
             clip_coef = float(max_grad_norm) / (grad_norm + 1e-6)
         combined_scale = float(post_scale) * clip_coef
 
+        lr_ratio = 1.0
+        if getattr(optimizer, "param_groups", None):
+            g0 = optimizer.param_groups[0]
+            if float(g0.get("initial_lr", 0.0)) > 0.0:
+                lr_ratio = float(g0["lr"]) / float(g0["initial_lr"])
+
         prev_hook = self._hook_enabled
         self._hook_enabled = False
         try:
@@ -1097,6 +1113,14 @@ class MergedGradientAccumulator:
                         buf.mul_(combined_scale)
                     p.grad = buf.to(device=p.device, dtype=p.dtype)
                 optimizer.step()
+            if hasattr(self.model, "step_intel_vision_xpu") and self.model.has_intel_vision_bridge():
+                xpu_res = self.model.step_intel_vision_xpu(
+                    lr_scale=lr_ratio,
+                    max_grad_norm=float(max_grad_norm if max_grad_norm is not None else 1.0),
+                    post_scale=float(post_scale),
+                )
+                if not xpu_res.get("finite", True):
+                    self.skipped_nonfinite_steps += 1
         finally:
             for p in self.params:
                 p.grad = None

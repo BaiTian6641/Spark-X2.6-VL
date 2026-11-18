@@ -371,3 +371,72 @@ def test_stage7_campaign_config_and_rsi_verifiers() -> None:
         yn_row,
         '<think>\n<box x1="0" y1="0" x2="500" y2="500" label="nw"/>\n</think>\nNo',
     )["verified"]
+
+
+def test_intel_arc_xpu_vision_coproc_bridge_roundtrip(tmp_path: Path) -> None:
+    import sys
+    from transformers import Siglip2VisionConfig, Siglip2VisionModel
+    from colab.final.intel_vision_coproc import IntelArcXpuVisionBridge
+
+    vis_dir = tmp_path / "tiny_vision"
+    vis_dir.mkdir(parents=True, exist_ok=True)
+    cfg = Siglip2VisionConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=3,
+        num_attention_heads=4,
+        num_patches=16,
+    )
+    cfg.save_pretrained(vis_dir)
+    host_vis = Siglip2VisionModel(cfg).to(torch.float32)
+    if hasattr(host_vis.vision_model, "head"):
+        del host_vis.vision_model.head
+    host_vis.vision_model.use_head = False
+
+    bridge = IntelArcXpuVisionBridge(
+        vis_dir,
+        xpu_python=sys.executable,
+        device_spec="cpu",
+        vision_dtype="float32",
+        weight_decay=0.01,
+    )
+    try:
+        bridge.sync_from_host(host_vis)
+        info = bridge.configure_trainability(trainable=True, unfreeze_last_n_layers=27)
+        assert info["unfrozen_layers"] == 3
+        assert info["trainable_parameters"] == info["total_parameters"] > 0
+
+        pv = torch.randn(2, 16, 768, dtype=torch.float32)
+        pam = torch.ones(2, 16, dtype=torch.int64)
+        ss = torch.tensor([[4, 4], [4, 4]], dtype=torch.int64)
+        proj = torch.nn.Linear(64, 16)
+
+        w_before = host_vis.vision_model.encoder.layers[0].fc1.weight.detach().clone()
+        feat = bridge.forward(
+            {"pixel_values": pv, "pixel_attention_mask": pam, "spatial_shapes": ss},
+            training_mode=True,
+            out_device="cpu",
+            out_dtype=torch.float32,
+        )
+        assert feat.requires_grad
+        loss = proj(feat).square().mean()
+        loss.backward()
+        assert proj.weight.grad is not None and float(proj.weight.grad.abs().sum()) > 0.0
+
+        step_res = bridge.step(lr=1e-3, max_grad_norm=1.0, post_scale=1.0)
+        assert step_res["applied"] is True and step_res["finite"] is True
+        assert step_res["vision_grad_norm"] > 0.0
+
+        assert bridge.sync_to_host(host_vis) is True
+        assert bridge.sync_to_host(host_vis) is False  # Clean dirty flag -> 0ms no-op!
+        assert not torch.equal(w_before, host_vis.vision_model.encoder.layers[0].fc1.weight.detach())
+
+        opt_sd = bridge.optim_state_dict()
+        assert len(opt_sd) > 0
+        bridge.load_optim_state_dict({})
+        assert len(bridge.optim_state_dict()) == 0
+        bridge.load_optim_state_dict(opt_sd)
+        assert len(bridge.optim_state_dict()) == len(opt_sd)
+    finally:
+        bridge.close()
+

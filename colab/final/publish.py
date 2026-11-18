@@ -82,6 +82,8 @@ def export_and_upload(campaign,config):
             if sha(dest)!=sha(path): raise ValueError('Existing final export belongs to a different model')
         else: os.link(path,dest)  # Closed immutable weights; no extra 30GB staging copy.
     inference_policy={k:v for k,v in config.items() if k not in ('drive_project_folder','observed_compute_balance','observed_cu_per_hour','instructor_route_eligibility_receipt')}
+    # Portable default: standalone exported model runs natively on single CUDA/CPU unless caller opts into OpenVINO/XPU.
+    inference_policy['intel_arc_vision_offload']=False
     write(out/'config.json',inference_policy)
     summary={'training_complete':True,'full_parameter_stages':state['completed_stages'],'rsi_rounds':state['rsi_rounds'],'human_audio_review':state.get('human_audio_review'),'broad_capability_passed':False,'evaluations':list(state.get('evaluations',{})),'frozen_infrastructure':['Qwen speech tokenizer/codec','Stable Audio Oobleck autoencoder'],'source_binding':campaign.bound}
     write(out/'evaluation-summary.json',summary)

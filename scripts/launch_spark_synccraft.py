@@ -28,6 +28,7 @@ DEFAULT_CONFIG_PATH = HERE / "campaign_rtx_pro_4000_24gb.json"
 PINNED_RUNTIME_PATHS = (
     "colab/final/common.py",
     "colab/final/loop_engram.py",
+    "colab/final/intel_vision_coproc.py",
     "colab/final/optimizer.py",
     "colab/final/coat_spark.py",
     "colab/final/synccraft_bridge.py",

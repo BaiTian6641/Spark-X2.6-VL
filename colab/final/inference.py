@@ -3,7 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-def load(directory,device='cuda'):
+def load(directory,device='cuda',*,intel_vision:str|None=None):
+    import os
     from .common import read,sha
     from .engine import reload_paths
     from .model import SparkNative,load_spark_native_safetensors
@@ -13,7 +14,16 @@ def load(directory,device='cuda'):
         path=(directory/f['path']).resolve()
         if not path.is_relative_to(directory.resolve()) or path.is_symlink() or path.stat().st_size!=f['bytes'] or sha(path)!=f['sha256']:
             raise ValueError('Export content differs from its release manifest')
-    config=read(directory/'config.json')
+    config=dict(read(directory/'config.json'))
+    mode=intel_vision or os.environ.get('SPARK_INTEL_ARC_INFERENCE','').strip().lower()
+    if mode=='openvino':
+        config['intel_arc_vision_offload']=False
+        config['intel_arc_openvino_eval']=True
+    elif mode=='xpu':
+        config['intel_arc_vision_offload']=True
+        config['intel_arc_openvino_eval']=False
+    else:
+        config['intel_arc_vision_offload']=False
     model=SparkNative(reload_paths(directory,config=config),config,device=device,pretrained=False)
     load_spark_native_safetensors(model,directory/'model.safetensors')
     model.eval()
