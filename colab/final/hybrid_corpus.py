@@ -1275,6 +1275,58 @@ def prepare_hybrid_world_v32_data(root: str | Path, token: str | None, config: d
     use_stage5_mix = bool(config.get("enable_stage5_reasoning_mix", False))
     use_stage6_sculpted = bool(config.get("enable_stage6_sculpted_style", False))
     use_stage7_full = bool(config.get("enable_stage7_full_vision_frontier", False))
+
+    # Fast-resume database indexing if verified `packets.jsonl.gz` + `HANDOFF.json` already exist on disk.
+    if cat.exists() and handoff_path.exists() and cat.stat().st_size > 0 and not build_meta.exists():
+        if db.exists():
+            db.unlink()
+        comp_counts: Counter[str] = Counter()
+        task_counts = Counter()
+        pkt_total = 0
+        with gzip.open(cat, "rt", encoding="utf-8") as gz:
+            for line in gz:
+                pkt = json.loads(line)
+                pkt_total += 1
+                comp_counts[str(pkt.get("component", ""))] += 1
+                for orig in variants(pkt["record"]):
+                    task_counts[str(orig.get("task", ""))] += 1
+        report = build_database(cat, db, config)
+        s7_path = root / "metadata" / "STAGE7_HOLDOUT_MANIFEST.json"
+        s7_man = read(s7_path) if s7_path.exists() else None
+        report["hybrid_sources"] = {
+            "packets_by_component": dict(sorted(comp_counts.items())),
+            "stage7_holdout_manifest_summary": (
+                {
+                    "supergpqa_holdout_count": s7_man["supergpqa_holdout_count"],
+                    "swebench_pro_holdout_count": s7_man["swebench_pro_holdout_count"],
+                    "deepswe_holdout_count": s7_man["deepswe_holdout_count"],
+                }
+                if s7_man
+                else None
+            ),
+            "task_distribution": dict(sorted(task_counts.items())),
+        }
+        write(db.with_suffix(".report.json"), report)
+        build_doc = {
+            "catalogue_sha256": sha(cat),
+            "split": config["split_percent"],
+            "seed": config["seed"],
+            "dataset_mode": "hybrid_world_v32",
+            "stage5_reasoning_mix": use_stage5_mix,
+        }
+        if use_stage6_sculpted:
+            build_doc["stage6_sculpted_style"] = True
+        if use_stage7_full:
+            build_doc["stage7_full_vision_frontier"] = True
+        write(build_meta, build_doc)
+        emit(
+            "hybrid_corpus_ready",
+            packets=pkt_total,
+            instructions=report["instructions"],
+            groups=report["groups"],
+            tasks=len(task_counts),
+        )
+        return report
     emit("hybrid_corpus_stage", stage="spark_mm_selection")
     spark_mm_packets, spark_mm_comps = _select_spark_mm_packets(root, token, config)
 
