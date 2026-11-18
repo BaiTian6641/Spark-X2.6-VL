@@ -60,7 +60,7 @@
   "drive_cap_bytes": 2000000000000,
   "checkpoint_slots": 2,
   "checkpoint_minutes": 60,
-  "initial_checkpoint_reservation_bytes": 16000000000,
+  "initial_checkpoint_reservation_bytes": 22500000000,
   "local_free_floor_bytes": 20000000000,
   "cache_bytes_per_component": 5000000000,
   "max_compute_units": 1000,
