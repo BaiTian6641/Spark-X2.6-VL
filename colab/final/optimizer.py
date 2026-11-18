@@ -953,14 +953,15 @@ class MergedGradientAccumulator:
             self.param_names[id(p)] = name
             buf_dtype = self._buffer_dtype_for(name, p)
             if has_b50_offload:
-                in_bottom_nonrecurrent = any(
-                    name.startswith(f"spark.model.layers.{k}.") for k in range(0, loop_start)
+                in_offload_nonrecurrent = any(
+                    name.startswith(f"spark.model.layers.{k}.")
+                    for k in (*range(0, loop_start), *range(loop_end, min(30, 36)))
                 )
                 offload_to_cpu = (
                     enable_cpu_accum
                     and p.is_cuda
                     and p.ndim == 2
-                    and (p.numel() >= 100_000_000 or (in_bottom_nonrecurrent and p.numel() >= 1_000_000))
+                    and (p.numel() >= 100_000_000 or (in_offload_nonrecurrent and p.numel() >= 1_000_000))
                 )
             else:
                 in_recurrent = any(name.startswith(f"spark.model.layers.{k}.") for k in range(loop_start, loop_end))
