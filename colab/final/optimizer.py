@@ -561,7 +561,7 @@ class ApolloMergedOptimizer(torch.optim.Optimizer):
 
         state["step"] += 1
         t = int(state["step"])
-        g = grad_raw.float()
+        g = grad_raw.to(device=p.device, dtype=torch.float32)
         if grad_scale != 1.0:
             g = g * grad_scale
 
@@ -658,7 +658,7 @@ class ApolloMergedOptimizer(torch.optim.Optimizer):
             r_grad = torch.zeros((rank, cols), device=p.device, dtype=torch.float32)
             for start in range(0, rows, self.chunk_rows):
                 end = min(rows, start + self.chunk_rows)
-                g_chunk = grad_raw[start:end].float()
+                g_chunk = grad_raw[start:end].to(device=p.device, dtype=torch.float32)
                 if grad_scale != 1.0:
                     g_chunk = g_chunk * grad_scale
                 r_grad.addmm_(basis[:, start:end], g_chunk)
@@ -667,7 +667,7 @@ class ApolloMergedOptimizer(torch.optim.Optimizer):
             basis_t = basis.t()
             for start in range(0, rows, self.chunk_rows):
                 end = min(rows, start + self.chunk_rows)
-                g_chunk = grad_raw[start:end].float()
+                g_chunk = grad_raw[start:end].to(device=p.device, dtype=torch.float32)
                 if grad_scale != 1.0:
                     g_chunk = g_chunk * grad_scale
                 r_grad[start:end] = g_chunk @ basis_t
@@ -698,7 +698,7 @@ class ApolloMergedOptimizer(torch.optim.Optimizer):
         sq_norm = torch.zeros((), device=p.device, dtype=torch.float32)
         for start in range(0, rows, self.chunk_rows):
             end = min(rows, start + self.chunk_rows)
-            g_chunk = grad_raw[start:end].float()
+            g_chunk = grad_raw[start:end].to(device=p.device, dtype=torch.float32)
             if grad_scale != 1.0:
                 g_chunk = g_chunk * grad_scale
             if proj_side == "left":
@@ -740,7 +740,7 @@ class ApolloMergedOptimizer(torch.optim.Optimizer):
         for start in range(0, rows, self.chunk_rows):
             end = min(rows, start + self.chunk_rows)
             w_chunk = p.data[start:end].float()
-            g_chunk = grad_raw[start:end].float()
+            g_chunk = grad_raw[start:end].to(device=p.device, dtype=torch.float32)
             if grad_scale != 1.0:
                 g_chunk = g_chunk * grad_scale
             if proj_side == "left":
@@ -891,6 +891,10 @@ class MergedGradientAccumulator:
         self.microbatches_in_step: int = 0
         self.units_in_step: int = 0
 
+        loop_start = int(getattr(model, "loop_start", 12))
+        loop_end = int(getattr(model, "loop_end", 24))
+        enable_cpu_accum = bool(getattr(model, "enable_loop_engram", False))
+
         seen: set[int] = set()
         for name, p in model.named_parameters():
             if not p.requires_grad or id(p) in seen:
@@ -899,7 +903,11 @@ class MergedGradientAccumulator:
             self.params.append(p)
             self.param_names[id(p)] = name
             buf_dtype = self._buffer_dtype_for(name, p)
-            self.buffers[id(p)] = torch.zeros_like(p, dtype=buf_dtype)
+            in_recurrent_core = any(name.startswith(f"spark.model.layers.{k}.") for k in range(loop_start, loop_end))
+            if enable_cpu_accum and p.is_cuda and p.ndim == 2 and p.numel() >= 1_000_000 and not in_recurrent_core:
+                self.buffers[id(p)] = torch.zeros(p.shape, dtype=buf_dtype, device="cpu", pin_memory=True)
+            else:
+                self.buffers[id(p)] = torch.zeros_like(p, dtype=buf_dtype)
             if attach_hooks:
                 p._immediate_accum_fn = self._make_direct_consumer(id(p))
                 if hasattr(p, "register_post_accumulate_grad_hook"):
@@ -928,10 +936,9 @@ class MergedGradientAccumulator:
             if buf is None:
                 return False
             g = grad.detach()
-            if buf.dtype == g.dtype:
-                buf.add_(g, alpha=self._active_weight)
-            else:
-                buf.add_(g.to(buf.dtype), alpha=self._active_weight)
+            if g.device != buf.device or g.dtype != buf.dtype:
+                g = g.to(device=buf.device, dtype=buf.dtype)
+            buf.add_(g, alpha=self._active_weight)
             return True
 
         return _consume
@@ -942,10 +949,9 @@ class MergedGradientAccumulator:
                 return
             buf = self.buffers[pid]
             g = param.grad.detach()
-            if buf.dtype == g.dtype:
-                buf.add_(g, alpha=self._active_weight)
-            else:
-                buf.add_(g.to(buf.dtype), alpha=self._active_weight)
+            if g.device != buf.device or g.dtype != buf.dtype:
+                g = g.to(device=buf.device, dtype=buf.dtype)
+            buf.add_(g, alpha=self._active_weight)
             param.grad = None
 
         return _hook
@@ -1004,10 +1010,9 @@ class MergedGradientAccumulator:
                 continue
             buf = self.buffers[id(p)]
             g = p.grad.detach()
-            if buf.dtype == g.dtype:
-                buf.add_(g, alpha=weight)
-            else:
-                buf.add_(g.to(buf.dtype), alpha=weight)
+            if g.device != buf.device or g.dtype != buf.dtype:
+                g = g.to(device=buf.device, dtype=buf.dtype)
+            buf.add_(g, alpha=weight)
             p.grad = None
 
     @torch.no_grad()
@@ -1043,7 +1048,7 @@ class MergedGradientAccumulator:
             bf = buf.float()
             if post_scale != 1.0:
                 bf = bf * post_scale
-            total_sq = total_sq + bf.square().sum()
+            total_sq = total_sq + bf.square().sum().to(device=total_sq.device, dtype=torch.float32)
 
         microbatches = self.microbatches_in_step
         units = self.units_in_step
@@ -1090,7 +1095,7 @@ class MergedGradientAccumulator:
                     buf = self.buffers[id(p)]
                     if combined_scale != 1.0:
                         buf.mul_(combined_scale)
-                    p.grad = buf if buf.dtype == p.dtype else buf.to(p.dtype)
+                    p.grad = buf.to(device=p.device, dtype=p.dtype)
                 optimizer.step()
         finally:
             for p in self.params:
