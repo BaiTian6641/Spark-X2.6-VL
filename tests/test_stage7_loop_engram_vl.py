@@ -411,7 +411,7 @@ def test_intel_arc_xpu_vision_coproc_bridge_roundtrip(tmp_path: Path) -> None:
         ss = torch.tensor([[4, 4], [4, 4]], dtype=torch.int64)
         proj = torch.nn.Linear(64, 16)
 
-        w_before = host_vis.vision_model.encoder.layers[0].fc1.weight.detach().clone()
+        w_before = host_vis.vision_model.encoder.layers[0].mlp.fc1.weight.detach().clone()
         feat = bridge.forward(
             {"pixel_values": pv, "pixel_attention_mask": pam, "spatial_shapes": ss},
             training_mode=True,
@@ -429,7 +429,7 @@ def test_intel_arc_xpu_vision_coproc_bridge_roundtrip(tmp_path: Path) -> None:
 
         assert bridge.sync_to_host(host_vis) is True
         assert bridge.sync_to_host(host_vis) is False  # Clean dirty flag -> 0ms no-op!
-        assert not torch.equal(w_before, host_vis.vision_model.encoder.layers[0].fc1.weight.detach())
+        assert not torch.equal(w_before, host_vis.vision_model.encoder.layers[0].mlp.fc1.weight.detach())
 
         opt_sd = bridge.optim_state_dict()
         assert len(opt_sd) > 0
