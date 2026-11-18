@@ -688,11 +688,47 @@ class MultimodalTieredMoEEngram(nn.Module):
         self.tier1b_exp_avg_sq[uniq_rows] = v.to(self.tier1b_exp_avg_sq.dtype)
         self.tier1b_cold_weight[uniq_rows] = w.to(self.tier1b_cold_weight.dtype)
 
+    @torch.no_grad()
+    def _route_dispatch_plan(
+        self,
+        hidden_states: torch.Tensor,
+        vis_summary: Optional[torch.Tensor],
+        pass_idx: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[int, ...]]:
+        """Compute discrete Top-K routing plan outside `checkpoint` so FP8 activation hooks never alter expert shapes."""
+        param_dtype = self.project.weight.dtype
+        h_norm_f = fast_rmsnorm(hidden_states.detach().to(param_dtype), self.norm_weight.detach(), self.norm_eps).float()
+        p_idx = min(max(int(pass_idx), 0), self.max_passes - 1)
+        route_in = self.router_proj(h_norm_f)
+        if vis_summary is not None:
+            route_in = route_in + self.vis_router_proj(vis_summary.detach().float())
+        u = F.normalize(route_in, p=2, dim=-1, eps=1e-6)
+        c = F.normalize(self.expert_centroids.detach(), p=2, dim=-1, eps=1e-6)
+        temp = self.router_log_temp.detach().exp().clamp(min=0.03, max=2.0)
+        router_logits = (torch.matmul(u, c.t()) / temp) + self.pass_router_bias.detach()[p_idx]
+        scores = torch.sigmoid(router_logits)
+        _, topk_idx = torch.topk(scores + self.expert_bias, k=self.top_k, dim=-1)
+
+        if self.training and torch.is_grad_enabled():
+            # Note: `no_grad()` disables grad inside this helper; check caller via `self.training` in `forward_with_z_loss`.
+            pass
+
+        n_tokens = int(hidden_states.shape[0] * hidden_states.shape[1])
+        flat_e = topk_idx.reshape(n_tokens * self.top_k)
+        sorted_e, sort_perm = torch.sort(flat_e)
+        token_rows = torch.div(sort_perm, self.top_k, rounding_mode="floor")
+        counts = tuple(int(x) for x in torch.bincount(sorted_e, minlength=self.num_experts).tolist())
+        return topk_idx, token_rows, sort_perm, counts
+
     def _forward_core(
         self,
         hidden_states: torch.Tensor,
         e_lexical: torch.Tensor,
         vis_summary: Optional[torch.Tensor],
+        topk_idx: torch.Tensor,
+        token_rows: torch.Tensor,
+        sort_perm: torch.Tensor,
+        counts: tuple[int, ...],
         pass_idx: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         out_dtype = hidden_states.dtype
@@ -707,7 +743,7 @@ class MultimodalTieredMoEEngram(nn.Module):
         h_fused = h_norm + lex_hidden
         shared_out = self.shared_down(triton_swiglu(self.shared_gate(h_fused), self.shared_up(h_fused)))
 
-        # Tier 3: Multimodal Hypersphere Cosine Router (`h_t + W_vis v_bar`)
+        # Tier 3: Multimodal Hypersphere Cosine Router (`h_t + W_vis v_bar`) using frozen forward dispatch plan
         p_idx = min(max(int(pass_idx), 0), self.max_passes - 1)
         route_in = self.router_proj(h_norm_f)
         if vis_summary is not None:
@@ -720,28 +756,16 @@ class MultimodalTieredMoEEngram(nn.Module):
         z_curr = torch.logsumexp(router_logits, dim=-1).pow(2).mean()
 
         scores = torch.sigmoid(router_logits)
-        _, topk_idx = torch.topk(scores + self.expert_bias, k=self.top_k, dim=-1)
         topk_raw = torch.gather(scores, dim=-1, index=topk_idx)
         topk_gates = (topk_raw / (topk_raw.sum(dim=-1, keepdim=True) + 1e-6)).to(param_dtype)
-
-        if self.training and torch.is_grad_enabled():
-            with torch.no_grad():
-                one_hot = F.one_hot(topk_idx, num_classes=self.num_experts).float()
-                load = one_hot.sum(dim=-2).mean(dim=(0, 1)) / float(self.top_k)
-                self._pending_expert_loads.append(load.detach())
 
         q = self.query_proj(h_norm) + lex_dropped
         flat_q = q.reshape(-1, self.eng_dim)
         n_tokens = flat_q.shape[0]
-        flat_idx = topk_idx.reshape(n_tokens, self.top_k)
         flat_gates = topk_gates.reshape(n_tokens, self.top_k)
 
-        flat_e = flat_idx.reshape(-1)
-        sorted_e, sort_perm = torch.sort(flat_e)
-        token_rows = torch.div(sort_perm, self.top_k, rounding_mode="floor")
         sorted_q = flat_q.index_select(0, token_rows)
         sorted_g = flat_gates.reshape(-1).index_select(0, sort_perm).unsqueeze(-1)
-        counts = torch.bincount(sorted_e, minlength=self.num_experts).tolist()
         out_chunks = []
         offset = 0
         for e_id, cnt in enumerate(counts):
@@ -773,11 +797,19 @@ class MultimodalTieredMoEEngram(nn.Module):
         text_token_mask: Optional[torch.Tensor] = None,
         use_grad_checkpoint: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Tier-1 lookup stays outside `checkpoint` so Host DRAM sparse row hooks fire strictly once per backward!
+        # Tier-1 lookup + discrete Top-K dispatch plan stay outside `checkpoint` so Host DRAM sparse row hooks
+        # fire strictly once and COAT FP8 activation compression never perturbs per-expert token counts!
         param_dtype = self.project.weight.dtype
         e_lexical = self._lookup_tier1_lexical(
             ngram_indices, hidden_states.device, param_dtype, text_token_mask=text_token_mask
         )
+        topk_idx, token_rows, sort_perm, counts = self._route_dispatch_plan(hidden_states, vis_summary, pass_idx)
+        if self.training and torch.is_grad_enabled():
+            with torch.no_grad():
+                one_hot = F.one_hot(topk_idx, num_classes=self.num_experts).float()
+                load = one_hot.sum(dim=-2).mean(dim=(0, 1)) / float(self.top_k)
+                self._pending_expert_loads.append(load.detach())
+
         can_ckpt = (
             use_grad_checkpoint
             and self.training
@@ -790,11 +822,24 @@ class MultimodalTieredMoEEngram(nn.Module):
                 hidden_states,
                 e_lexical,
                 vis_summary,
+                topk_idx,
+                token_rows,
+                sort_perm,
+                counts,
                 pass_idx,
                 use_reentrant=False,
             )
         else:
-            delta, z_curr = self._forward_core(hidden_states, e_lexical, vis_summary, pass_idx)
+            delta, z_curr = self._forward_core(
+                hidden_states,
+                e_lexical,
+                vis_summary,
+                topk_idx,
+                token_rows,
+                sort_perm,
+                counts,
+                pass_idx,
+            )
         self.last_router_z_loss = z_curr.detach()
         return delta, z_curr
 
