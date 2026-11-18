@@ -109,6 +109,75 @@ def triton_swiglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     return F.silu(gate) * up
 
 
+class _ImmediateMatmulFn(torch.autograd.Function):
+    """2D/ND matmul (`x @ w`) that flushes `grad_w` straight into `MergedGradientAccumulator` across recurrent passes."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+        ctx.save_for_backward(x, w)
+        ctx.w_ref = w if w.requires_grad else None
+        return torch.matmul(x, w)
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        x, w = ctx.saved_tensors
+        grad_x = torch.matmul(grad_out, w.t()) if ctx.needs_input_grad[0] else None
+        grad_w = None
+        if ctx.needs_input_grad[1] and ctx.w_ref is not None:
+            x2 = x.reshape(-1, x.shape[-1])
+            go2 = grad_out.reshape(-1, grad_out.shape[-1])
+            grad_w = x2.t().matmul(go2).to(w.dtype)
+            consume = getattr(ctx.w_ref, "_immediate_accum_fn", None)
+            if consume is not None and consume(grad_w):
+                grad_w = None
+        return grad_x, grad_w
+
+
+class _ImmediateLinearFn(torch.autograd.Function):
+    """Linear (`F.linear(x, w, b)`) that flushes `grad_w`/`grad_b` straight into `MergedGradientAccumulator`."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, w: torch.Tensor, b: Optional[torch.Tensor]) -> torch.Tensor:
+        ctx.save_for_backward(x, w)
+        ctx.w_ref = w if w.requires_grad else None
+        ctx.b_ref = b if (b is not None and b.requires_grad) else None
+        ctx.b_dtype = b.dtype if b is not None else None
+        return F.linear(x, w, b)
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        x, w = ctx.saved_tensors
+        grad_x = torch.matmul(grad_out, w) if ctx.needs_input_grad[0] else None
+        grad_w = None
+        grad_b = None
+        if ctx.needs_input_grad[1] and ctx.w_ref is not None:
+            x2 = x.reshape(-1, x.shape[-1])
+            go2 = grad_out.reshape(-1, grad_out.shape[-1])
+            grad_w = go2.t().matmul(x2).to(w.dtype)
+            consume_w = getattr(ctx.w_ref, "_immediate_accum_fn", None)
+            if consume_w is not None and consume_w(grad_w):
+                grad_w = None
+        if ctx.needs_input_grad[2] and ctx.b_ref is not None:
+            dims = tuple(range(grad_out.ndim - 1))
+            grad_b = grad_out.float().sum(dim=dims).to(ctx.b_dtype)
+            consume_b = getattr(ctx.b_ref, "_immediate_accum_fn", None)
+            if consume_b is not None and consume_b(grad_b):
+                grad_b = None
+        return grad_x, grad_w, grad_b
+
+
+def _imm_matmul(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    if torch.is_grad_enabled() and getattr(w, "_immediate_accum_fn", None) is not None:
+        return _ImmediateMatmulFn.apply(x, w)
+    return torch.matmul(x, w)
+
+
+def _imm_linear(mod: nn.Linear, x: torch.Tensor) -> torch.Tensor:
+    if torch.is_grad_enabled() and getattr(mod.weight, "_immediate_accum_fn", None) is not None:
+        return _ImmediateLinearFn.apply(x, mod.weight, mod.bias)
+    return mod(x)
+
+
 def fast_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     if x.is_cuda and HAS_LIGER_RMSNORM and torch.is_grad_enabled():
         return LigerRMSNormFunction.apply(x, weight.to(x.dtype), eps)
@@ -734,20 +803,23 @@ class MultimodalTieredMoEEngram(nn.Module):
         out_dtype = hidden_states.dtype
         param_dtype = self.project.weight.dtype
         lex_dropped = self.lex_dropout(e_lexical)
-        lex_hidden = self.lexical_up(lex_dropped)
+        lex_hidden = _imm_linear(self.lexical_up, lex_dropped)
 
         h_norm = fast_rmsnorm(hidden_states.to(param_dtype), self.norm_weight, self.norm_eps)
         h_norm_f = h_norm.float()
 
         # Tier 2: 100%-active Shared SwiGLU Expert
         h_fused = h_norm + lex_hidden
-        shared_out = self.shared_down(triton_swiglu(self.shared_gate(h_fused), self.shared_up(h_fused)))
+        shared_out = _imm_linear(
+            self.shared_down,
+            triton_swiglu(_imm_linear(self.shared_gate, h_fused), _imm_linear(self.shared_up, h_fused)),
+        )
 
         # Tier 3: Multimodal Hypersphere Cosine Router (`h_t + W_vis v_bar`) using frozen forward dispatch plan
         p_idx = min(max(int(pass_idx), 0), self.max_passes - 1)
-        route_in = self.router_proj(h_norm_f)
+        route_in = _imm_linear(self.router_proj, h_norm_f)
         if vis_summary is not None:
-            route_in = route_in + self.vis_router_proj(vis_summary.float())
+            route_in = route_in + _imm_linear(self.vis_router_proj, vis_summary.float())
         u = F.normalize(route_in, p=2, dim=-1, eps=1e-6)
         c = F.normalize(self.expert_centroids, p=2, dim=-1, eps=1e-6)
         temp = self.router_log_temp.exp().clamp(min=0.03, max=2.0)
@@ -759,7 +831,7 @@ class MultimodalTieredMoEEngram(nn.Module):
         topk_raw = torch.gather(scores, dim=-1, index=topk_idx)
         topk_gates = (topk_raw / (topk_raw.sum(dim=-1, keepdim=True) + 1e-6)).to(param_dtype)
 
-        q = self.query_proj(h_norm) + lex_dropped
+        q = _imm_linear(self.query_proj, h_norm) + lex_dropped
         flat_q = q.reshape(-1, self.eng_dim)
         n_tokens = flat_q.shape[0]
         flat_gates = topk_gates.reshape(n_tokens, self.top_k)
@@ -774,16 +846,16 @@ class MultimodalTieredMoEEngram(nn.Module):
             q_e = sorted_q[offset : offset + cnt]
             g_e = sorted_g[offset : offset + cnt]
             offset += cnt
-            act_e = triton_swiglu(torch.matmul(q_e, self.expert_gates[e_id]), torch.matmul(q_e, self.expert_ups[e_id]))
-            out_chunks.append(torch.matmul(act_e, self.expert_downs[e_id]) * g_e)
+            act_e = triton_swiglu(_imm_matmul(q_e, self.expert_gates[e_id]), _imm_matmul(q_e, self.expert_ups[e_id]))
+            out_chunks.append(_imm_matmul(act_e, self.expert_downs[e_id]) * g_e)
         routed_flat = torch.zeros((n_tokens, self.width), dtype=param_dtype, device=flat_q.device)
         if out_chunks:
             routed_flat.index_add_(0, token_rows, torch.cat(out_chunks, dim=0))
 
         routed_out = routed_flat.view_as(shared_out)
         combined = 0.5 * lex_hidden + shared_out + routed_out
-        ctx = (2.0 * torch.sigmoid(self.ctx_gate(h_norm).float())).to(param_dtype)
-        projected = self.project(combined * ctx)
+        ctx = (2.0 * torch.sigmoid(_imm_linear(self.ctx_gate, h_norm).float())).to(param_dtype)
+        projected = _imm_linear(self.project, combined * ctx)
         gate = torch.sigmoid(self.gain).to(out_dtype)
         return projected.to(out_dtype) * gate, z_curr
 

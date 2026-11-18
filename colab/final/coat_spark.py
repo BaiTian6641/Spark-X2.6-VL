@@ -257,6 +257,8 @@ class _CoatLinearFn(torch.autograd.Function):
         need_b_grad = bias is not None and bias.requires_grad
         ctx.need_w_grad = need_w_grad
         ctx.need_b_grad = need_b_grad
+        ctx.weight_ref = weight if need_w_grad else None
+        ctx.bias_ref = bias if need_b_grad else None
         ctx.x_dtype = x.dtype
         ctx.w_dtype = weight.dtype
         ctx.b_dtype = bias.dtype if bias is not None else None
@@ -299,12 +301,18 @@ class _CoatLinearFn(torch.autograd.Function):
             if go_2d.dtype != xr_2d.dtype:
                 xr_2d = xr_2d.to(go_2d.dtype)
             grad_w = go_2d.t().matmul(xr_2d)
-            if grad_w.dtype != ctx.w_dtype:
+            consume_w = getattr(ctx.weight_ref, "_immediate_accum_fn", None)
+            if consume_w is not None and consume_w(grad_w):
+                grad_w = None
+            elif grad_w.dtype != ctx.w_dtype:
                 grad_w = grad_w.to(ctx.w_dtype)
 
         if ctx.need_b_grad and ctx.needs_input_grad[2]:
             reduce_dims = tuple(range(grad_out.ndim - 1))
             grad_b = grad_out.float().sum(dim=reduce_dims).to(ctx.b_dtype)
+            consume_b = getattr(ctx.bias_ref, "_immediate_accum_fn", None)
+            if consume_b is not None and consume_b(grad_b):
+                grad_b = None
 
         return grad_x, grad_w, grad_b, None, None, None, None
 

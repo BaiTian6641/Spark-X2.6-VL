@@ -900,8 +900,10 @@ class MergedGradientAccumulator:
             self.param_names[id(p)] = name
             buf_dtype = self._buffer_dtype_for(name, p)
             self.buffers[id(p)] = torch.zeros_like(p, dtype=buf_dtype)
-            if attach_hooks and hasattr(p, "register_post_accumulate_grad_hook"):
-                self._handles.append(p.register_post_accumulate_grad_hook(self._make_hook(id(p))))
+            if attach_hooks:
+                p._immediate_accum_fn = self._make_direct_consumer(id(p))
+                if hasattr(p, "register_post_accumulate_grad_hook"):
+                    self._handles.append(p.register_post_accumulate_grad_hook(self._make_hook(id(p))))
 
     def _buffer_dtype_for(self, name: str, p: nn.Parameter) -> torch.dtype:
         if self.accum_mode == "fp32":
@@ -918,6 +920,22 @@ class MergedGradientAccumulator:
             return torch.float32
         return torch.bfloat16
 
+    def _make_direct_consumer(self, pid: int) -> Callable[[torch.Tensor], bool]:
+        def _consume(grad: torch.Tensor) -> bool:
+            if not self._hook_enabled or grad is None:
+                return False
+            buf = self.buffers.get(pid)
+            if buf is None:
+                return False
+            g = grad.detach()
+            if buf.dtype == g.dtype:
+                buf.add_(g, alpha=self._active_weight)
+            else:
+                buf.add_(g.to(buf.dtype), alpha=self._active_weight)
+            return True
+
+        return _consume
+
     def _make_hook(self, pid: int) -> Callable[[torch.Tensor], None]:
         def _hook(param: torch.Tensor) -> None:
             if not self._hook_enabled or param.grad is None:
@@ -933,6 +951,9 @@ class MergedGradientAccumulator:
         return _hook
 
     def close(self) -> None:
+        for p in self.params:
+            if hasattr(p, "_immediate_accum_fn"):
+                delattr(p, "_immediate_accum_fn")
         for h in self._handles:
             h.remove()
         self._handles.clear()
