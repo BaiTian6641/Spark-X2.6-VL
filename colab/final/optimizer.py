@@ -939,9 +939,10 @@ class MergedGradientAccumulator:
         loop_end = int(getattr(model, "loop_end", 24))
         enable_cpu_accum = bool(getattr(model, "enable_loop_engram", False))
         has_b50_offload = bool(hasattr(model, "has_intel_vision_bridge") and model.has_intel_vision_bridge())
-        # Under Dual-GPU B50 vision offload, `cuda:0` frees ~3.2 GiB of HBM: keep ALL 36 Spark decoder layers
-        # AND all 8 Engram anchors in `672 GB/s` GDDR7 HBM, pinning only `embed_tokens` (`>= 100M` elems = 0.67 GB)
-        # in DDR5 with a persistent pinned DMA staging buffer (`28.4 GB/s` Gen5 x8 instead of pageable `3.5 GB/s`).
+        # Under Dual-GPU B50 vision offload, `cuda:0` frees ~3.2 GiB of HBM: keep Spark layers `12..35`
+        # (including all recurrent `[12..24) x 2` layers) AND all 8 Engram anchors in `672 GB/s` GDDR7 HBM,
+        # pinning `embed_tokens` + non-recurrent bottom layers `0..11` (`~2.52 GB`) in DDR5 with a persistent
+        # pinned Gen5 x8 DMA staging buffer (`28.4 GB/s`), guaranteeing >2.2 GiB HBM headroom up to 7k+ tokens!
         max_cpu_buf_bytes = 0
         seen: set[int] = set()
         for name, p in model.named_parameters():
@@ -952,7 +953,15 @@ class MergedGradientAccumulator:
             self.param_names[id(p)] = name
             buf_dtype = self._buffer_dtype_for(name, p)
             if has_b50_offload:
-                offload_to_cpu = enable_cpu_accum and p.is_cuda and p.ndim == 2 and p.numel() >= 100_000_000
+                in_bottom_nonrecurrent = any(
+                    name.startswith(f"spark.model.layers.{k}.") for k in range(0, loop_start)
+                )
+                offload_to_cpu = (
+                    enable_cpu_accum
+                    and p.is_cuda
+                    and p.ndim == 2
+                    and (p.numel() >= 100_000_000 or (in_bottom_nonrecurrent and p.numel() >= 1_000_000))
+                )
             else:
                 in_recurrent = any(name.startswith(f"spark.model.layers.{k}.") for k in range(loop_start, loop_end))
                 offload_to_cpu = enable_cpu_accum and p.is_cuda and p.ndim == 2 and p.numel() >= 1_000_000 and not in_recurrent
