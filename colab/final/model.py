@@ -821,7 +821,11 @@ class SparkNative(nn.Module):
         self.loop_controllers = nn.ModuleDict()
         self.engram_anchors = nn.ModuleDict()
         if self.enable_loop_engram:
-            self._install_loop_and_engram(policy, spark_dtype=spark_dtype)
+            skip_orth = (not pretrained) or (
+                bool(policy.get('init_from_release_dir'))
+                and not bool(policy.get('allow_warmstart_missing_loop_engram', True))
+            )
+            self._install_loop_and_engram(policy, spark_dtype=spark_dtype, skip_orthogonal_init=skip_orth)
 
         if self.modalities=='omni':
             from transformers import WhisperModel,WhisperConfig,WhisperFeatureExtractor,ClapFeatureExtractor
@@ -908,7 +912,13 @@ class SparkNative(nn.Module):
         self.freeze_infrastructure()
         self.gradient_checkpointing_enable()
 
-    def _install_loop_and_engram(self, policy: dict[str, Any], *, spark_dtype: torch.dtype) -> None:
+    def _install_loop_and_engram(
+        self,
+        policy: dict[str, Any],
+        *,
+        spark_dtype: torch.dtype,
+        skip_orthogonal_init: bool = False,
+    ) -> None:
         from .loop_engram import (
             MultimodalTieredMoEEngram,
             SublayerDualMHC,
@@ -977,6 +987,7 @@ class SparkNative(nn.Module):
                     max_passes=self.max_loop_passes,
                     offload_tier1b_cpu=offload_cpu,
                     param_dtype=eng_dtype,
+                    skip_orthogonal_init=skip_orthogonal_init,
                 )
                 for idx in anchor_indices
             }
@@ -1539,11 +1550,9 @@ class SparkNative(nn.Module):
                     views.append((crop_im,crop_alpha,(a/w,b/h,c/w,d/h),self.policy['tile_patches']))
         return views
 
-    def image_tokens(self,images,times,capture,alphas=None,visual_units=None):
+    def _prepare_visual_units_and_groups(self, images, times, capture, alphas=None, visual_units=None):
         if not images:
-            return None
-        # Only genuine temporal_frame sequences disable detail tiles; multiview renders,
-        # UV atlases, and before/after state pairs preserve full detail tile crops!
+            return [], {}
         if visual_units:
             is_temporal=all(u.get('visual_kind')=='temporal_frame' for u in visual_units)
         else:
@@ -1583,26 +1592,76 @@ class SparkNative(nn.Module):
             u=max(candidates,key=count); u['patches']=max(64,u['patches']//2)
             u['batch']=self.image_processor(images=u['image'],return_tensors='pt',max_num_patches=u['patches'])
 
-        outputs=[None]*len(units); groups={}
-        for index,unit in enumerate(units): groups.setdefault(unit['patches'],[]).append((index,unit))
+        groups={}
+        for index,unit in enumerate(units):
+            groups.setdefault(unit['patches'],[]).append((index,unit))
+        return units, groups
+
+    def prefetch_examples_vision(self, examples: list[tuple[dict[str, Any], dict[str, Any]]]) -> None:
+        """Tile & execute 27L SigLIP2-So400M on Intel Arc Pro B50 (`xpu:0`) for `Microbatch m+1`
+        in a background thread concurrently while NVIDIA Blackwell (`cuda:0`) computes `Microbatch m`."""
+        bridge = getattr(self, '_intel_vision_bridge', None)
+        if bridge is None or not self.training or not getattr(self, '_intel_vision_trainable', False):
+            return
+        vis_dtype = next(self.vision.parameters()).dtype
+        for _row, media in examples:
+            images = media.get('images')
+            if not images or '_prefetched_b50_vision' in media:
+                continue
+            units, groups = self._prepare_visual_units_and_groups(
+                images,
+                media.get('times'),
+                media.get('capture_times'),
+                media.get('alphas'),
+                media.get('visual_units'),
+            )
+            prefetched_groups: dict[int, tuple[dict[str, torch.Tensor], tuple[int, torch.Tensor]]] = {}
+            for p_key, items in sorted(groups.items()):
+                batch = {
+                    k: torch.cat([u['batch'][k] for _, u in items], dim=0).to(
+                        dtype=vis_dtype if k == 'pixel_values' else None,
+                    )
+                    for k in ('pixel_values', 'pixel_attention_mask', 'spatial_shapes')
+                }
+                res = bridge.prefetch_forward_train(batch, out_dtype=vis_dtype)
+                prefetched_groups[p_key] = (batch, res)
+            media['_prefetched_b50_vision'] = (units, groups, prefetched_groups)
+
+    def image_tokens(self,images,times,capture,alphas=None,visual_units=None,_prefetched=None):
+        if not images:
+            return None
+        if _prefetched is not None:
+            units, groups, prefetched_groups = _prefetched
+        else:
+            units, groups = self._prepare_visual_units_and_groups(
+                images, times, capture, alphas=alphas, visual_units=visual_units
+            )
+            prefetched_groups = None
+
+        outputs=[None]*len(units)
         vis_dtype=next(self.vision.parameters()).dtype
         proj_dtype=self.vision_projector[0].weight.dtype
 
         bridge = getattr(self, '_intel_vision_bridge', None)
         ov_runner = getattr(self, '_openvino_vision_runner', None)
-        for _,items in sorted(groups.items()):
+        for p_key,items in sorted(groups.items()):
             if bridge is not None:
-                batch={
-                    k:torch.cat([u['batch'][k] for _,u in items],dim=0).to(
-                        dtype=vis_dtype if k=='pixel_values' else None,
-                    )
-                    for k in ('pixel_values','pixel_attention_mask','spatial_shapes')
-                }
+                if prefetched_groups is not None and p_key in prefetched_groups:
+                    batch, pre_res = prefetched_groups[p_key]
+                else:
+                    batch={
+                        k:torch.cat([u['batch'][k] for _,u in items],dim=0).to(
+                            dtype=vis_dtype if k=='pixel_values' else None,
+                        )
+                        for k in ('pixel_values','pixel_attention_mask','spatial_shapes')
+                    }
+                    pre_res = None
                 features=bridge.forward(
                     batch,
                     training_mode=self.training,
                     out_device=self.device,
                     out_dtype=vis_dtype,
+                    prefetched_result=pre_res,
                 )
             elif ov_runner is not None and not self.training:
                 batch={
@@ -1812,6 +1871,7 @@ class SparkNative(nn.Module):
             _VisitCache,
             _attn_accepts_position_embeddings,
             build_spark_loop_context,
+            prefetch_tier1b_for_anchors,
         )
         from torch.utils.checkpoint import checkpoint
 
@@ -1861,6 +1921,19 @@ class SparkNative(nn.Module):
             if len(self.engram_anchors) > 0
             else None
         )
+        t1b_prefetched: dict[str, Any] = {}
+        t1b_ready_evt: Any = None
+        if ngram_indices is not None:
+            dma_st = getattr(self, '_tier1b_dma_stream', None)
+            if dma_st is None and hidden.is_cuda:
+                dma_st = torch.cuda.Stream(device=hidden.device)
+                self._tier1b_dma_stream = dma_st
+            t1b_prefetched, t1b_ready_evt = prefetch_tier1b_for_anchors(
+                self.engram_anchors,
+                ngram_indices,
+                hidden.device,
+                dma_stream=dma_st,
+            )
         eff_vis_ctx = visual_context if (visual_context is not None and len(getattr(self, 'visual_cross_attn', ())) > 0) else None
         vis_summary = visual_context.float().mean(dim=1, keepdim=True) if visual_context is not None else None
         passes = max(1, min(self.max_loop_passes, int(num_passes if num_passes is not None else self.loop_passes)))
@@ -1885,6 +1958,9 @@ class SparkNative(nn.Module):
                     grad_ckpt,
                 )
                 if ngram_indices is not None and str(idx) in self.engram_anchors:
+                    if t1b_ready_evt is not None:
+                        torch.cuda.current_stream(hidden.device).wait_event(t1b_ready_evt)
+                        t1b_ready_evt = None
                     eng_delta, z_l = self.engram_anchors[str(idx)].forward_with_z_loss(
                         hidden,
                         ngram_indices=ngram_indices,
@@ -1892,6 +1968,7 @@ class SparkNative(nn.Module):
                         vis_summary=vis_summary,
                         text_token_mask=eff_text_mask,
                         use_grad_checkpoint=grad_ckpt,
+                        prefetched_tier1b=t1b_prefetched.get(str(idx)),
                     )
                     hidden = hidden + eng_delta
                     z_losses.append(z_l)
@@ -1990,6 +2067,9 @@ class SparkNative(nn.Module):
                         streams = torch.stack((s0_xa, streams[1]), dim=0)
 
                     if ngram_indices is not None and str(idx) in self.engram_anchors:
+                        if t1b_ready_evt is not None:
+                            torch.cuda.current_stream(hidden.device).wait_event(t1b_ready_evt)
+                            t1b_ready_evt = None
                         eng_delta, z_l = self.engram_anchors[str(idx)].forward_with_z_loss(
                             streams[0],
                             ngram_indices=ngram_indices,
@@ -1997,6 +2077,7 @@ class SparkNative(nn.Module):
                             vis_summary=vis_summary,
                             text_token_mask=eff_text_mask,
                             use_grad_checkpoint=grad_ckpt,
+                            prefetched_tier1b=t1b_prefetched.get(str(idx)),
                         )
                         streams = torch.stack((streams[0] + eng_delta, streams[1]), dim=0)
                         z_losses.append(z_l)
@@ -2019,6 +2100,9 @@ class SparkNative(nn.Module):
                     grad_ckpt,
                 )
                 if ngram_indices is not None and str(idx) in self.engram_anchors:
+                    if t1b_ready_evt is not None:
+                        torch.cuda.current_stream(hidden.device).wait_event(t1b_ready_evt)
+                        t1b_ready_evt = None
                     eng_delta, z_l = self.engram_anchors[str(idx)].forward_with_z_loss(
                         hidden,
                         ngram_indices=ngram_indices,
@@ -2026,6 +2110,7 @@ class SparkNative(nn.Module):
                         vis_summary=vis_summary,
                         text_token_mask=eff_text_mask,
                         use_grad_checkpoint=grad_ckpt,
+                        prefetched_tier1b=t1b_prefetched.get(str(idx)),
                     )
                     hidden = hidden + eng_delta
                     z_losses.append(z_l)
@@ -2075,8 +2160,18 @@ class SparkNative(nn.Module):
         img_fn = getattr(self, 'image_tokens', None)
         if img_fn is None:
             return None
+        pre_b50 = media.pop('_prefetched_b50_vision', None) if isinstance(media, dict) else None
         # Backward compatibility for mock lambdas in unit tests (`model.image_tokens = lambda *args: None`)
         try:
+            if pre_b50 is not None:
+                return img_fn(
+                    media['images'],
+                    media['times'],
+                    media['capture_times'],
+                    media.get('alphas'),
+                    media.get('visual_units'),
+                    _prefetched=pre_b50,
+                )
             return img_fn(
                 media['images'],
                 media['times'],

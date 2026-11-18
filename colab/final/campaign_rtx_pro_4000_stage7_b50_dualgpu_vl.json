@@ -12,7 +12,7 @@
   "intel_arc_xpu_python": "/home/baitian6641/Spark-X2.6-VL/.venv-xpu/bin/python",
   "intel_arc_openvino_eval": true,
   "intel_arc_openvino_device": "GPU.0",
-  "intel_arc_grad_ckpt_tokens": 1024,
+  "intel_arc_grad_ckpt_tokens": 3072,
   "dataset_mode": "hybrid_world_v32",
   "enable_stage5_reasoning_mix": true,
   "enable_stage5_gpqa_extended": true,

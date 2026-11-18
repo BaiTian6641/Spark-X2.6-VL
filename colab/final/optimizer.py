@@ -402,6 +402,7 @@ class ApolloMergedOptimizer(torch.optim.Optimizer):
         self.fp8_codec = CoatDynamicRangeFP8Codec(group_size=coat_group_size)
         self._rounding_cpu_gen = torch.Generator(device="cpu")
         self._rounding_cpu_gen.manual_seed((self.base_seed ^ 0xA5A55A5A) & ((1 << 63) - 1))
+        self._device_rngs: dict[torch.device, torch.Generator] = {}
         self._cached_bases: dict[int, tuple[int, torch.Tensor]] = {}
         self.last_codec_stats: dict[str, float] = {
             "saturated_fraction": 0.0,
@@ -412,11 +413,10 @@ class ApolloMergedOptimizer(torch.optim.Optimizer):
         draw_seed = int(
             torch.randint(0, (1 << 62) - 1, (1,), generator=self._rounding_cpu_gen).item()
         )
-        if device.type == "cpu":
-            gen = torch.Generator(device="cpu")
-            gen.manual_seed(draw_seed)
-            return gen
-        gen = torch.Generator(device=device)
+        gen = self._device_rngs.get(device)
+        if gen is None:
+            gen = torch.Generator(device="cpu" if device.type == "cpu" else device)
+            self._device_rngs[device] = gen
         gen.manual_seed(draw_seed)
         return gen
 
@@ -660,9 +660,16 @@ class ApolloMergedOptimizer(torch.optim.Optimizer):
             if grad_raw.device != p.device
             else grad_raw
         )
+        fast_unchunked = (rows <= self.chunk_rows) or (rows * cols <= 33_554_432)
+        g_full_f32: torch.Tensor | None = None
 
-        # Compute projected gradient R_t in FP32 by chunking along rows if large.
-        if proj_side == "left":
+        # Compute projected gradient R_t in FP32 (single-shot for <=33M elems, chunked for huge tables like embed_tokens).
+        if fast_unchunked:
+            g_full_f32 = grad_src.float()
+            if grad_scale != 1.0:
+                g_full_f32.mul_(grad_scale)
+            r_grad = (basis @ g_full_f32) if proj_side == "left" else (g_full_f32 @ basis.t())
+        elif proj_side == "left":
             r_grad = torch.zeros((rank, cols), device=p.device, dtype=torch.float32)
             for start in range(0, rows, self.chunk_rows):
                 end = min(rows, start + self.chunk_rows)
@@ -702,31 +709,41 @@ class ApolloMergedOptimizer(torch.optim.Optimizer):
         else:
             raise ValueError(f"Unsupported scale_type: {scale_type}")
 
-        # Compute full-space scaled gradient norm in chunks to apply Fira norm-growth limiter without a full FP32 copy.
-        sq_norm = torch.zeros((), device=p.device, dtype=torch.float32)
-        for start in range(0, rows, self.chunk_rows):
-            end = min(rows, start + self.chunk_rows)
-            g_chunk = grad_src[start:end].float()
-            if grad_scale != 1.0:
-                g_chunk = g_chunk * grad_scale
-            if proj_side == "left":
-                s_chunk = g_chunk * channel_scale.unsqueeze(0)
-            else:
-                s_chunk = g_chunk * channel_scale[start:end].unsqueeze(1)
-            sq_norm = sq_norm + s_chunk.square().sum()
+        # Zero-sync Fira norm-growth limiter: keep `prev_scaled_norm` as a device tensor so ZERO `.item()` stalls occur!
+        if g_full_f32 is not None:
+            scale_view = channel_scale.unsqueeze(0) if proj_side == "left" else channel_scale.unsqueeze(1)
+            sq_norm = (g_full_f32 * scale_view).square().sum()
+        else:
+            sq_norm = torch.zeros((), device=p.device, dtype=torch.float32)
+            for start in range(0, rows, self.chunk_rows):
+                end = min(rows, start + self.chunk_rows)
+                g_chunk = grad_src[start:end].float()
+                if grad_scale != 1.0:
+                    g_chunk = g_chunk * grad_scale
+                if proj_side == "left":
+                    s_chunk = g_chunk * channel_scale.unsqueeze(0)
+                else:
+                    s_chunk = g_chunk * channel_scale[start:end].unsqueeze(1)
+                sq_norm = sq_norm + s_chunk.square().sum()
 
-        current_norm = float(sq_norm.sqrt().item())
+        current_norm_t = sq_norm.sqrt()
         prev_norm = state.get("prev_scaled_norm")
-        limiter = 1.0
         growth_bound = group.get("norm_growth_bound")
-        if growth_bound is not None and prev_norm is not None and prev_norm > 0.0:
-            ratio = current_norm / (prev_norm + eps)
-            if ratio > float(growth_bound):
-                limiter = float(growth_bound) / ratio
-                current_norm = current_norm * limiter
-        state["prev_scaled_norm"] = current_norm
+        if growth_bound is not None and prev_norm is not None:
+            prev_t = (
+                prev_norm.to(device=p.device, dtype=torch.float32)
+                if isinstance(prev_norm, torch.Tensor)
+                else torch.tensor(float(prev_norm), device=p.device, dtype=torch.float32)
+            )
+            gb = float(growth_bound)
+            ratio = current_norm_t / (prev_t + eps)
+            limiter_t = torch.where((prev_t > 0.0) & (ratio > gb), gb / ratio, torch.ones_like(ratio))
+            current_norm_t = current_norm_t * limiter_t
+        else:
+            limiter_t = torch.ones((), device=p.device, dtype=torch.float32)
+        state["prev_scaled_norm"] = current_norm_t
 
-        effective_channel_scale = channel_scale * (float(group.get("apollo_scale", 1.0)) * limiter)
+        effective_channel_scale = channel_scale * (limiter_t * float(group.get("apollo_scale", 1.0)))
 
         # Persist updated projected moments (FP32 or COAT dynamic-range FP8).
         sat, uflow = 0.0, 0.0
@@ -734,7 +751,6 @@ class ApolloMergedOptimizer(torch.optim.Optimizer):
             state["exp_avg"] = self.fp8_codec.encode(exp_avg, signed=True)
             sat = max(sat, self.fp8_codec.last_stats["saturated_fraction"])
             uflow = max(uflow, self.fp8_codec.last_stats["underflow_fraction"])
-            state["exp_avg"] = state["exp_avg"]
             state["exp_avg_sq"] = self.fp8_codec.encode(exp_avg_sq, signed=False)
             sat = max(sat, self.fp8_codec.last_stats["saturated_fraction"])
             uflow = max(uflow, self.fp8_codec.last_stats["underflow_fraction"])
@@ -742,27 +758,43 @@ class ApolloMergedOptimizer(torch.optim.Optimizer):
             state["exp_avg"] = exp_avg
             state["exp_avg_sq"] = exp_avg_sq
 
-        # Apply chunked full-space update + decoupled weight decay directly to p.
         use_sr = bool(group.get("stochastic_rounding", True)) and p.dtype == torch.bfloat16
         sr_gen = self._next_rounding_generator(p.device) if use_sr else None
 
-        for start in range(0, rows, self.chunk_rows):
-            end = min(rows, start + self.chunk_rows)
-            w_chunk = p.data[start:end].float()
-            g_chunk = grad_src[start:end].float()
-            if grad_scale != 1.0:
-                g_chunk = g_chunk * grad_scale
-            if proj_side == "left":
-                upd = g_chunk * effective_channel_scale.unsqueeze(0)
-            else:
-                upd = g_chunk * effective_channel_scale[start:end].unsqueeze(1)
+        if g_full_f32 is not None:
+            scale_view = (
+                effective_channel_scale.unsqueeze(0)
+                if proj_side == "left"
+                else effective_channel_scale.unsqueeze(1)
+            )
+            g_full_f32.mul_(scale_view)
+            w_f = p.data.float()
             if wd != 0.0:
-                w_chunk.mul_(1.0 - lr * wd)
-            w_chunk.add_(upd, alpha=-lr)
+                w_f.mul_(1.0 - lr * wd)
+            w_f.add_(g_full_f32, alpha=-lr)
             if use_sr and sr_gen is not None:
-                p.data[start:end].copy_(stochastic_round_fp32_to_bf16(w_chunk, sr_gen))
+                p.data.copy_(stochastic_round_fp32_to_bf16(w_f, sr_gen))
             else:
-                p.data[start:end].copy_(w_chunk.to(p.dtype))
+                p.data.copy_(w_f.to(p.dtype))
+            del g_full_f32, w_f
+        else:
+            for start in range(0, rows, self.chunk_rows):
+                end = min(rows, start + self.chunk_rows)
+                w_chunk = p.data[start:end].float()
+                g_chunk = grad_src[start:end].float()
+                if grad_scale != 1.0:
+                    g_chunk = g_chunk * grad_scale
+                if proj_side == "left":
+                    upd = g_chunk * effective_channel_scale.unsqueeze(0)
+                else:
+                    upd = g_chunk * effective_channel_scale[start:end].unsqueeze(1)
+                if wd != 0.0:
+                    w_chunk.mul_(1.0 - lr * wd)
+                w_chunk.add_(upd, alpha=-lr)
+                if use_sr and sr_gen is not None:
+                    p.data[start:end].copy_(stochastic_round_fp32_to_bf16(w_chunk, sr_gen))
+                else:
+                    p.data[start:end].copy_(w_chunk.to(p.dtype))
         del grad_src
 
         return sat, uflow
@@ -905,12 +937,9 @@ class MergedGradientAccumulator:
         loop_end = int(getattr(model, "loop_end", 24))
         enable_cpu_accum = bool(getattr(model, "enable_loop_engram", False))
         has_b50_offload = bool(hasattr(model, "has_intel_vision_bridge") and model.has_intel_vision_bridge())
-        # When SigLIP2-So400M is offloaded to Intel Arc Pro B50 (`xpu:0`), `cuda:0` frees ~3.2 GiB of HBM!
-        # Keep Spark layers [8..36) (`28/36` layers) accumulation buffers directly in `cuda:0` HBM so backward
-        # avoids GPU->CPU copies on 80% of decoder layers, keeping only `embed_tokens`, `layers.0..7`, & `engram` in pinned DDR5.
-        hbm_start = 8 if has_b50_offload else loop_start
-        hbm_end = 36 if has_b50_offload else loop_end
-
+        # Under Dual-GPU B50 vision offload, `cuda:0` frees ~3.2 GiB of HBM: keep ALL 36 Spark decoder layers
+        # AND all 8 Engram anchors in `672 GB/s` GDDR7 HBM, pinning only `embed_tokens` (`>= 100M` elems = 0.78 GB)
+        # in DDR5 so 99.9% of backward hooks run purely in HBM with zero PCIe traffic!
         seen: set[int] = set()
         for name, p in model.named_parameters():
             if not p.requires_grad or id(p) in seen:
@@ -919,8 +948,12 @@ class MergedGradientAccumulator:
             self.params.append(p)
             self.param_names[id(p)] = name
             buf_dtype = self._buffer_dtype_for(name, p)
-            keep_in_hbm = any(name.startswith(f"spark.model.layers.{k}.") for k in range(hbm_start, hbm_end))
-            if enable_cpu_accum and p.is_cuda and p.ndim == 2 and p.numel() >= 1_000_000 and not keep_in_hbm:
+            if has_b50_offload:
+                offload_to_cpu = enable_cpu_accum and p.is_cuda and p.ndim == 2 and p.numel() >= 100_000_000
+            else:
+                in_recurrent = any(name.startswith(f"spark.model.layers.{k}.") for k in range(loop_start, loop_end))
+                offload_to_cpu = enable_cpu_accum and p.is_cuda and p.ndim == 2 and p.numel() >= 1_000_000 and not in_recurrent
+            if offload_to_cpu:
                 self.buffers[id(p)] = torch.zeros(p.shape, dtype=buf_dtype, device="cpu", pin_memory=True)
             else:
                 self.buffers[id(p)] = torch.zeros_like(p, dtype=buf_dtype)
@@ -1069,14 +1102,12 @@ class MergedGradientAccumulator:
                 for buf in self.buffers.values():
                     torch.distributed.all_reduce(buf, op=torch.distributed.ReduceOp.AVG)
 
+        # Single-sync global norm reduction: IEEE-754 NaN/Inf propagates monotonically through `square().sum()`
+        # into `total_sq`, avoiding 1,000+ per-tensor `isfinite().all()` host-device pipeline stalls!
         norm_dev = self.params[0].device if self.params else torch.device("cpu")
         total_sq = torch.zeros((), device=norm_dev, dtype=torch.float32)
-        all_finite = True
         for buf in self.buffers.values():
             b_fast = buf.to(device=norm_dev, non_blocking=True) if buf.device != norm_dev else buf
-            if not torch.isfinite(b_fast).all():
-                all_finite = False
-                break
             bf = b_fast.float()
             if post_scale != 1.0:
                 bf = bf * post_scale
@@ -1085,19 +1116,6 @@ class MergedGradientAccumulator:
 
         microbatches = self.microbatches_in_step
         units = self.units_in_step
-
-        if not all_finite:
-            self.zero_buffers()
-            self.skipped_nonfinite_steps += 1
-            return StepDiagnostics(
-                applied=False,
-                finite=False,
-                grad_norm=float("nan"),
-                clip_coef=0.0,
-                supervised_units=units,
-                microbatches=microbatches,
-                step=self.completed_steps,
-            )
 
         grad_norm = float(total_sq.sqrt().item())
         if not math.isfinite(grad_norm):

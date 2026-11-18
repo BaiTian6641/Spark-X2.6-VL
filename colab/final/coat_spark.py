@@ -20,9 +20,66 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+try:
+    import triton
+    import triton.language as tl
+
+    HAS_TRITON = True
+except Exception:
+    triton = None
+    tl = None
+    HAS_TRITON = False
+
 FP8_ACT_DTYPE = torch.float8_e4m3fn
 FP8_ACT_MAX = 448.0
 FP8_ACT_MIN_NORMAL = 2.0**-6
+
+
+if HAS_TRITON:
+
+    @triton.jit
+    def _coat_quant_fp8_kernel(
+        x_ptr,
+        q_ptr,
+        s_ptr,
+        numel,
+        num_groups,
+        GROUP_SIZE: tl.constexpr,
+        GROUPS_PER_BLOCK: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        g_idx = pid * GROUPS_PER_BLOCK + tl.arange(0, GROUPS_PER_BLOCK)[:, None]
+        c_idx = tl.arange(0, GROUP_SIZE)[None, :]
+        elem_idx = g_idx * GROUP_SIZE + c_idx
+        g_mask = g_idx < num_groups
+        e_mask = g_mask & (elem_idx < numel)
+        vals = tl.load(x_ptr + elem_idx, mask=e_mask, other=0.0).to(tl.float32)
+        amax = tl.max(tl.abs(vals), axis=1, keep_dims=True)
+        scale = tl.maximum(amax * (1.0 / 448.0), 1e-12)
+        scaled = tl.clamp(vals / scale, -448.0, 448.0)
+        tl.store(q_ptr + elem_idx, scaled.to(q_ptr.dtype.element_ty), mask=g_mask)
+        s_row = pid * GROUPS_PER_BLOCK + tl.arange(0, GROUPS_PER_BLOCK)
+        tl.store(s_ptr + s_row, tl.reshape(scale, (GROUPS_PER_BLOCK,)).to(tl.bfloat16), mask=s_row < num_groups)
+
+    @triton.jit
+    def _coat_dequant_fp8_kernel(
+        q_ptr,
+        s_ptr,
+        out_ptr,
+        numel,
+        num_groups,
+        GROUP_SIZE: tl.constexpr,
+        GROUPS_PER_BLOCK: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        g_idx = pid * GROUPS_PER_BLOCK + tl.arange(0, GROUPS_PER_BLOCK)[:, None]
+        c_idx = tl.arange(0, GROUP_SIZE)[None, :]
+        elem_idx = g_idx * GROUP_SIZE + c_idx
+        e_mask = (g_idx < num_groups) & (elem_idx < numel)
+        q_val = tl.load(q_ptr + elem_idx, mask=e_mask, other=0.0).to(tl.float32)
+        s_val = tl.load(s_ptr + g_idx, mask=g_idx < num_groups, other=0.0).to(tl.float32)
+        restored = q_val * s_val
+        tl.store(out_ptr + elem_idx, restored.to(out_ptr.dtype.element_ty), mask=e_mask)
 
 
 @dataclass
@@ -36,6 +93,7 @@ class CoatActivationTelemetry:
     skipped_frozen_linear_inputs: int = 0
     cache_invalidations: int = 0
     cache_rebuilds: int = 0
+    collect_detailed_stats: bool = False
 
     def reset_step(self) -> None:
         self.compressed_tensors = 0
@@ -70,13 +128,42 @@ def quantize_activation_per_group_fp8(
     group_size: int = 128,
     telemetry: CoatActivationTelemetry | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, tuple[int, ...], torch.dtype, int]:
-    """Per-group FP8 (`float8_e4m3fn`) quantization with bounded transient FP32 memory."""
+    """Per-group FP8 (`float8_e4m3fn`) quantization via 1-pass Triton kernel (zero host-device syncs)."""
     orig_shape = tuple(x.shape)
     orig_dtype = x.dtype
-    flat = x.detach().reshape(-1)
+    flat = x.detach().contiguous().reshape(-1)
     numel = flat.numel()
     pad = (-numel) % group_size
     num_groups = (numel + pad) // group_size
+    want_stats = telemetry is not None and bool(getattr(telemetry, "collect_detailed_stats", False))
+
+    if (
+        HAS_TRITON
+        and flat.is_cuda
+        and num_groups > 0
+        and (group_size & (group_size - 1) == 0)
+        and not want_stats
+    ):
+        q = torch.empty((num_groups, group_size), dtype=FP8_ACT_DTYPE, device=x.device)
+        scale_bf16 = torch.empty((num_groups,), dtype=torch.bfloat16, device=x.device)
+        gpb = max(1, min(32, 256 // max(1, group_size)))
+        grid = (triton.cdiv(num_groups, gpb),)
+        _coat_quant_fp8_kernel[grid](
+            flat,
+            q,
+            scale_bf16,
+            numel,
+            num_groups,
+            GROUP_SIZE=group_size,
+            GROUPS_PER_BLOCK=gpb,
+        )
+        if telemetry is not None:
+            telemetry.compressed_tensors += 1
+            telemetry.uncompressed_bytes += numel * x.element_size()
+            telemetry.compressed_bytes += num_groups * group_size + num_groups * 2
+            telemetry.total_elements += numel
+        return q, scale_bf16, orig_shape, orig_dtype, numel
+
     q = torch.empty((num_groups, group_size), dtype=FP8_ACT_DTYPE, device=x.device)
     scale_bf16 = torch.empty((num_groups,), dtype=torch.bfloat16, device=x.device)
 
@@ -101,7 +188,7 @@ def quantize_activation_per_group_fp8(
         q[g_start:g_end] = scaled.clamp(-FP8_ACT_MAX, FP8_ACT_MAX).to(FP8_ACT_DTYPE)
         scale_bf16[g_start:g_end] = scale.squeeze(-1).to(torch.bfloat16)
 
-        if telemetry is not None and valid_len > 0:
+        if want_stats and valid_len > 0:
             valid_scaled = scaled.reshape(-1)[:valid_len].abs()
             sat_count += int((valid_scaled > FP8_ACT_MAX * 0.999).sum().item())
             uflow_count += int(
@@ -132,6 +219,25 @@ def dequantize_activation_per_group_fp8(
 ) -> torch.Tensor:
     target_dtype = torch.float32 if as_float32 else orig_dtype
     num_groups, group_size = q.shape
+    if (
+        HAS_TRITON
+        and q.is_cuda
+        and num_groups > 0
+        and (group_size & (group_size - 1) == 0)
+    ):
+        out_flat = torch.empty((numel,), dtype=target_dtype, device=q.device)
+        gpb = max(1, min(32, 256 // max(1, group_size)))
+        grid = (triton.cdiv(num_groups, gpb),)
+        _coat_dequant_fp8_kernel[grid](
+            q,
+            scale_bf16,
+            out_flat,
+            numel,
+            num_groups,
+            GROUP_SIZE=group_size,
+            GROUPS_PER_BLOCK=gpb,
+        )
+        return out_flat.reshape(orig_shape)
     if as_float32 or q.numel() <= 2_097_152:
         restored = q.float() * scale_bf16.float().unsqueeze(-1)
         flat = restored.reshape(-1)[:numel].reshape(orig_shape)
@@ -590,6 +696,7 @@ def qualify_coat_kernels(device: str | torch.device = "cpu") -> dict[str, Any]:
         use_fp8_matmul=use_scaled_mm,
         use_saved_tensors_hook=False,
     )
+    ctrl.telemetry.collect_detailed_stats = True
     holder.train()
     y_coat = coat_spark_gated_gelu(
         holder.proj(g_coat),

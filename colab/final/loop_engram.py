@@ -144,6 +144,59 @@ class _ImmediateMatmulFn(torch.autograd.Function):
         return grad_x, grad_w
 
 
+class _GroupedExpertMatmulFn(torch.autograd.Function):
+    """Fused SM90+/SM120 `torch._grouped_mm` across all 16 2D `ParameterList` experts (zero CPU `.tolist()` sync)."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, offs: torch.Tensor, *weights: torch.Tensor) -> torch.Tensor:
+        x_c = x.contiguous()
+        w_3d = torch.stack([w if w.dtype == x_c.dtype else w.to(x_c.dtype) for w in weights], dim=0).contiguous()
+        out = torch._grouped_mm(x_c, w_3d, offs=offs)
+        ctx.save_for_backward(x_c, offs, w_3d)
+        ctx.x_dtype = x.dtype
+        ctx.w_refs = tuple(w if w.requires_grad else None for w in weights)
+        ctx.w_dtypes = tuple(w.dtype for w in weights)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        x_c, offs, w_3d = ctx.saved_tensors
+        go_c = grad_out.contiguous()
+        if go_c.dtype != w_3d.dtype:
+            go_c = go_c.to(w_3d.dtype)
+        grad_x = None
+        if ctx.needs_input_grad[0]:
+            w_t = w_3d.transpose(1, 2).contiguous()
+            grad_x = torch._grouped_mm(go_c, w_t, offs=offs)
+            if grad_x.dtype != ctx.x_dtype:
+                grad_x = grad_x.to(ctx.x_dtype)
+
+        grad_ws: list[Optional[torch.Tensor]] = [None] * len(ctx.w_refs)
+        if any(r is not None for r in ctx.w_refs):
+            try:
+                gw_3d = torch._grouped_mm(x_c.t(), go_c, offs=offs)
+                for e_id, w_ref in enumerate(ctx.w_refs):
+                    if w_ref is None:
+                        continue
+                    gw = gw_3d[e_id].to(ctx.w_dtypes[e_id])
+                    consume = getattr(w_ref, "_immediate_accum_fn", None)
+                    if consume is None or not consume(gw):
+                        grad_ws[e_id] = gw
+            except Exception:
+                offs_list = offs.tolist()
+                prev = 0
+                for e_id, end in enumerate(offs_list):
+                    end_i = int(end)
+                    w_ref = ctx.w_refs[e_id]
+                    if w_ref is not None and end_i > prev:
+                        gw = x_c[prev:end_i].t().matmul(go_c[prev:end_i]).to(ctx.w_dtypes[e_id])
+                        consume = getattr(w_ref, "_immediate_accum_fn", None)
+                        if consume is None or not consume(gw):
+                            grad_ws[e_id] = gw
+                    prev = end_i
+        return (grad_x, None, *grad_ws)
+
+
 class _ImmediateLinearFn(torch.autograd.Function):
     """Linear (`F.linear(x, w, b)`) that flushes `grad_w`/`grad_b` straight into `MergedGradientAccumulator`."""
 
@@ -451,6 +504,7 @@ class MultimodalTieredMoEEngram(nn.Module):
         max_passes: int = 2,
         offload_tier1b_cpu: bool = True,
         param_dtype: torch.dtype = torch.bfloat16,
+        skip_orthogonal_init: bool = False,
     ):
         super().__init__()
         self.width = int(width)
@@ -534,7 +588,13 @@ class MultimodalTieredMoEEngram(nn.Module):
         self.expert_downs = nn.ParameterList(
             [nn.Parameter(torch.empty(self.expert_rank, self.width, dtype=param_dtype)) for _ in range(self.num_experts)]
         )
-        self._init_orthogonal_experts()
+        if skip_orthogonal_init:
+            for e in range(self.num_experts):
+                nn.init.normal_(self.expert_gates[e], mean=0.0, std=0.02)
+                nn.init.normal_(self.expert_ups[e], mean=0.0, std=0.02)
+                nn.init.normal_(self.expert_downs[e], mean=0.0, std=0.01)
+        else:
+            self._init_orthogonal_experts()
 
         # Context-aware sigmoid gate & zero-initialized residual projection
         self.ctx_gate = nn.Linear(self.width, self.width, bias=True, dtype=param_dtype)
@@ -668,6 +728,7 @@ class MultimodalTieredMoEEngram(nn.Module):
         device: torch.device,
         param_dtype: torch.dtype,
         text_token_mask: Optional[torch.Tensor] = None,
+        prefetched_tier1b: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         bi, tri, skip = ngram_indices
         sw = F.softmax(self.scale_weights, dim=0).to(param_dtype)
@@ -681,28 +742,38 @@ class MultimodalTieredMoEEngram(nn.Module):
             is_cold_bi = bi >= hot_b
             is_cold_tri = tri >= hot_b
             is_cold_skip = skip >= hot_b
-            cold_b = self.cold_buckets
-            c_bi = (bi - hot_b).clamp(min=0, max=cold_b - 1)
-            c_tri = (tri - hot_b).clamp(min=0, max=cold_b - 1) + cold_b
-            c_skip = (skip - hot_b).clamp(min=0, max=cold_b - 1) + 2 * cold_b
 
             if self.offload_tier1b_cpu and self.tier1b_cold_weight is not None:
-                stacked = torch.stack([c_bi, c_tri, c_skip], dim=0)
-                uniq_gpu, inv = torch.unique(stacked, return_inverse=True)
-                uniq_cpu = uniq_gpu.cpu()
-                fetched_cpu = self.tier1b_cold_weight[uniq_cpu]
-                fetched_gpu = fetched_cpu.to(device=device, dtype=param_dtype, non_blocking=True)
+                if prefetched_tier1b is not None:
+                    uniq_cpu, inv, fetched_gpu = prefetched_tier1b
+                    if fetched_gpu.dtype != param_dtype:
+                        fetched_gpu = fetched_gpu.to(dtype=param_dtype)
+                else:
+                    cold_b = self.cold_buckets
+                    c_bi = (bi - hot_b).clamp(min=0, max=cold_b - 1)
+                    c_tri = (tri - hot_b).clamp(min=0, max=cold_b - 1) + cold_b
+                    c_skip = (skip - hot_b).clamp(min=0, max=cold_b - 1) + 2 * cold_b
+                    stacked = torch.stack([c_bi, c_tri, c_skip], dim=0)
+                    uniq_gpu, inv = torch.unique(stacked, return_inverse=True)
+                    uniq_cpu = uniq_gpu.cpu()
+                    fetched_cpu = self.tier1b_cold_weight[uniq_cpu]
+                    fetched_gpu = fetched_cpu.to(device=device, dtype=param_dtype, non_blocking=True)
                 if self.training and torch.is_grad_enabled() and any(p.requires_grad for p in self.parameters()):
                     fetched_gpu = fetched_gpu.detach().requires_grad_(True)
                     rows_ref = uniq_cpu
 
                     def _capture_grad(grad: torch.Tensor, _r=rows_ref) -> None:
-                        self._microbatch_tier1b_grads.append((_r, grad.detach().to(device="cpu", dtype=torch.float32)))
+                        # Defer D2H transfer until step boundary so backward never stalls CUDA stream!
+                        self._microbatch_tier1b_grads.append((_r, grad.detach()))
 
                     fetched_gpu.register_hook(_capture_grad)
                 gathered = fetched_gpu[inv]
                 c_e_bi, c_e_tri, c_e_skip = gathered[0], gathered[1], gathered[2]
             else:
+                cold_b = self.cold_buckets
+                c_bi = (bi - hot_b).clamp(min=0, max=cold_b - 1)
+                c_tri = (tri - hot_b).clamp(min=0, max=cold_b - 1) + cold_b
+                c_skip = (skip - hot_b).clamp(min=0, max=cold_b - 1) + 2 * cold_b
                 c_e_bi = self.tier1b_cold(c_bi)
                 c_e_tri = self.tier1b_cold(c_tri)
                 c_e_skip = self.tier1b_cold(c_skip)
@@ -749,7 +820,9 @@ class MultimodalTieredMoEEngram(nn.Module):
             return
 
         all_rows = torch.cat([r for r, _ in self._microbatch_tier1b_grads], dim=0)
-        all_grads = torch.cat([g for _, g in self._microbatch_tier1b_grads], dim=0)
+        all_grads = torch.cat(
+            [g.to(device="cpu", dtype=torch.float32) for _, g in self._microbatch_tier1b_grads], dim=0
+        )
         self._microbatch_tier1b_grads.clear()
 
         uniq_rows, inv = torch.unique(all_rows, return_inverse=True)
@@ -784,7 +857,7 @@ class MultimodalTieredMoEEngram(nn.Module):
         hidden_states: torch.Tensor,
         vis_summary: Optional[torch.Tensor],
         pass_idx: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[int, ...]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Any]:
         """Compute discrete Top-K routing plan outside `checkpoint` so FP8 activation hooks never alter expert shapes."""
         param_dtype = self.project.weight.dtype
         h_norm_f = fast_rmsnorm(hidden_states.detach().to(param_dtype), self.norm_weight.detach(), self.norm_eps).float()
@@ -799,15 +872,16 @@ class MultimodalTieredMoEEngram(nn.Module):
         scores = torch.sigmoid(router_logits)
         _, topk_idx = torch.topk(scores + self.expert_bias, k=self.top_k, dim=-1)
 
-        if self.training and torch.is_grad_enabled():
-            # Note: `no_grad()` disables grad inside this helper; check caller via `self.training` in `forward_with_z_loss`.
-            pass
-
         n_tokens = int(hidden_states.shape[0] * hidden_states.shape[1])
         flat_e = topk_idx.reshape(n_tokens * self.top_k)
         sorted_e, sort_perm = torch.sort(flat_e)
         token_rows = torch.div(sort_perm, self.top_k, rounding_mode="floor")
-        counts = tuple(int(x) for x in torch.bincount(sorted_e, minlength=self.num_experts).tolist())
+        bin_counts = torch.bincount(sorted_e, minlength=self.num_experts)
+        if hidden_states.is_cuda and hasattr(torch, "_grouped_mm") and param_dtype == torch.bfloat16:
+            # Stay 100% on GPU (`offs` int32 tensor) with ZERO `.tolist()` CUDA stream stall!
+            offs = torch.cumsum(bin_counts, dim=0).to(torch.int32)
+            return topk_idx, token_rows, sort_perm, offs
+        counts = tuple(int(x) for x in bin_counts.tolist())
         return topk_idx, token_rows, sort_perm, counts
 
     def _forward_core(
@@ -818,7 +892,7 @@ class MultimodalTieredMoEEngram(nn.Module):
         topk_idx: torch.Tensor,
         token_rows: torch.Tensor,
         sort_perm: torch.Tensor,
-        counts: tuple[int, ...],
+        counts_or_offs: Any,
         pass_idx: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         out_dtype = hidden_states.dtype
@@ -859,19 +933,27 @@ class MultimodalTieredMoEEngram(nn.Module):
 
         sorted_q = flat_q.index_select(0, token_rows)
         sorted_g = flat_gates.reshape(-1).index_select(0, sort_perm).unsqueeze(-1)
-        out_chunks = []
-        offset = 0
-        for e_id, cnt in enumerate(counts):
-            if cnt == 0:
-                continue
-            q_e = sorted_q[offset : offset + cnt]
-            g_e = sorted_g[offset : offset + cnt]
-            offset += cnt
-            act_e = triton_swiglu(_imm_matmul(q_e, self.expert_gates[e_id]), _imm_matmul(q_e, self.expert_ups[e_id]))
-            out_chunks.append(_imm_matmul(act_e, self.expert_downs[e_id]) * g_e)
         routed_flat = torch.zeros((n_tokens, self.width), dtype=param_dtype, device=flat_q.device)
-        if out_chunks:
-            routed_flat.index_add_(0, token_rows, torch.cat(out_chunks, dim=0))
+        if isinstance(counts_or_offs, torch.Tensor):
+            if sorted_q.shape[0] > 0:
+                gate_all = _GroupedExpertMatmulFn.apply(sorted_q, counts_or_offs, *self.expert_gates)
+                up_all = _GroupedExpertMatmulFn.apply(sorted_q, counts_or_offs, *self.expert_ups)
+                act_all = triton_swiglu(gate_all, up_all)
+                down_all = _GroupedExpertMatmulFn.apply(act_all, counts_or_offs, *self.expert_downs) * sorted_g
+                routed_flat.index_add_(0, token_rows, down_all)
+        else:
+            out_chunks = []
+            offset = 0
+            for e_id, cnt in enumerate(counts_or_offs):
+                if cnt == 0:
+                    continue
+                q_e = sorted_q[offset : offset + cnt]
+                g_e = sorted_g[offset : offset + cnt]
+                offset += cnt
+                act_e = triton_swiglu(_imm_matmul(q_e, self.expert_gates[e_id]), _imm_matmul(q_e, self.expert_ups[e_id]))
+                out_chunks.append(_imm_matmul(act_e, self.expert_downs[e_id]) * g_e)
+            if out_chunks:
+                routed_flat.index_add_(0, token_rows, torch.cat(out_chunks, dim=0))
 
         routed_out = routed_flat.view_as(shared_out)
         combined = 0.5 * lex_hidden + shared_out + routed_out
@@ -889,12 +971,17 @@ class MultimodalTieredMoEEngram(nn.Module):
         vis_summary: Optional[torch.Tensor] = None,
         text_token_mask: Optional[torch.Tensor] = None,
         use_grad_checkpoint: bool = False,
+        prefetched_tier1b: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Tier-1 lookup + discrete Top-K dispatch plan stay outside `checkpoint` so Host DRAM sparse row hooks
         # fire strictly once and COAT FP8 activation compression never perturbs per-expert token counts!
         param_dtype = self.project.weight.dtype
         e_lexical = self._lookup_tier1_lexical(
-            ngram_indices, hidden_states.device, param_dtype, text_token_mask=text_token_mask
+            ngram_indices,
+            hidden_states.device,
+            param_dtype,
+            text_token_mask=text_token_mask,
+            prefetched_tier1b=prefetched_tier1b,
         )
         topk_idx, token_rows, sort_perm, counts = self._route_dispatch_plan(hidden_states, vis_summary, pass_idx)
         if self.training and torch.is_grad_enabled():
@@ -945,6 +1032,7 @@ class MultimodalTieredMoEEngram(nn.Module):
         vis_summary: Optional[torch.Tensor] = None,
         text_token_mask: Optional[torch.Tensor] = None,
         use_grad_checkpoint: bool = False,
+        prefetched_tier1b: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         delta, _ = self.forward_with_z_loss(
             hidden_states,
@@ -953,8 +1041,53 @@ class MultimodalTieredMoEEngram(nn.Module):
             vis_summary=vis_summary,
             text_token_mask=text_token_mask,
             use_grad_checkpoint=use_grad_checkpoint,
+            prefetched_tier1b=prefetched_tier1b,
         )
         return delta
+
+
+@torch.no_grad()
+def prefetch_tier1b_for_anchors(
+    engram_anchors: nn.ModuleDict,
+    ngram_indices: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    device: torch.device,
+    *,
+    dma_stream: Optional[Any] = None,
+) -> tuple[dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]], Optional[Any]]:
+    """Coalesce Tier-1B unique-row lookup across all 8 anchors into ONE host-device DMA behind Layers 0..2."""
+    active_items = [
+        (k, mod)
+        for k, mod in engram_anchors.items()
+        if mod.cold_buckets > 0 and mod.offload_tier1b_cpu and mod.tier1b_cold_weight is not None
+    ]
+    if not active_items:
+        return {}, None
+    first = active_items[0][1]
+    hot_b = first.hot_buckets
+    cold_b = first.cold_buckets
+    param_dtype = first.project.weight.dtype
+    bi, tri, skip = ngram_indices
+    c_bi = (bi - hot_b).clamp(min=0, max=cold_b - 1)
+    c_tri = (tri - hot_b).clamp(min=0, max=cold_b - 1) + cold_b
+    c_skip = (skip - hot_b).clamp(min=0, max=cold_b - 1) + 2 * cold_b
+    stacked = torch.stack([c_bi, c_tri, c_skip], dim=0)
+    uniq_gpu, inv_gpu = torch.unique(stacked, return_inverse=True)
+    uniq_cpu = uniq_gpu.cpu()
+
+    cpu_rows = torch.stack([mod.tier1b_cold_weight[uniq_cpu] for _, mod in active_items], dim=0)
+    if device.type == "cuda":
+        cpu_rows = cpu_rows.pin_memory()
+        if dma_stream is not None:
+            dma_stream.wait_stream(torch.cuda.current_stream(device))
+            with torch.cuda.stream(dma_stream):
+                gpu_all = cpu_rows.to(device=device, dtype=param_dtype, non_blocking=True)
+                ready_evt = torch.cuda.Event()
+                ready_evt.record(dma_stream)
+            return {
+                k: (uniq_cpu, inv_gpu, gpu_all[idx]) for idx, (k, _) in enumerate(active_items)
+            }, ready_evt
+    gpu_all = cpu_rows.to(device=device, dtype=param_dtype, non_blocking=True)
+    return {k: (uniq_cpu, inv_gpu, gpu_all[idx]) for idx, (k, _) in enumerate(active_items)}, None
 
 
 class SublayerDualMHC(nn.Module):

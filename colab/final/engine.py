@@ -137,11 +137,13 @@ def ensure_coat_for_model(model,config):
         existing.enabled=True
         return existing
     from .coat_spark import install_spark_coat
+    has_grad_ckpt = bool(getattr(getattr(model.spark, 'model', model.spark), 'gradient_checkpointing', False))
     ctrl=install_spark_coat(
         model.spark,
         group_size=int(config.get('coat_activation_group_size',16)),
         min_features=int(config.get('apollo_min_dim',64)),
         use_fp8_matmul=bool(config.get('coat_fp8_linear_forward',False)),
+        use_saved_tensors_hook=not has_grad_ckpt,
     )
     model._coat_controller=ctrl
     return ctrl
@@ -655,13 +657,49 @@ class Campaign:
         exposure=Counter(self.state.get('exposure',{}))
         losses_by_stratum=defaultdict(lambda:[0.,0])
 
+        from concurrent.futures import ThreadPoolExecutor
+        use_vis_prefetch = (
+            hasattr(self.model, 'has_intel_vision_bridge')
+            and self.model.has_intel_vision_bridge()
+            and getattr(self.model, '_intel_vision_trainable', False)
+            and hasattr(self.model, 'prefetch_examples_vision')
+        )
+        prefetch_pool = ThreadPoolExecutor(max_workers=1) if use_vis_prefetch else None
+        prefetched_next = None
+        prefetch_fut = None
+
         try:
             batches_iter=iter(loader)
             while True:
-                try:
-                    batch=next(batches_iter)
-                except StopIteration:
-                    batch=None
+                if prefetched_next is not None:
+                    if prefetch_fut is not None:
+                        prefetch_fut.result()
+                        prefetch_fut = None
+                    batch = prefetched_next
+                    prefetched_next = None
+                else:
+                    try:
+                        batch=next(batches_iter)
+                    except StopIteration:
+                        batch=None
+
+                # Overlap `Microbatch m+1` CPU tiling + Intel Arc Pro B50 27L ViT forward behind
+                # `Microbatch m` NVIDIA Blackwell 48L forward + backward (strictly within the same
+                # accumulation window so vision weights never step between prefetch and consumption!).
+                if (
+                    batch is not None
+                    and prefetch_pool is not None
+                    and (window_microbatches + 1) < accumulation
+                    and not self.stop_reason
+                ):
+                    try:
+                        prefetched_next = next(batches_iter)
+                    except StopIteration:
+                        prefetched_next = None
+                    if prefetched_next is not None:
+                        prefetch_fut = prefetch_pool.submit(
+                            self.model.prefetch_examples_vision, prefetched_next['examples']
+                        )
 
                 if batch is not None:
                     is_long_mb = use_cuda_amp and any(
@@ -849,6 +887,13 @@ class Campaign:
                 if self.stop_reason or batch is None:
                     break
         finally:
+            if prefetch_fut is not None:
+                try:
+                    prefetch_fut.result()
+                except Exception:
+                    pass
+            if prefetch_pool is not None:
+                prefetch_pool.shutdown(wait=True)
             batches_iter=None
             loader=None
             accumulator.close()
