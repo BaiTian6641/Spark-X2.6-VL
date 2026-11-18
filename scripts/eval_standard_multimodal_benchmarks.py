@@ -387,10 +387,12 @@ def score_mmmu_open_answer(raw_text: str, gold_raw: Any) -> bool:
 def extract_yes_no(raw_text: str) -> str | None:
     """Extract binary `'yes'` / `'no'` prediction for POPE hallucination evaluation."""
     body, _ = clean_prediction_body(raw_text)
-    body = re.sub(r"^(?:answer|答案)\s*[:：]?\s*", "", body.strip(), flags=re.IGNORECASE)
-    low = body.lower().strip()
-    if not low:
+    if not body:
         return None
+    explicit = re.findall(r"(?:answer|答案)\s*(?:is|为|:|：)?\s*\b(yes|no|true|false)\b", body, flags=re.IGNORECASE)
+    if explicit:
+        return "yes" if explicit[-1].lower() in ("yes", "true") else "no"
+    low = body.lower().strip()
     first = re.findall(r"\b(yes|no|true|false)\b", low)
     if first:
         return "yes" if first[0] in ("yes", "true") else "no"
@@ -592,8 +594,13 @@ def eval_mmmu_val(model: Any, rows: list[dict[str, Any]], *, enable_thinking: bo
     for r in rows:
         imgs = [decode_parquet_image(r.get(f"image_{k}")) for k in range(1, 8)]
         imgs = [im for im in imgs if im is not None]
-        vkind = "multiview_render" if len(imgs) > 1 else "independent_image"
-        med = visual_media(imgs, visual_kind=vkind) if imgs else None
+        vkind = "state_pair" if len(imgs) == 2 else ("multiview_render" if len(imgs) > 2 else "independent_image")
+        v_units = (
+            [{"visual_kind": "state_pair", "view_id": "before"}, {"visual_kind": "state_pair", "view_id": "after"}]
+            if len(imgs) == 2
+            else None
+        )
+        med = visual_media(imgs, visual_kind=vkind, visual_units=v_units) if imgs else None
         qtype = str(r.get("question_type", "multiple-choice"))
         opts = parse_safe_list(r.get("options", ""))
         if qtype == "multiple-choice" and opts:
@@ -729,8 +736,13 @@ def eval_blink(model: Any, rows: list[dict[str, Any]]) -> dict[str, Any]:
     for r in rows:
         imgs = [decode_parquet_image(r.get(f"image_{k}")) for k in range(1, 5)]
         imgs = [im for im in imgs if im is not None]
-        vkind = "multiview_render" if len(imgs) > 1 else "independent_image"
-        med = visual_media(imgs, visual_kind=vkind) if imgs else None
+        vkind = "state_pair" if len(imgs) == 2 else ("multiview_render" if len(imgs) > 2 else "independent_image")
+        v_units = (
+            [{"visual_kind": "state_pair", "view_id": "before"}, {"visual_kind": "state_pair", "view_id": "after"}]
+            if len(imgs) == 2
+            else None
+        )
+        med = visual_media(imgs, visual_kind=vkind, visual_units=v_units) if imgs else None
         choices = parse_safe_list(r.get("choices", ""))
         letters = [chr(ord("A") + i) for i in range(max(2, len(choices)))]
         prompt = f"{str(r['prompt']).strip()}\nAnswer with only the option letter ({', '.join(letters)}) in the format: Answer: <letter>"
@@ -759,7 +771,7 @@ def eval_pope(model: Any, rows: list[dict[str, Any]]) -> dict[str, Any]:
     for r in rows:
         im = decode_parquet_image(r["image"])
         med = visual_media([im]) if im is not None else None
-        prompt = f"{str(r['question']).strip()}\nAnswer strictly with Yes or No."
+        prompt = f"{str(r['question']).strip()} Please answer yes or no."
         pred = generate(model, prompt, media=med, enable_thinking=False, max_new_tokens=24)
         yn = extract_yes_no(pred) or "no"
         gold = str(r["answer"]).strip().lower()
