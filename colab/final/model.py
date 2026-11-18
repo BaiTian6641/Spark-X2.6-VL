@@ -1764,8 +1764,6 @@ class SparkNative(nn.Module):
                         _vc=v_cache,
                         _vs=v_slot,
                         _cp=cache_position,
-                        _xb=xattn_blk,
-                        _vctx=eff_vis_ctx,
                     ) -> torch.Tensor:
                         return _ctrl(
                             st_in,
@@ -1778,20 +1776,55 @@ class SparkNative(nn.Module):
                             past_key_values=_vc,
                             virtual_idx=_vs,
                             cache_position=_cp,
-                            xattn_block=_xb,
-                            vis_ctx=_vctx,
+                            xattn_block=None,
+                            vis_ctx=None,
                         )
 
                     can_ckpt_mhc = grad_ckpt and (
                         streams.requires_grad
                         or any(p.requires_grad for p in layer.parameters())
                         or any(p.requires_grad for p in ctrl.parameters())
-                        or (xattn_blk is not None and eff_vis_ctx is not None and any(p.requires_grad for p in xattn_blk.parameters()))
                     )
                     if can_ckpt_mhc:
                         streams = checkpoint(_mhc_step, streams, use_reentrant=False)
                     else:
                         streams = _mhc_step(streams)
+
+                    # Disjoint sequential checkpoint segment for Visual Cross-Attention (Pass-0 + Pass-2 re-attendance)
+                    # so `layer` + `SublayerDualMHC` and `xattn_blk` never materialize backward graphs simultaneously!
+                    if xattn_blk is not None and eff_vis_ctx is not None:
+                        def _loop_xattn_step(
+                            s0_in: torch.Tensor,
+                            _xb=xattn_blk,
+                            _vctx=eff_vis_ctx,
+                            _ex=is_extra,
+                            _p=p_idx,
+                            _ctrl=ctrl,
+                            _has_post_ln=hasattr(layer, 'post_attention_layernorm'),
+                        ) -> torch.Tensor:
+                            adapted0 = _xb(s0_in, _vctx)
+                            if not _ex:
+                                return adapted0.to(s0_in.dtype)
+                            if _has_post_ln:
+                                gp = _ctrl.p3_ffn_extra_gain if (_p >= 2 and _ctrl.p3_ffn_extra_gain is not None) else _ctrl.ffn_extra_gain
+                            else:
+                                gp = _ctrl.p3_extra_gain if (_p >= 2 and _ctrl.p3_extra_gain is not None) else _ctrl.extra_gain
+                            gf = torch.tanh(gp.float())
+                            s0_f = s0_in.float()
+                            return (s0_f + gf * (adapted0.float() - s0_f)).to(s0_in.dtype)
+
+                        can_ckpt_xa = grad_ckpt and (
+                            streams.requires_grad
+                            or eff_vis_ctx.requires_grad
+                            or any(p.requires_grad for p in xattn_blk.parameters())
+                            or (is_extra and any(p.requires_grad for p in ctrl.parameters()))
+                        )
+                        s0_xa = (
+                            checkpoint(_loop_xattn_step, streams[0], use_reentrant=False)
+                            if can_ckpt_xa
+                            else _loop_xattn_step(streams[0])
+                        )
+                        streams = torch.stack((s0_xa, streams[1]), dim=0)
 
                     if ngram_indices is not None and str(idx) in self.engram_anchors:
                         eng_delta, z_l = self.engram_anchors[str(idx)].forward_with_z_loss(
