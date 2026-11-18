@@ -27,10 +27,14 @@ DEFAULT_CONFIG_PATH = HERE / "campaign_rtx_pro_4000_24gb.json"
 
 PINNED_RUNTIME_PATHS = (
     "colab/final/common.py",
+    "colab/final/loop_engram.py",
     "colab/final/optimizer.py",
     "colab/final/coat_spark.py",
     "colab/final/synccraft_bridge.py",
     "colab/final/sculpted_style_corpus.py",
+    "colab/final/sculpted_v8_v41_corpus.py",
+    "colab/final/visual_primitives_corpus.py",
+    "colab/final/frontier_stage7_corpus.py",
     "colab/final/world_pipeline.py",
     "colab/final/reasoning_agentic_corpus.py",
     "colab/final/vision_rsi.py",
@@ -43,6 +47,8 @@ PINNED_RUNTIME_PATHS = (
     "colab/final/storage.py",
     "colab/final/assets.py",
     "colab/final/inference.py",
+    "colab/final/publish.py",
+    "colab/final/teacher.py",
     "colab/final/run.py",
     "colab/final/components.lock.json",
 )
@@ -187,6 +193,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dataset-mode", choices=("local_synccraft", "hybrid_world_v32", "hf_full"), default=None, help="Dataset source override")
     parser.add_argument("--steps", type=int, default=None, help="Number of optimizer updates per profile in ablate mode")
     parser.add_argument("--resume-receipt", type=str, default=None, help="Receipt JSON path for resume mode")
+    parser.add_argument("--run-phase", choices=("full", "train", "rsi", "audit"), default=None, help="Optional phase override (train -> teacher subagent -> rsi -> audit)")
     parser.add_argument("--no-animation", action="store_true", help="Exclude Stage-B animation clips during static pilot prep")
     args = parser.parse_args(argv)
 
@@ -252,6 +259,8 @@ def main(argv: list[str] | None = None) -> int:
     extra: list[str] = []
     if args.resume_receipt:
         extra.extend(["--resume-receipt", args.resume_receipt])
+    if args.run_phase:
+        extra.extend(["--run-phase", args.run_phase])
     return _invoke_runner(run_mode, effective_cfg_path, manifest["source_sha256"], extra)
 
 

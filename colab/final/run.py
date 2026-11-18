@@ -242,7 +242,7 @@ def _valid_recovery_proof(proof,profile):
 def direct(config,token,key,source_sha):
     phase=config.get('run_phase','full')
     if phase not in ('full','train','rsi','audit'): raise ValueError('Expected run_phase full, train, rsi or audit')
-    is_vision_rsi=(config.get('rsi_mode')=='vision_self_improvement' or int(config.get('vision_rsi_rounds',0))>0)
+    is_vision_rsi=(config.get('rsi_mode') in ('vision_self_improvement','teacher_subagent_v8') or int(config.get('vision_rsi_rounds',0))>0)
     needs_instructor=((phase=='rsi' and not is_vision_rsi) or (phase=='full' and int(config.get('instructor_rounds',0))>0 and not is_vision_rsi))
     if needs_instructor and not key: raise ValueError('OPENCODE_API_KEY is required for instructor rounds')
     from .teacher import eligibility
@@ -321,9 +321,11 @@ def direct(config,token,key,source_sha):
     return 0
 
 def main(secrets=None):
-    p=argparse.ArgumentParser(description=__doc__); p.add_argument('mode',choices=('cpu','doctor','direct','ablate','qualify','discover','upload-checkpoint','recover','train','resume')); p.add_argument('--config',required=True);p.add_argument('--source-sha',required=True); p.add_argument('--profile-receipt');p.add_argument('--resume-receipt');p.add_argument('--checkpoint-directory');a=p.parse_args()
+    p=argparse.ArgumentParser(description=__doc__); p.add_argument('mode',choices=('cpu','doctor','direct','ablate','qualify','discover','upload-checkpoint','recover','train','resume')); p.add_argument('--config',required=True);p.add_argument('--source-sha',required=True); p.add_argument('--profile-receipt');p.add_argument('--resume-receipt');p.add_argument('--checkpoint-directory');p.add_argument('--run-phase',choices=('full','train','rsi','audit'));a=p.parse_args()
     if not re.fullmatch('[0-9a-f]{64}',a.source_sha): raise ValueError('Source archive SHA256 is required')
-    config=validate_config(read(a.config)); root=Path(config['work_root']); root.mkdir(parents=True,exist_ok=True)
+    config=validate_config(read(a.config))
+    if a.run_phase: config['run_phase']=a.run_phase
+    root=Path(config['work_root']); root.mkdir(parents=True,exist_ok=True)
     # Training, restore, retry-upload and cleanup share the same local slots.
     # A second cell/process must never reclaim files from a running campaign.
     with (root/'.campaign.lock').open('a') as lock:

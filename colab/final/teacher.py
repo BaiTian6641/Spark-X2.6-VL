@@ -19,6 +19,8 @@ SYSTEM=('You are the external instructor for an English/Chinese multimodal train
         'This request only changes replay priority of the original source record; no answer/prompt edits.')
 
 def eligibility(config):
+    if config.get('rsi_mode') in ('vision_self_improvement','teacher_subagent_v8'):
+        return {'provider':'local_or_subagent','model':str(config.get('rsi_mode')),'permits_dataset_review':True}
     if config.get('instructor_enabled') is True:
         if config.get('instructor_model',MODEL)!=MODEL:
             raise ValueError('The configured instructor must be the explicitly selected mimo-v2.6-pro')

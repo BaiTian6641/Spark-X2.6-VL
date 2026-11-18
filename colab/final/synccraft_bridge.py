@@ -2053,12 +2053,17 @@ def compute_scene_render_iou(
 def evaluate_synccraft_completion(record: dict[str, Any], completion_text: str) -> dict[str, Any]:
     """Evaluate a Spark-X2.6-VL completion against SyncCraft's compiler, 15-axis SAT, UV, world-ladder, and motion oracles."""
     task = str(record.get("task", ""))
+    meta = record.get("metadata", {}) if isinstance(record.get("metadata"), dict) else {}
     from .sculpted_style_corpus import SCULPTED_STYLE_TASKS, evaluate_sculpted_task_completion
+    from .sculpted_v8_v41_corpus import SCULPTED_V8_TASKS, evaluate_v8_v41_task_completion
+
+    if task in ("synccraft_v41_sculpted_v8", "synccraft_v41_proposer") or (
+        task in SCULPTED_V8_TASKS and ("v8_rubric" in meta or "v8_check" in meta or "modular_task_kind" in meta)
+    ):
+        return evaluate_v8_v41_task_completion(record, completion_text)
 
     if task in SCULPTED_STYLE_TASKS:
         return evaluate_sculpted_task_completion(record, completion_text)
-
-    meta = record.get("metadata", {}) if isinstance(record.get("metadata"), dict) else {}
     think_trace, body = strip_think_block(completion_text)
     result: dict[str, Any] = {
         "task": task,

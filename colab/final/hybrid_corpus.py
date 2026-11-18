@@ -1261,6 +1261,8 @@ def prepare_hybrid_world_v32_data(root: str | Path, token: str | None, config: d
         }
         if bool(config.get("enable_stage6_sculpted_style", False)):
             expected["stage6_sculpted_style"] = True
+        if bool(config.get("enable_stage7_full_vision_frontier", False)):
+            expected["stage7_full_vision_frontier"] = True
         saved_meta = read(build_meta)
         # Backward compatibility when Stage 1-4 BUILD.json omitted stage5_reasoning_mix=False
         if "stage5_reasoning_mix" not in saved_meta and not expected["stage5_reasoning_mix"]:
@@ -1272,6 +1274,7 @@ def prepare_hybrid_world_v32_data(root: str | Path, token: str | None, config: d
     seed = int(config["seed"])
     use_stage5_mix = bool(config.get("enable_stage5_reasoning_mix", False))
     use_stage6_sculpted = bool(config.get("enable_stage6_sculpted_style", False))
+    use_stage7_full = bool(config.get("enable_stage7_full_vision_frontier", False))
     emit("hybrid_corpus_stage", stage="spark_mm_selection")
     spark_mm_packets, spark_mm_comps = _select_spark_mm_packets(root, token, config)
 
@@ -1364,6 +1367,50 @@ def prepare_hybrid_world_v32_data(root: str | Path, token: str | None, config: d
             )
             handoff_comps.append(sculpted_comp_entry)
 
+    stage7_vis_records: list[tuple[dict[str, Any], list[str]]] = []
+    stage7_vis_transport: dict[str, dict[str, Any]] = {}
+    stage7_frontier_records: list[dict[str, Any]] = []
+    stage7_holdout_manifest: dict[str, Any] | None = None
+    stage7_v8_records: list[dict[str, Any]] = []
+    stage7_v8_transport: dict[str, dict[str, Any]] = {}
+
+    if use_stage7_full:
+        from .frontier_stage7_corpus import build_stage7_frontier_and_world_knowledge_stream
+        from .sculpted_v8_v41_corpus import build_stage7_sculpted_v8_v41_records
+        from .visual_primitives_corpus import build_stage7_visual_primitives_and_main_dishes
+
+        emit("hybrid_corpus_stage", stage="stage7_visual_primitives_and_main_dishes")
+        stage7_vis_records, stage7_vis_blobs = build_stage7_visual_primitives_and_main_dishes(root, token, config)
+        if stage7_vis_blobs:
+            s7_vis_comp, stage7_vis_transport = _write_local_tar_component(
+                root,
+                "stage7_visual_primitives",
+                stage7_vis_blobs,
+                seed=seed,
+            )
+            handoff_comps.append(s7_vis_comp)
+
+        emit("hybrid_corpus_stage", stage="stage7_frontier_and_world_knowledge_2026")
+        stage7_frontier_records, stage7_holdout_manifest = build_stage7_frontier_and_world_knowledge_stream(
+            root,
+            token,
+            config,
+        )
+
+        emit("hybrid_corpus_stage", stage="stage7_sculpted_v8_and_blockdsl_v41")
+        stage7_v8_records, stage7_v8_blobs = build_stage7_sculpted_v8_v41_records(
+            seed=seed,
+            scale=float(config.get("stage7_sculpted_v8_scale", 1.0)),
+        )
+        if stage7_v8_blobs:
+            s7_v8_comp, stage7_v8_transport = _write_local_tar_component(
+                root,
+                "stage7_sculpted_v8_v41",
+                stage7_v8_blobs,
+                seed=seed,
+            )
+            handoff_comps.append(s7_v8_comp)
+
     handoff_doc = {
         "schema_version": 1,
         "repo_id": "TassP0lar/SparkX2.6-MM",
@@ -1432,6 +1479,42 @@ def prepare_hybrid_world_v32_data(root: str | Path, token: str | None, config: d
         else:
             all_packets.append({"component": "sculpted_style_v6", "record": rec, "transport": None})
 
+    for rec, frame_names in stage7_vis_records:
+        if frame_names:
+            if not stage7_vis_transport or any(m not in stage7_vis_transport for m in frame_names):
+                continue
+            shards_used = {stage7_vis_transport[m]["shard"] for m in frame_names}
+            if len(shards_used) != 1:
+                continue
+            shard_name = next(iter(shards_used))
+            transport = {
+                "shard": shard_name,
+                "media": [dict(stage7_vis_transport[m]["entry"]) for m in frame_names],
+            }
+            all_packets.append({"component": "stage7_visual_primitives", "record": rec, "transport": transport})
+        else:
+            all_packets.append({"component": "stage7_visual_primitives", "record": rec, "transport": None})
+
+    for rec in stage7_frontier_records:
+        all_packets.append({"component": "stage7_frontier_world_knowledge", "record": rec, "transport": None})
+
+    for rec in stage7_v8_records:
+        frame_names = list(rec.get("frames") or ())
+        if frame_names:
+            if not stage7_v8_transport or any(m not in stage7_v8_transport for m in frame_names):
+                continue
+            shards_used = {stage7_v8_transport[m]["shard"] for m in frame_names}
+            if len(shards_used) != 1:
+                continue
+            shard_name = next(iter(shards_used))
+            transport = {
+                "shard": shard_name,
+                "media": [dict(stage7_v8_transport[m]["entry"]) for m in frame_names],
+            }
+            all_packets.append({"component": "stage7_sculpted_v8_v41", "record": rec, "transport": transport})
+        else:
+            all_packets.append({"component": "stage7_sculpted_v8_v41", "record": rec, "transport": None})
+
     # Enforce qualified context policy across 100% of rows before freezing catalogue
     all_packets, context_filter_stats = _filter_packets_to_context_policy(all_packets, root, config)
 
@@ -1456,6 +1539,18 @@ def prepare_hybrid_world_v32_data(root: str | Path, token: str | None, config: d
         "synccraft_world_v32_records": len(sc_records),
         "stage5_reasoning_and_agentic_records": len(stage5_records),
         "stage6_sculpted_style_records": len(sculpted_records),
+        "stage7_visual_primitives_records": len(stage7_vis_records),
+        "stage7_frontier_world_knowledge_records": len(stage7_frontier_records),
+        "stage7_sculpted_v8_v41_records": len(stage7_v8_records),
+        "stage7_holdout_manifest_summary": (
+            {
+                "supergpqa_holdout_count": stage7_holdout_manifest["supergpqa_holdout_count"],
+                "swebench_pro_holdout_count": stage7_holdout_manifest["swebench_pro_holdout_count"],
+                "deepswe_holdout_count": stage7_holdout_manifest["deepswe_holdout_count"],
+            }
+            if stage7_holdout_manifest
+            else None
+        ),
         "stage5_holdout_manifest_summary": (
             {
                 "gpqa_diamond_held_out_100_percent": stage5_holdout_manifest["gpqa_diamond_held_out_100_percent"],
@@ -1480,6 +1575,8 @@ def prepare_hybrid_world_v32_data(root: str | Path, token: str | None, config: d
     }
     if use_stage6_sculpted:
         build_doc["stage6_sculpted_style"] = True
+    if use_stage7_full:
+        build_doc["stage7_full_vision_frontier"] = True
     write(build_meta, build_doc)
     emit(
         "hybrid_corpus_ready",

@@ -245,7 +245,10 @@ def build_apollo_param_groups(
     base_connector_lr = float(
         config.get("apollo_connector_learning_rate", config.get("adapter_lr", config.get("connector_learning_rate", 2e-4)))
     )
-    base_vision_lr = float(config.get("vision_lr", base_backbone_lr * 0.5))
+    base_vision_lr = float(config.get("vision_lr", config.get("vision_learning_rate", base_backbone_lr * 0.5)))
+    base_engram_lr = float(
+        config.get("engram_lr", config.get("engram_learning_rate", base_connector_lr))
+    )
     base_output_lr = float(config.get("output_lr", config.get("audio_output_learning_rate", 5e-6)))
     apollo_scale = float(
         config.get("apollo_scale", 128.0 if scale_kind == "tensor" and rank_val == 1 else 1.0)
@@ -267,6 +270,7 @@ def build_apollo_param_groups(
         if not param.requires_grad or id(param) in seen:
             continue
         seen.add(id(param))
+        is_engram_mhc = group_tag == "engram_mhc" or name.startswith(("engram_anchors.", "loop_controllers."))
         is_connector = (
             group_tag in ("connectors", "visual_adapters")
             or ".bridge." in name
@@ -279,9 +283,13 @@ def build_apollo_param_groups(
         wd = 0.0 if no_decay else weight_decay
 
         target_lr = (
-            base_connector_lr
-            if is_connector
-            else (base_output_lr if is_audio_out else (base_vision_lr if is_vision else base_backbone_lr))
+            base_engram_lr
+            if is_engram_mhc
+            else (
+                base_connector_lr
+                if is_connector
+                else (base_output_lr if is_audio_out else (base_vision_lr if is_vision else base_backbone_lr))
+            )
         )
 
         if is_high_precision_small_or_sensitive_param(

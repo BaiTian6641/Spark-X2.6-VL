@@ -43,8 +43,11 @@ def loss_weights(catalogue,order,config):
 def _lr_for_group_and_name(group:str,name:str,config:dict)->float:
     base_lr=float(config.get('backbone_lr',config.get('learning_rate',1e-4)))
     conn_lr=float(config.get('adapter_lr',config.get('connector_learning_rate',base_lr)))
-    vis_lr=float(config.get('vision_lr',base_lr*0.5))
+    engram_lr=float(config.get('engram_lr',config.get('engram_learning_rate',conn_lr)))
+    vis_lr=float(config.get('vision_lr',config.get('vision_learning_rate',base_lr*0.5)))
     out_lr=float(config.get('output_lr',config.get('audio_output_learning_rate',base_lr)))
+    if group=='engram_mhc' or name.startswith(('engram_anchors.','loop_controllers.')):
+        return engram_lr
     if group in ('connectors','visual_adapters') or '.bridge.' in name or 'default_voice' in name or 'visual_cross_attn' in name:
         return conn_lr
     if group in ('speech_output','sound_output'):
@@ -218,7 +221,7 @@ def _save_model_safetensors(model, path):
         seen_ptrs.add((ptr, tensor.shape, tensor.stride()))
         cpu_t = tensor.detach().contiguous().cpu()
         dt = dtype_map[cpu_t.dtype]
-        raw = bytes(cpu_t.view(torch.uint8).reshape(-1).numpy())
+        raw = bytes(cpu_t.reshape(-1).view(torch.uint8).numpy())
         end = offset + len(raw)
         header[name] = {'dtype': dt, 'shape': list(cpu_t.shape), 'data_offsets': [offset, end]}
         blobs.append(raw)
@@ -322,6 +325,8 @@ def checkpoint(model,optimizer,scheduler,state,root,config,bound,store,defer_upl
     if torch.cuda.is_available(): torch.cuda.synchronize()
     _save_model_safetensors(model, directory/'model.safetensors')
     torch.save(optimizer.state_dict(),directory/'optimizer.pt'); torch.save(scheduler.state_dict(),directory/'scheduler.pt'); torch.save(rng_state(),directory/'rng.pt')
+    if hasattr(model,'has_tier1b_state') and model.has_tier1b_state():
+        torch.save(model.tier1b_state_dict(),directory/'tier1b_optim.pt')
     write(directory/'STATE.json',state); write(directory/'config.json',config); write(directory/'BINDING.json',bound); write(directory/'PARAMETERS.json',{'sample_sha256':sample_hash(model),'census':census(model)})
     copy_reload_assets(model,directory)
     for name in ('corpus.report.json','BUILD.json'):
@@ -381,7 +386,8 @@ def load_checkpoint(directory,config,bound,model=None,load_optimizer=True,device
         coat_ctrl.rebuild_weight_caches()
     rebind_assets(model,directory)
     if sample_hash(model)!=read(directory/'PARAMETERS.json')['sample_sha256']: raise ValueError('Reloaded parameter samples differ')
-    optimizer=optimizer_for(model,config)
+    eff_opt_cfg={**config,**(state.get('stage_opt_overrides') or {})}
+    optimizer=optimizer_for(model,eff_opt_cfg)
     scheduler=_build_scheduler(
         optimizer,
         kind=state.get('scheduler_kind','cosine'),
@@ -390,6 +396,8 @@ def load_checkpoint(directory,config,bound,model=None,load_optimizer=True,device
     )
     if load_optimizer:
         optimizer.load_state_dict(torch.load(directory/'optimizer.pt',map_location='cpu',weights_only=True)); scheduler.load_state_dict(torch.load(directory/'scheduler.pt',map_location='cpu',weights_only=True))
+        if (directory/'tier1b_optim.pt').is_file() and hasattr(model,'load_tier1b_state_dict'):
+            model.load_tier1b_state_dict(torch.load(directory/'tier1b_optim.pt',map_location='cpu',weights_only=True))
     set_rng(torch.load(directory/'rng.pt',map_location='cpu',weights_only=True))
     return model,optimizer,scheduler,state
 
@@ -505,13 +513,29 @@ class Campaign:
 
         stage_mode=stage.get('stage_mode')
         unfreeze_vis=int(stage.get('unfreeze_vision_last_n_layers',0))
+        is_frozen_spark=(
+            bool(stage.get('alignment_only',False))
+            or stage_mode in ('alignment_only','frozen_spark_connector','frozen_spark_cross_attn','vision_late_unfreeze','defrost_loop_engram')
+        )
+        stage_opt_overrides={
+            k:stage[k]
+            for k in (
+                'learning_rate','backbone_lr','apollo_learning_rate',
+                'connector_learning_rate','adapter_lr','apollo_connector_learning_rate',
+                'vision_lr','vision_learning_rate',
+                'engram_lr','engram_learning_rate',
+                'warmup_ratio','clip_norm',
+            )
+            if k in stage
+        }
+        stage_cfg={**self.c,**stage_opt_overrides}
         self.model.set_stage(
             stage.get('alignment_only',False),
             stage_mode=stage_mode,
             unfreeze_vision_last_n_layers=unfreeze_vis,
         )
         self.model.train()
-        coat_ctrl=ensure_coat_for_model(self.model,self.c)
+        coat_ctrl=ensure_coat_for_model(self.model,stage_cfg)
 
         microbatch=self.c['microbatch_size']; accumulation=self.c['gradient_accumulation']//microbatch
         cursor=CommittedCursor(order,self.state.get('cursor') if resume else None)
@@ -522,18 +546,22 @@ class Campaign:
             if stage['name'] not in self.state['completed_stages']: self.state['completed_stages'].append(stage['name'])
             return
 
-        warmup=round(planned*self.c['warmup_ratio'])
-        optimizer=optimizer_for(self.model,self.c)
+        warmup=round(planned*float(stage_cfg['warmup_ratio']))
+        optimizer=optimizer_for(self.model,stage_cfg)
         scheduler=_build_scheduler(optimizer,kind='cosine',num_warmup_steps=warmup,num_training_steps=planned)
         if stage.get('inherit_parent_optimizer') and not resume:
             lrs=[g['lr'] for g in optimizer.param_groups]
             saved=Path(self.state['last_checkpoint_local'])
             optimizer.load_state_dict(torch.load(saved/'optimizer.pt',map_location='cpu',weights_only=True))
             for group,lr in zip(optimizer.param_groups,lrs): group['lr']=lr; group['initial_lr']=lr
+            if (saved/'tier1b_optim.pt').is_file() and hasattr(self.model,'load_tier1b_state_dict'):
+                self.model.load_tier1b_state_dict(torch.load(saved/'tier1b_optim.pt',map_location='cpu',weights_only=True))
         if resume:
             saved=Path(self.state['last_checkpoint_local'])
             optimizer.load_state_dict(torch.load(saved/'optimizer.pt',map_location='cpu',weights_only=True))
             scheduler.load_state_dict(torch.load(saved/'scheduler.pt',map_location='cpu',weights_only=True))
+            if (saved/'tier1b_optim.pt').is_file() and hasattr(self.model,'load_tier1b_state_dict'):
+                self.model.load_tier1b_state_dict(torch.load(saved/'tier1b_optim.pt',map_location='cpu',weights_only=True))
             set_rng(torch.load(saved/'rng.pt',map_location='cpu',weights_only=True))
 
         self.state.update(
@@ -541,10 +569,11 @@ class Campaign:
             alignment_only=stage.get('alignment_only',False),
             stage_mode=stage_mode,
             unfreeze_vision_last_n_layers=unfreeze_vis,
+            stage_opt_overrides=stage_opt_overrides,
             planned_updates=planned,
             warmup_steps=warmup,
             scheduler_kind='cosine',
-            optimizer_profile=self.c.get('optimizer_profile','apollo_coat'),
+            optimizer_profile=stage_cfg.get('optimizer_profile','apollo_coat'),
             order_sha256=cursor.order_sha256,
         )
         weights=stage.get('fixed_loss_weights') or loss_weights(self.catalogue,order,self.c)
@@ -640,6 +669,7 @@ class Campaign:
 
                     if not torch.isfinite(micro_loss_sum):
                         accumulator.zero_buffers()
+                        if hasattr(self.model,'zero_tier1b_buffers'): self.model.zero_tier1b_buffers()
                         raise RuntimeError('Nonfinite microbatch loss encountered; rolled back merged gradient buffer before step')
 
                     mb_units=max(1,int(result.get('supervised_units',len(batch['examples']))))
@@ -649,8 +679,8 @@ class Campaign:
                     with accumulator.microbatch(weight=mb_weight,supervised_units=mb_units):
                         if micro_loss_sum.requires_grad:
                             micro_loss_sum.backward()
-                        elif not stage.get('alignment_only',False):
-                            raise RuntimeError('Full-Spark microbatch loss is detached from autograd graph')
+                        elif not is_frozen_spark or stage_mode=='defrost_loop_engram':
+                            raise RuntimeError('Full-Spark or Loop-Engram microbatch loss is detached from autograd graph')
                     micro_loss_sum=None
                     if is_long_mb:
                         torch.cuda.empty_cache()
@@ -665,25 +695,44 @@ class Campaign:
                         break
                     continue
 
-                if not stage.get('alignment_only',False):
+                if not is_frozen_spark:
                     spark_buf_norm=0.0
                     for group,_name,p in self.model.named_groups():
                         if group=='spark' and id(p) in accumulator.buffers:
                             spark_buf_norm+=float(accumulator.buffers[id(p)].detach().float().norm())
                     if spark_buf_norm<=0.0:
                         accumulator.zero_buffers()
+                        if hasattr(self.model,'zero_tier1b_buffers'): self.model.zero_tier1b_buffers()
                         raise RuntimeError('Spark full-parameter gradient path is absent')
+                elif stage_mode=='defrost_loop_engram':
+                    eng_buf_norm=0.0
+                    for group,_name,p in self.model.named_groups():
+                        if group=='engram_mhc' and id(p) in accumulator.buffers:
+                            eng_buf_norm+=float(accumulator.buffers[id(p)].detach().float().norm())
+                    if eng_buf_norm<=0.0:
+                        accumulator.zero_buffers()
+                        if hasattr(self.model,'zero_tier1b_buffers'): self.model.zero_tier1b_buffers()
+                        raise RuntimeError('Loop-Engram defrost gradient path is absent')
 
                 denom=float(max(1,window_tokens if norm_mode=='per_token' else window_records))
+                base_engram_lr=float(stage_cfg.get('engram_lr',stage_cfg.get('engram_learning_rate',stage_cfg.get('connector_learning_rate',1.2e-4))))
+                lr_ratio=1.0
+                if optimizer.param_groups:
+                    g0=optimizer.param_groups[0]
+                    if float(g0.get('initial_lr',0.0))>0.0:
+                        lr_ratio=float(g0['lr'])/float(g0['initial_lr'])
                 step_stats=accumulator.step(
                     optimizer,
                     scheduler,
-                    max_grad_norm=float(self.c['clip_norm']),
+                    max_grad_norm=float(stage_cfg['clip_norm']),
                     post_scale=1.0/denom,
                     invalidate_caches_fn=inv_fn,
                 )
                 if not step_stats.finite or not step_stats.applied:
+                    if hasattr(self.model,'zero_tier1b_buffers'): self.model.zero_tier1b_buffers()
                     raise RuntimeError('Nonfinite merged gradient norm detected; optimizer step aborted cleanly')
+                if hasattr(self.model,'step_tier1b_sparse_adam'):
+                    self.model.step_tier1b_sparse_adam(lr=base_engram_lr*lr_ratio,denom=denom)
 
                 # Commit cursor ONLY at completed optimizer step boundaries!
                 cursor.commit(window_records)
@@ -1006,6 +1055,9 @@ class Campaign:
     def vision_self_improving_rsi(self,round_no):
         from .vision_rsi import run_vision_self_improvement_round
         return run_vision_self_improvement_round(self,round_no)
+    def teacher_subagent_rsi(self,round_no):
+        from .vision_rsi import run_vision_self_improvement_round
+        return run_vision_self_improvement_round(self,round_no)
     def qualify_instructor_format(self):
         from .teacher import Instructor
         import torch
@@ -1047,7 +1099,7 @@ class Campaign:
         if phase in ('rsi','audit'):
             missing={s['name'] for s in self.c['stages']}-set(self.state.get('completed_stages',[]))
             if missing: raise RuntimeError('Full fine-tune stages are incomplete: '+','.join(sorted(missing)))
-        is_vision_rsi=(self.c.get('rsi_mode')=='vision_self_improvement' or int(self.c.get('vision_rsi_rounds',0))>0)
+        is_vision_rsi=(self.c.get('rsi_mode') in ('vision_self_improvement','teacher_subagent_v8') or int(self.c.get('vision_rsi_rounds',0))>0)
         target_rsi_rounds=int(self.c.get('vision_rsi_rounds',0)) if is_vision_rsi else int(self.c.get('instructor_rounds',0))
         if phase=='audit' and len(self.state.get('rsi_rounds',[]))!=target_rsi_rounds:
             raise RuntimeError('All configured RSI rounds must complete before result checking')

@@ -12,8 +12,9 @@ Key contracts:
 from __future__ import annotations
 from contextlib import contextmanager
 from contextvars import ContextVar
-import functools, hashlib, math, sys
+import functools, hashlib, math, re, sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 import numpy as np
 import torch
@@ -502,7 +503,7 @@ def _write_safetensors_dict(tensors: dict[str, torch.Tensor], dest: Path, metada
     for name, t in tensors.items():
         cpu_t = t.detach().contiguous().cpu()
         dt = dtype_map[cpu_t.dtype]
-        raw = bytes(cpu_t.view(torch.uint8).reshape(-1).numpy())
+        raw = bytes(cpu_t.reshape(-1).view(torch.uint8).numpy())
         end = offset + len(raw)
         header[name] = {'dtype': dt, 'shape': list(cpu_t.shape), 'data_offsets': [offset, end]}
         blobs.append(raw)
@@ -600,11 +601,19 @@ def export_spark_native_fp8_safetensors(model: nn.Module, path: str | Path) -> d
             continue
         seen_ptrs.add(sig)
         t_cpu = tensor.detach().contiguous().cpu()
-        if (
+        is_spark_fp8_target = (
             name.startswith('spark.model.layers.')
             and any(name.endswith(sfx) for sfx in _FP8_TARGET_SUFFIXES)
             and t_cpu.ndim == 2
-        ):
+        )
+        is_engram_fp8_target = (
+            name.startswith('engram_anchors.')
+            and t_cpu.ndim == 2
+            and min(t_cpu.shape) >= 256
+            and not name.endswith(('tier1a_hot.weight', 'tier1b_cold_weight'))
+            and float(t_cpu.abs().max().item()) > 1e-8
+        )
+        if is_spark_fp8_target or is_engram_fp8_target:
             w_f32 = t_cpu.to(torch.float32)
             scale = (w_f32.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12) / fp8_max).to(torch.bfloat16)
             w_fp8 = (w_f32 / scale.to(torch.float32)).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
@@ -627,28 +636,46 @@ def export_spark_native_fp8_safetensors(model: nn.Module, path: str | Path) -> d
     return {'quantized_linear_tensors': quantized_count, 'residual_format': 'q4g128', 'bytes': dest.stat().st_size}
 
 
-def load_spark_native_safetensors(model: nn.Module, path: str | Path) -> None:
+def load_spark_native_safetensors(
+    model: nn.Module,
+    path: str | Path,
+    *,
+    allow_missing_loop_engram: bool = False,
+) -> None:
     """Load standard BF16 `model.safetensors` or channelwise `F8_E4M3` (+ optional `q4g128` sub-LSB residual) `model.safetensors`."""
     sf_path = Path(path)
-    aux_suffixes = ('.weight_scale', '.input_scale', '.weight_res_q4', '.weight_res_scale')
+    aux_suffixes = ('_scale', '_res_q4', '_res_scale', '.input_scale')
+    param_map = dict(model.named_parameters())
+    buf_map = dict(model.named_buffers())
     try:
         from safetensors import safe_open
         from safetensors.torch import load_model
         with safe_open(str(sf_path), framework='pt', device='cpu') as f:
             sf_keys = set(f.keys())
-            has_fp8 = any(k.endswith('.weight_scale') for k in sf_keys)
+            has_fp8 = any(
+                (k not in param_map and k not in buf_map and k.endswith('_scale'))
+                for k in sf_keys
+            )
             if not has_fp8:
-                strict = not hasattr(getattr(model, 'spark', None), 'tie_weights')
-                load_model(model, str(sf_path), strict=strict, device='cpu')
-                if hasattr(getattr(model, 'spark', None), 'tie_weights'):
+                has_tie = hasattr(getattr(model, 'spark', None), 'tie_weights')
+                strict = (not has_tie) and (not allow_missing_loop_engram)
+                missing_sf, unexpected_sf = load_model(model, str(sf_path), strict=strict, device='cpu')
+                if has_tie:
                     model.spark.tie_weights()
+                missing = set(missing_sf) - {'spark.lm_head.weight'}
+                if allow_missing_loop_engram:
+                    missing = {k for k in missing if not k.startswith(('loop_controllers.', 'engram_anchors.'))}
+                if missing:
+                    raise RuntimeError(f'Missing parameters when loading SparkNative safetensors: {sorted(missing)[:8]}')
+                if unexpected_sf:
+                    raise RuntimeError(f'Unexpected parameters when loading SparkNative safetensors: {sorted(unexpected_sf)[:8]}')
+                if hasattr(model, '_ensure_tier1b_cpu_pinned'):
+                    model._ensure_tier1b_cpu_pinned()
                 return
 
-            param_map = dict(model.named_parameters())
-            buf_map = dict(model.named_buffers())
             loaded: set[str] = set()
             for key in sorted(sf_keys):
-                if key.endswith(aux_suffixes):
+                if key not in param_map and key not in buf_map and key.endswith(aux_suffixes):
                     continue
                 target = param_map.get(key)
                 if target is None:
@@ -674,11 +701,9 @@ def load_spark_native_safetensors(model: nn.Module, path: str | Path) -> None:
     except ModuleNotFoundError:
         tensors = _read_safetensors_dict(sf_path)
         sf_keys = set(tensors.keys())
-        param_map = dict(model.named_parameters())
-        buf_map = dict(model.named_buffers())
         loaded = set()
         for key in sorted(sf_keys):
-            if key.endswith(aux_suffixes):
+            if key not in param_map and key not in buf_map and key.endswith(aux_suffixes):
                 continue
             target = param_map.get(key)
             if target is None:
@@ -704,7 +729,12 @@ def load_spark_native_safetensors(model: nn.Module, path: str | Path) -> None:
 
     if hasattr(getattr(model, 'spark', None), 'tie_weights'):
         model.spark.tie_weights()
-    missing = set(param_map.keys()) - loaded - {'spark.lm_head.weight'}
+    if hasattr(model, '_ensure_tier1b_cpu_pinned'):
+        model._ensure_tier1b_cpu_pinned()
+    expected_all = set(param_map.keys()) | {k for k in buf_map if k.endswith('tier1b_cold_weight')}
+    missing = expected_all - loaded - {'spark.lm_head.weight'}
+    if allow_missing_loop_engram:
+        missing = {k for k in missing if not k.startswith(('loop_controllers.', 'engram_anchors.'))}
     if missing:
         raise RuntimeError(f'Missing parameters when loading SparkNative safetensors: {sorted(missing)[:8]}')
 
@@ -775,6 +805,18 @@ class SparkNative(nn.Module):
         if n_xattn > 0:
             self.install_visual_cross_attention(n_xattn)
 
+        # Stage-7 Looped 48L Dual-mHC + `+1.0B` Multimodal MoE-Engram (`En1B-A256M`).
+        self.enable_loop_engram = bool(policy.get('enable_loop_engram', False))
+        self.loop_start = 0
+        self.loop_end = 0
+        self.loop_passes = 1
+        self.max_loop_passes = 1
+        self._engram_total_buckets = 0
+        self.loop_controllers = nn.ModuleDict()
+        self.engram_anchors = nn.ModuleDict()
+        if self.enable_loop_engram:
+            self._install_loop_and_engram(policy, spark_dtype=spark_dtype)
+
         if self.modalities=='omni':
             from transformers import WhisperModel,WhisperConfig,WhisperFeatureExtractor,ClapFeatureExtractor
             whisper=(WhisperModel.from_pretrained(paths['speech_in'],local_files_only=True,dtype=torch.float32) if pretrained else WhisperModel(WhisperConfig.from_pretrained(paths['speech_in'],local_files_only=True)))
@@ -804,7 +846,13 @@ class SparkNative(nn.Module):
                 init_sf = init_dir / 'model.safetensors'
                 if not init_sf.is_file():
                     raise FileNotFoundError(f'Warm-start init_from_release_dir missing model.safetensors: {init_sf}')
-                load_spark_native_safetensors(self, init_sf)
+                load_spark_native_safetensors(
+                    self,
+                    init_sf,
+                    allow_missing_loop_engram=bool(
+                        self.enable_loop_engram and policy.get('allow_warmstart_missing_loop_engram', True)
+                    ),
+                )
                 self._warm_started_from = str(init_sf)
             # Move Spark + SigLIP2 preserving their configured dtypes; keep connectors/adapters in float32.
             self.spark.to(device=device,dtype=spark_dtype)
@@ -812,9 +860,146 @@ class SparkNative(nn.Module):
             self.vision.to(device=device,dtype=vision_dtype)
             for conn in self._connector_modules():
                 conn.to(device=device,dtype=torch.float32)
+            if self.enable_loop_engram:
+                self.loop_controllers.to(device=device, dtype=torch.float32)
+                self.engram_anchors.to(device=device)
 
         self.freeze_infrastructure()
         self.gradient_checkpointing_enable()
+
+    def _install_loop_and_engram(self, policy: dict[str, Any], *, spark_dtype: torch.dtype) -> None:
+        from .loop_engram import (
+            MultimodalTieredMoEEngram,
+            SublayerDualMHC,
+            patch_spark_attention_for_loglinear_kv,
+        )
+
+        layers = getattr(getattr(self.spark, 'model', None), 'layers', None)
+        if layers is None or len(layers) == 0:
+            raise ValueError('Cannot enable Loop-Engram: spark.model.layers not found')
+        n_layers = len(layers)
+        default_start = 12 if n_layers >= 24 else max(1, n_layers // 3)
+        default_end = 24 if n_layers >= 24 else max(default_start + 1, 2 * (n_layers // 3))
+        self.loop_start = int(policy.get('loop_start', default_start))
+        self.loop_end = int(policy.get('loop_end', default_end))
+        if not (0 <= self.loop_start < self.loop_end <= n_layers):
+            raise ValueError(f'Invalid loop range [{self.loop_start}, {self.loop_end}) for n_layers={n_layers}')
+        self.loop_passes = max(1, int(policy.get('loop_passes', 2)))
+        self.max_loop_passes = max(self.loop_passes, int(policy.get('max_loop_passes', self.loop_passes)))
+        adapter_rank = int(policy.get('loop_pass_adapter_rank', 16))
+        rms_eps = float(getattr(self.config, 'rms_norm_eps', 1e-6))
+
+        self.loop_controllers = nn.ModuleDict(
+            {
+                str(idx): SublayerDualMHC(
+                    width=self.hidden,
+                    pass_adapter_rank=adapter_rank,
+                    max_passes=self.max_loop_passes,
+                    rmsnorm_eps=rms_eps,
+                )
+                for idx in range(self.loop_start, self.loop_end)
+            }
+        )
+
+        if n_layers >= 32:
+            default_anchors = [3, 7, 11, 15, 19, 23, 27, 31]
+        else:
+            step = max(1, n_layers // min(4, n_layers))
+            default_anchors = sorted({min(n_layers - 1, (i + 1) * step - 1) for i in range(min(4, n_layers))})
+        raw_anchors = policy.get('engram_anchors', default_anchors)
+        anchor_indices = sorted({int(a) for a in raw_anchors if 0 <= int(a) < n_layers})
+
+        hot_b = int(policy.get('engram_hot_buckets', 8192))
+        cold_b = int(policy.get('engram_cold_buckets', 32768))
+        self._engram_total_buckets = hot_b + cold_b
+        eng_dim = int(policy.get('engram_dim', 256))
+        shared_rank = int(policy.get('engram_shared_rank', 1536))
+        num_experts = int(policy.get('engram_num_experts', 16))
+        top_k = int(policy.get('engram_top_k', 4))
+        expert_rank = int(policy.get('engram_expert_rank', 1368))
+        route_dim = int(policy.get('engram_route_dim', 64))
+        offload_cpu = bool(policy.get('engram_offload_tier1b_cpu', True))
+        eng_dtype = spark_dtype if spark_dtype in (torch.bfloat16, torch.float16, torch.float32) else torch.bfloat16
+
+        self.engram_anchors = nn.ModuleDict(
+            {
+                str(idx): MultimodalTieredMoEEngram(
+                    width=self.hidden,
+                    hot_buckets=hot_b,
+                    cold_buckets=cold_b,
+                    eng_dim=eng_dim,
+                    shared_rank=shared_rank,
+                    num_experts=num_experts,
+                    top_k=top_k,
+                    expert_rank=expert_rank,
+                    route_dim=route_dim,
+                    max_passes=self.max_loop_passes,
+                    offload_tier1b_cpu=offload_cpu,
+                    param_dtype=eng_dtype,
+                )
+                for idx in anchor_indices
+            }
+        )
+        patch_spark_attention_for_loglinear_kv(
+            self.spark,
+            exact_threshold=int(policy.get('loglinear_kv_threshold', 8192)),
+        )
+
+    def _ensure_tier1b_cpu_pinned(self) -> None:
+        for mod in self.engram_anchors.values():
+            cold = mod._buffers.get('tier1b_cold_weight', None)
+            if cold is not None and mod.offload_tier1b_cpu:
+                cpu_t = cold.detach().to(device='cpu', dtype=mod.tier1a_hot.weight.dtype)
+                if torch.cuda.is_available() and not cpu_t.is_pinned():
+                    cpu_t = cpu_t.pin_memory()
+                mod._buffers['tier1b_cold_weight'] = cpu_t
+
+    def has_tier1b_state(self) -> bool:
+        return any(
+            getattr(mod, 'offload_tier1b_cpu', False) and getattr(mod, 'tier1b_cold_weight', None) is not None
+            for mod in self.engram_anchors.values()
+        )
+
+    def tier1b_state_dict(self) -> dict[str, Any]:
+        return {k: mod.tier1b_optim_state_dict() for k, mod in self.engram_anchors.items()}
+
+    def load_tier1b_state_dict(self, state: dict[str, Any]) -> None:
+        if not isinstance(state, dict):
+            return
+        for k, mod in self.engram_anchors.items():
+            if k in state:
+                mod.load_tier1b_optim_state_dict(state[k])
+
+    def zero_tier1b_buffers(self) -> None:
+        for mod in self.engram_anchors.values():
+            mod.zero_tier1b_buffers()
+
+    def step_tier1b_sparse_adam(self, *, lr: float = 1.2e-4, denom: float = 1.0) -> None:
+        for mod in self.engram_anchors.values():
+            mod.step_tier1b_sparse_adam(lr=lr, denom=denom)
+
+    def loop_engram_telemetry(self) -> dict[str, Any]:
+        if not self.enable_loop_engram:
+            return {'enabled': False}
+        total_gpu = sum(p.numel() for p in self.engram_anchors.parameters()) + sum(
+            p.numel() for p in self.loop_controllers.parameters()
+        )
+        total_cpu_t1b = sum(
+            int(mod.tier1b_cold_weight.numel())
+            for mod in self.engram_anchors.values()
+            if mod.tier1b_cold_weight is not None
+        )
+        return {
+            'enabled': True,
+            'loop_range': [self.loop_start, self.loop_end],
+            'loop_passes': self.loop_passes,
+            'effective_layers': len(self.spark.model.layers) + (self.loop_end - self.loop_start) * (self.loop_passes - 1),
+            'added_gpu_parameters': total_gpu,
+            'added_cpu_tier1b_elements': total_cpu_t1b,
+            'total_added_capacity': total_gpu + total_cpu_t1b,
+            'controllers': {f'L{k}': c.controller_telemetry() for k, c in self.loop_controllers.items()},
+            'engrams': {f'L{k}': m.engram_telemetry() for k, m in self.engram_anchors.items()},
+        }
 
     def _connector_modules(self) -> list[nn.Module]:
         mods: list[nn.Module] = []
@@ -1075,6 +1260,21 @@ class SparkNative(nn.Module):
         if post_ln is not None:
             post_ln.requires_grad_(True)
 
+    def _freeze_unused_loop_pass_params(self) -> None:
+        if not getattr(self, 'enable_loop_engram', False) or self.max_loop_passes <= self.loop_passes:
+            return
+        for ctrl in self.loop_controllers.values():
+            if self.loop_passes < 3:
+                if getattr(ctrl, 'p3_extra_gain', None) is not None:
+                    ctrl.p3_extra_gain.requires_grad_(False)
+                if getattr(ctrl, 'p3_ffn_extra_gain', None) is not None:
+                    ctrl.p3_ffn_extra_gain.requires_grad_(False)
+            for p_idx in range(self.loop_passes, self.max_loop_passes):
+                if ctrl.pass_down is not None and p_idx < len(ctrl.pass_down):
+                    ctrl.pass_down[p_idx].requires_grad_(False)
+                if ctrl.pass_up is not None and p_idx < len(ctrl.pass_up):
+                    ctrl.pass_up[p_idx].requires_grad_(False)
+
     def set_stage(
         self,
         alignment_only=False,
@@ -1082,13 +1282,29 @@ class SparkNative(nn.Module):
         stage_mode: str | None = None,
         unfreeze_vision_last_n_layers: int = 0,
     ):
-        """Configure parameter trainability across staged connector, gated cross-attn, vision, and full-Spark runs."""
+        """Configure parameter trainability across staged connector, defrost_loop_engram, vision, and full-Spark runs."""
         mode = stage_mode or ('alignment_only' if alignment_only else 'full_spark')
         self.requires_grad_(True)
         self.freeze_infrastructure()
+        self._freeze_unused_loop_pass_params()
+
+        if mode == 'defrost_loop_engram':
+            for name in ('spark', 'vision', 'motion', 'speech_in', 'sound_in'):
+                mod = getattr(self, name, None)
+                if mod is not None:
+                    mod.requires_grad_(False)
+            speech_out = getattr(self, 'speech_out', None)
+            if speech_out is not None and getattr(speech_out, 'talker', None) is not None:
+                speech_out.talker.requires_grad_(False)
+            sound_out = getattr(self, 'sound_out', None)
+            if sound_out is not None and getattr(sound_out, 'dit', None) is not None:
+                sound_out.dit.requires_grad_(False)
+            if unfreeze_vision_last_n_layers > 0:
+                self._unfreeze_late_vision_layers(unfreeze_vision_last_n_layers)
+            return
 
         if mode in ('alignment_only', 'frozen_spark_connector', 'frozen_spark_cross_attn'):
-            for name in ('spark', 'vision', 'motion', 'speech_in', 'sound_in'):
+            for name in ('spark', 'vision', 'motion', 'speech_in', 'sound_in', 'loop_controllers', 'engram_anchors'):
                 mod = getattr(self, name, None)
                 if mod is not None:
                     mod.requires_grad_(False)
@@ -1105,8 +1321,10 @@ class SparkNative(nn.Module):
             return
 
         if mode == 'vision_late_unfreeze':
-            if getattr(self, 'spark', None) is not None:
-                self.spark.requires_grad_(False)
+            for name in ('spark', 'loop_controllers', 'engram_anchors'):
+                mod = getattr(self, name, None)
+                if mod is not None:
+                    mod.requires_grad_(False)
             if getattr(self, 'vision', None) is not None:
                 self._unfreeze_late_vision_layers(max(1, int(unfreeze_vision_last_n_layers or 2)))
             return
@@ -1151,9 +1369,11 @@ class SparkNative(nn.Module):
             'audio_clock',
             'visual_cross_attn',
         }
+        engram_mhc_prefixes = {'loop_controllers', 'engram_anchors'}
         for name,p in self.named_parameters():
             prefix=name.split('.')[0]
-            if prefix in connector_prefixes: group='connectors'
+            if prefix in engram_mhc_prefixes: group='engram_mhc'
+            elif prefix in connector_prefixes: group='connectors'
             elif prefix=='speech_out': group='speech_output'
             elif prefix=='sound_out': group='sound_output'
             else: group=prefix
@@ -1162,7 +1382,10 @@ class SparkNative(nn.Module):
     def tile_views(self,image,video,*,alpha=None,is_pixel_art_atlas=False):
         from PIL import Image
         w,h=image.size; views=[(image,alpha,(0.,0.,1.,1.),self.policy['thumbnail_patches'])]
-        if not video and self.policy['detail_tiles']:
+        default_min_tile=224 if getattr(self,'enable_loop_engram',False) else 0
+        min_tile_dim=int(self.policy.get('min_tile_source_dim',default_min_tile))
+        allow_tiles=bool(is_pixel_art_atlas) or min(w,h)>=min_tile_dim
+        if not video and self.policy['detail_tiles'] and allow_tiles:
             if self.policy['detail_tiles'] not in (2,4): raise ValueError('Qualified tile count is 0/2/4')
             nx,ny=(2,2) if self.policy['detail_tiles']==4 else ((2,1) if w>=h else (1,2))
             for j in range(ny):
@@ -1328,8 +1551,312 @@ class SparkNative(nn.Module):
         position=self.audio_clock(torch.stack([times/30,torch.sin(times),torch.cos(times),torch.ones_like(times)],dim=-1))[None]
         return (self.sound_projector(torch.cat(parts,dim=1),position=position)+self.modality.weight[3]).to(self.embed_dtype)
 
+    def _xattn_block_for_layer(self, layer_idx: int) -> nn.Module | None:
+        if len(getattr(self, 'visual_cross_attn', ())) == 0:
+            return None
+        layers = getattr(getattr(self.spark, 'model', None), 'layers', None)
+        if layers is None or not (0 <= layer_idx < len(layers)):
+            return None
+        xattn_idx = getattr(layers[layer_idx], '_spark_xattn_idx', None)
+        if isinstance(xattn_idx, int) and 0 <= xattn_idx < len(self.visual_cross_attn):
+            return self.visual_cross_attn[xattn_idx]
+        return None
+
+    def _run_single_spark_layer(
+        self,
+        layer_idx: int,
+        hidden: torch.Tensor,
+        causal_masks: dict[str, Any],
+        rope_cos_sin: dict[str, Any],
+        raw_attention_mask_2d: torch.Tensor | None,
+        past_key_values: Any,
+        virtual_idx: int,
+        cache_position: torch.Tensor,
+        visual_context: torch.Tensor | None,
+        grad_ckpt: bool,
+    ) -> torch.Tensor:
+        from .loop_engram import _SimpleTupleVisitCache, _VisitCache, _attn_accepts_position_embeddings
+        from torch.utils.checkpoint import checkpoint
+
+        layer = self.spark.model.layers[layer_idx]
+        lt = getattr(layer, 'layer_type', None) or getattr(layer.self_attn, 'layer_type', 'full_attention')
+        mask_4d = causal_masks.get(lt, causal_masks.get('full_attention'))
+        pos_emb = rope_cos_sin.get(lt)
+        uses_hf = _attn_accepts_position_embeddings(layer.self_attn)
+
+        if uses_hf:
+            v_cache = (
+                _VisitCache(past_key_values, layer_idx, virtual_idx, kv_dtype=self.embed_dtype)
+                if past_key_values is not None
+                else None
+            )
+
+            def _layer_step(h_in: torch.Tensor) -> torch.Tensor:
+                out = layer(
+                    h_in,
+                    position_embeddings=pos_emb,
+                    attention_mask=mask_4d,
+                    past_key_values=v_cache,
+                    cache_position=cache_position,
+                )
+                return out[0] if isinstance(out, tuple) else out
+
+            if grad_ckpt and (hidden.requires_grad or any(p.requires_grad for p in layer.parameters())):
+                hidden = checkpoint(_layer_step, hidden, use_reentrant=False)
+            else:
+                hidden = _layer_step(hidden)
+        else:
+            use_c = isinstance(past_key_values, _SimpleTupleVisitCache)
+            slot_kv = past_key_values.get_slot(virtual_idx) if use_c else None
+
+            def _synth_step(h_in: torch.Tensor) -> torch.Tensor:
+                out_h, _ = layer(h_in, attention_mask=raw_attention_mask_2d, past_kv=None, use_cache=False)
+                return out_h
+
+            if grad_ckpt and not use_c and (hidden.requires_grad or any(p.requires_grad for p in layer.parameters())):
+                hidden = checkpoint(_synth_step, hidden, use_reentrant=False)
+            else:
+                hidden, next_kv = layer(hidden, attention_mask=raw_attention_mask_2d, past_kv=slot_kv, use_cache=use_c)
+                if use_c:
+                    past_key_values.set_slot(virtual_idx, next_kv)
+
+        xattn_blk = self._xattn_block_for_layer(layer_idx)
+        if xattn_blk is not None and visual_context is not None:
+            if grad_ckpt and (hidden.requires_grad or visual_context.requires_grad or any(p.requires_grad for p in xattn_blk.parameters())):
+                hidden = checkpoint(xattn_blk, hidden, visual_context, use_reentrant=False)
+            else:
+                hidden = xattn_blk(hidden, visual_context)
+        return hidden
+
+    def forward_looped_model(
+        self,
+        *,
+        input_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        token_ids_for_engram: torch.Tensor | None = None,
+        text_token_mask: torch.Tensor | None = None,
+        prev_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        visual_context: torch.Tensor | None = None,
+        past_key_values: Any = None,
+        use_cache: bool = False,
+        num_passes: int | None = None,
+    ) -> SimpleNamespace:
+        """Execute 36-physical -> 48-virtual Dual-mHC Recurrent Loop + `+1B` Multimodal MoE-Engram."""
+        from .loop_engram import (
+            MultimodalTieredMoEEngram,
+            _SimpleTupleVisitCache,
+            _VisitCache,
+            _attn_accepts_position_embeddings,
+            build_spark_loop_context,
+        )
+        from torch.utils.checkpoint import checkpoint
+
+        if inputs_embeds is None:
+            if input_ids is None:
+                raise ValueError('Specify input_ids or inputs_embeds')
+            hidden = self.get_input_embeddings()(input_ids)
+        else:
+            hidden = inputs_embeds.to(self.embed_dtype)
+
+        eff_ids = token_ids_for_engram if token_ids_for_engram is not None else input_ids
+        if eff_ids is None:
+            eff_ids = torch.zeros(hidden.shape[:2], dtype=torch.long, device=hidden.device)
+            eff_text_mask: torch.Tensor | None = torch.zeros(hidden.shape[:2], dtype=torch.bool, device=hidden.device)
+        elif text_token_mask is not None:
+            eff_text_mask = text_token_mask.bool()
+        elif attention_mask is not None and attention_mask.shape == eff_ids.shape:
+            eff_text_mask = attention_mask.bool()
+        else:
+            eff_text_mask = None
+
+        layers = self.spark.model.layers
+        uses_hf = _attn_accepts_position_embeddings(layers[0].self_attn)
+        if use_cache and past_key_values is None:
+            if uses_hf:
+                from transformers.cache_utils import DynamicCache
+
+                past_key_values = DynamicCache()
+            else:
+                past_key_values = _SimpleTupleVisitCache()
+
+        causal_masks, rope_cos_sin, cache_position = build_spark_loop_context(
+            self.spark.model,
+            hidden,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            cfg=self.config,
+        )
+
+        ngram_indices = (
+            MultimodalTieredMoEEngram.compute_ngram_indices(
+                eff_ids,
+                self._engram_total_buckets,
+                prev_ids=prev_ids,
+                text_token_mask=eff_text_mask,
+            )
+            if len(self.engram_anchors) > 0
+            else None
+        )
+        eff_vis_ctx = visual_context if (visual_context is not None and len(getattr(self, 'visual_cross_attn', ())) > 0) else None
+        vis_summary = visual_context.float().mean(dim=1, keepdim=True) if visual_context is not None else None
+        passes = max(1, min(self.max_loop_passes, int(num_passes if num_passes is not None else self.loop_passes)))
+        grad_ckpt = bool(getattr(self.spark.model, 'gradient_checkpointing', False)) and self.training and not use_cache
+
+        z_losses: list[torch.Tensor] = []
+        virtual_idx = 0
+        sup_tok = _SUPPRESS_XATTN_HOOK.set(True)
+        try:
+            # Zone 1: Prelude & Lower Core `[0 .. loop_start)`
+            for idx in range(0, self.loop_start):
+                hidden = self._run_single_spark_layer(
+                    idx,
+                    hidden,
+                    causal_masks,
+                    rope_cos_sin,
+                    attention_mask,
+                    past_key_values,
+                    virtual_idx,
+                    cache_position,
+                    eff_vis_ctx,
+                    grad_ckpt,
+                )
+                if ngram_indices is not None and str(idx) in self.engram_anchors:
+                    eng_delta, z_l = self.engram_anchors[str(idx)].forward_with_z_loss(
+                        hidden,
+                        ngram_indices=ngram_indices,
+                        pass_idx=0,
+                        vis_summary=vis_summary,
+                        text_token_mask=eff_text_mask,
+                        use_grad_checkpoint=grad_ckpt,
+                    )
+                    hidden = hidden + eng_delta
+                    z_losses.append(z_l)
+                virtual_idx += 1
+
+            # Zone 2: Recurrent Sublayer Dual-mHC Core `[loop_start .. loop_end) x passes`
+            streams = torch.stack((hidden, hidden.clone()), dim=0)
+            for p_idx in range(passes):
+                is_extra = p_idx > 0
+                for idx in range(self.loop_start, self.loop_end):
+                    layer = layers[idx]
+                    ctrl = self.loop_controllers[str(idx)]
+                    lt = getattr(layer, 'layer_type', None) or getattr(layer.self_attn, 'layer_type', 'full_attention')
+                    mask_4d = causal_masks.get(lt, causal_masks.get('full_attention'))
+                    pos_emb = rope_cos_sin.get(lt)
+                    xattn_blk = self._xattn_block_for_layer(idx)
+                    v_cache = (
+                        _VisitCache(past_key_values, idx, virtual_idx, kv_dtype=self.embed_dtype)
+                        if (past_key_values is not None and uses_hf)
+                        else past_key_values
+                    )
+                    v_slot = virtual_idx
+
+                    def _mhc_step(
+                        st_in: torch.Tensor,
+                        _ctrl=ctrl,
+                        _layer=layer,
+                        _pos=pos_emb,
+                        _m4d=mask_4d,
+                        _m2d=attention_mask,
+                        _ex=is_extra,
+                        _p=p_idx,
+                        _vc=v_cache,
+                        _vs=v_slot,
+                        _cp=cache_position,
+                        _xb=xattn_blk,
+                        _vctx=eff_vis_ctx,
+                    ) -> torch.Tensor:
+                        return _ctrl(
+                            st_in,
+                            _layer,
+                            _pos,
+                            _m4d,
+                            raw_attention_mask_2d=_m2d,
+                            extra=_ex,
+                            pass_idx=_p,
+                            past_key_values=_vc,
+                            virtual_idx=_vs,
+                            cache_position=_cp,
+                            xattn_block=_xb,
+                            vis_ctx=_vctx,
+                        )
+
+                    can_ckpt_mhc = grad_ckpt and (
+                        streams.requires_grad
+                        or any(p.requires_grad for p in layer.parameters())
+                        or any(p.requires_grad for p in ctrl.parameters())
+                        or (xattn_blk is not None and eff_vis_ctx is not None and any(p.requires_grad for p in xattn_blk.parameters()))
+                    )
+                    if can_ckpt_mhc:
+                        streams = checkpoint(_mhc_step, streams, use_reentrant=False)
+                    else:
+                        streams = _mhc_step(streams)
+
+                    if ngram_indices is not None and str(idx) in self.engram_anchors:
+                        eng_delta, z_l = self.engram_anchors[str(idx)].forward_with_z_loss(
+                            streams[0],
+                            ngram_indices=ngram_indices,
+                            pass_idx=p_idx,
+                            vis_summary=vis_summary,
+                            text_token_mask=eff_text_mask,
+                            use_grad_checkpoint=grad_ckpt,
+                        )
+                        streams = torch.stack((streams[0] + eng_delta, streams[1]), dim=0)
+                        z_losses.append(z_l)
+                    virtual_idx += 1
+
+            hidden = streams[0]
+
+            # Zone 3: Coda `[loop_end .. n_layers)`
+            for idx in range(self.loop_end, len(layers)):
+                hidden = self._run_single_spark_layer(
+                    idx,
+                    hidden,
+                    causal_masks,
+                    rope_cos_sin,
+                    attention_mask,
+                    past_key_values,
+                    virtual_idx,
+                    cache_position,
+                    eff_vis_ctx,
+                    grad_ckpt,
+                )
+                if ngram_indices is not None and str(idx) in self.engram_anchors:
+                    eng_delta, z_l = self.engram_anchors[str(idx)].forward_with_z_loss(
+                        hidden,
+                        ngram_indices=ngram_indices,
+                        pass_idx=0,
+                        vis_summary=vis_summary,
+                        text_token_mask=eff_text_mask,
+                        use_grad_checkpoint=grad_ckpt,
+                    )
+                    hidden = hidden + eng_delta
+                    z_losses.append(z_l)
+                virtual_idx += 1
+        finally:
+            _SUPPRESS_XATTN_HOOK.reset(sup_tok)
+
+        hidden = self.spark.model.norm(hidden)
+        router_z_loss = torch.stack(z_losses).mean() if z_losses else hidden.new_zeros((), dtype=torch.float32)
+        return SimpleNamespace(
+            last_hidden_state=hidden,
+            past_key_values=past_key_values,
+            router_z_loss=router_z_loss,
+        )
+
     def forward_text_only(self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None, **kwargs):
-        """Pure-text fast path calling `self.spark` directly with zero visual module overhead."""
+        """Pure-text fast path calling `self.spark` (or `forward_looped_model`) directly with zero visual module overhead."""
+        if getattr(self, 'enable_loop_engram', False):
+            out = self.forward_looped_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                past_key_values=kwargs.get('past_key_values'),
+                use_cache=bool(kwargs.get('use_cache', False)),
+                prev_ids=kwargs.get('prev_ids'),
+            )
+            logits = self.get_output_embeddings()(out.last_hidden_state)
+            return SimpleNamespace(logits=logits, past_key_values=out.past_key_values, router_z_loss=out.router_z_loss)
         with self._visual_cross_attn_scope(None):
             return self.spark(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
 
@@ -1364,39 +1891,88 @@ class SparkNative(nn.Module):
         except TypeError:
             return img_fn(media['images'], media['times'], media['capture_times'])
 
-    def prefix_with_visual_context(self, row, media, *, for_generation: bool = False) -> tuple[torch.Tensor, torch.Tensor | None]:
-        if row['_family'].endswith('_out') and any(media.get(k) is not None for k in ('audio','motion')):
+    def prefix_with_visual_context_and_ids(
+        self,
+        row: dict[str, Any],
+        media: dict[str, Any],
+        *,
+        for_generation: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
+        if row['_family'].endswith('_out') and any(media.get(k) is not None for k in ('audio', 'motion')):
             raise ValueError('Output target leaked into input encoder')
-        pre,post=self.prompt_parts(
+        pre, post = self.prompt_parts(
             row['prompt'],
-            enable_thinking=bool(row.get('enable_thinking',False)),
+            enable_thinking=bool(row.get('enable_thinking', False)),
             system=row.get('system_prompt'),
             for_generation=for_generation,
         )
-        emb_dtype=self.embed_dtype
-        parts=[self.get_input_embeddings()(pre)]
+        emb_dtype = self.embed_dtype
+        parts = [self.get_input_embeddings()(pre)]
+        tok_parts = [pre]
+        mask_parts = [torch.ones_like(pre, dtype=torch.bool)]
+
         vis_tokens = self._encode_visual_tokens_for_media(media) if media.get('images') else None
         mot_tokens = self.motion_tokens(media.get('motion')) if getattr(self, 'motion_tokens', None) else None
         aud_tokens = self.audio_tokens(media.get('audio'), row['_family']) if getattr(self, 'audio_tokens', None) else None
         for x in (vis_tokens, mot_tokens, aud_tokens):
             if x is not None:
                 parts.append(x.to(emb_dtype))
+                tok_parts.append(torch.zeros((1, x.shape[1]), device=self.device, dtype=torch.long))
+                mask_parts.append(torch.zeros((1, x.shape[1]), device=self.device, dtype=torch.bool))
+
         parts.append(self.get_input_embeddings()(post))
-        return torch.cat(parts,dim=1), vis_tokens
+        tok_parts.append(post)
+        mask_parts.append(torch.ones_like(post, dtype=torch.bool))
+        return (
+            torch.cat(parts, dim=1),
+            vis_tokens,
+            torch.cat(tok_parts, dim=1),
+            torch.cat(mask_parts, dim=1),
+        )
+
+    def prefix_with_visual_context(self, row, media, *, for_generation: bool = False) -> tuple[torch.Tensor, torch.Tensor | None]:
+        embeds, vis_tokens, _, _ = self.prefix_with_visual_context_and_ids(row, media, for_generation=for_generation)
+        return embeds, vis_tokens
 
     def prefix(self,row,media):
         embeds, _ = self.prefix_with_visual_context(row, media, for_generation=False)
         return embeds
 
-    def hidden_states(self,embeds,visual_context=None):
+    def hidden_states(
+        self,
+        embeds,
+        visual_context=None,
+        *,
+        token_ids_for_engram: torch.Tensor | None = None,
+        text_token_mask: torch.Tensor | None = None,
+    ):
         return self.hidden_batch(
             embeds,
             torch.ones(embeds.shape[:2],device=self.device,dtype=torch.long),
             visual_context=visual_context,
+            token_ids_for_engram=token_ids_for_engram,
+            text_token_mask=text_token_mask,
         )
 
-    def hidden_batch(self,embeds,mask,visual_context=None):
+    def hidden_batch(
+        self,
+        embeds,
+        mask,
+        visual_context=None,
+        *,
+        token_ids_for_engram: torch.Tensor | None = None,
+        text_token_mask: torch.Tensor | None = None,
+    ):
         if embeds.shape[1]>self.policy['max_sequence']: raise ValueError('Input exceeds qualified context; no silent truncation')
+        if getattr(self, 'enable_loop_engram', False):
+            return self.forward_looped_model(
+                inputs_embeds=embeds,
+                token_ids_for_engram=token_ids_for_engram,
+                text_token_mask=text_token_mask,
+                attention_mask=mask,
+                visual_context=visual_context,
+                use_cache=False,
+            ).last_hidden_state
         with self._visual_cross_attn_scope(visual_context):
             return self.spark.model(inputs_embeds=embeds,attention_mask=mask,use_cache=False,return_dict=True).last_hidden_state
 
@@ -1407,42 +1983,96 @@ class SparkNative(nn.Module):
             return {**row, 'enable_thinking': False}
         return row
 
+    def _encode_answer_ids_and_labels(self, answer_plus_close: str) -> tuple[torch.Tensor, torch.Tensor, int]:
+        """Tokenize supervised answer, masking `<tool_response>...</tool_response>` spans with `ignore_index=-100`."""
+        if '<tool_response>' not in answer_plus_close:
+            ids = self.tokenizer(answer_plus_close, add_special_tokens=False, return_tensors='pt').input_ids.to(self.device)
+            return ids, ids, max(1, int(ids.numel()))
+
+        spans = re.split(r'(<tool_response>.*?</tool_response>)', answer_plus_close, flags=re.DOTALL)
+        id_list: list[int] = []
+        lbl_list: list[int] = []
+        for sp in spans:
+            if not sp:
+                continue
+            sp_ids = list(self.tokenizer(sp, add_special_tokens=False).input_ids)
+            id_list.extend(sp_ids)
+            if sp.startswith('<tool_response>') and sp.endswith('</tool_response>'):
+                lbl_list.extend([-100] * len(sp_ids))
+            else:
+                lbl_list.extend(sp_ids)
+        ids_t = torch.tensor([id_list], device=self.device, dtype=torch.long)
+        lbl_t = torch.tensor([lbl_list], device=self.device, dtype=torch.long)
+        sup_cnt = int((lbl_t != -100).sum().item())
+        if sup_cnt <= 0:
+            return ids_t, ids_t, max(1, int(ids_t.numel()))
+        return ids_t, lbl_t, sup_cnt
+
     def text_loss(self,row,media):
         sup_row=self._effective_supervised_row(row)
         bot_close=self.chat.layouts[bool(sup_row.get('enable_thinking',False))]['bot_close']
-        ids=self.tokenizer(sup_row['answer']+bot_close,add_special_tokens=False,return_tensors='pt').input_ids.to(self.device)
+        ids,labels,sup_cnt=self._encode_answer_ids_and_labels(sup_row['answer']+bot_close)
+        router_z_loss=None
         if not has_multimodal_context(media):
             pre,post=self.prompt_ids_for_row(sup_row,for_generation=False)
             prefix_ids=torch.tensor(pre+post,device=self.device,dtype=torch.long)[None]
             if ids.shape[1]>self.policy['max_answer_tokens'] or prefix_ids.shape[1]+ids.shape[1]>self.policy['max_sequence']:
                 raise ValueError('Supervision would be truncated; revise a versioned context policy')
             full_ids=torch.cat([prefix_ids,ids],dim=1)
-            with self._visual_cross_attn_scope(None):
-                hidden=self.spark.model(input_ids=full_ids,attention_mask=torch.ones_like(full_ids),use_cache=False,return_dict=True).last_hidden_state[:,prefix_ids.shape[1]-1:-1]
+            if getattr(self,'enable_loop_engram',False):
+                out=self.forward_looped_model(
+                    input_ids=full_ids,
+                    text_token_mask=torch.ones_like(full_ids,dtype=torch.bool),
+                    attention_mask=torch.ones_like(full_ids),
+                    visual_context=None,
+                    use_cache=False,
+                )
+                hidden=out.last_hidden_state[:,prefix_ids.shape[1]-1:-1]
+                router_z_loss=out.router_z_loss
+            else:
+                with self._visual_cross_attn_scope(None):
+                    hidden=self.spark.model(input_ids=full_ids,attention_mask=torch.ones_like(full_ids),use_cache=False,return_dict=True).last_hidden_state[:,prefix_ids.shape[1]-1:-1]
         else:
-            prefix,vis_ctx=self.prefix_with_visual_context(sup_row,media,for_generation=False)
+            prefix,vis_ctx,pref_ids,pref_tmask=self.prefix_with_visual_context_and_ids(sup_row,media,for_generation=False)
             if ids.shape[1]>self.policy['max_answer_tokens'] or prefix.shape[1]+ids.shape[1]>self.policy['max_sequence']:
                 raise ValueError('Supervision would be truncated; revise a versioned context policy')
             embeds=torch.cat([prefix,self.get_input_embeddings()(ids)],dim=1)
-            hidden=self.hidden_states(embeds,visual_context=vis_ctx)[:,prefix.shape[1]-1:-1]
+            if getattr(self,'enable_loop_engram',False):
+                full_tids=torch.cat([pref_ids,ids],dim=1)
+                full_tmask=torch.cat([pref_tmask,torch.ones_like(ids,dtype=torch.bool)],dim=1)
+                out=self.forward_looped_model(
+                    inputs_embeds=embeds,
+                    token_ids_for_engram=full_tids,
+                    text_token_mask=full_tmask,
+                    attention_mask=torch.ones(embeds.shape[:2],device=self.device,dtype=torch.long),
+                    visual_context=vis_ctx,
+                    use_cache=False,
+                )
+                hidden=out.last_hidden_state[:,prefix.shape[1]-1:-1]
+                router_z_loss=out.router_z_loss
+            else:
+                hidden=self.hidden_states(embeds,visual_context=vis_ctx)[:,prefix.shape[1]-1:-1]
 
         total=hidden.new_zeros((),dtype=torch.float32)
         ls=float(self.policy.get('label_smoothing',0.0)) if self.training else 0.0
         from torch.utils.checkpoint import checkpoint
         for start in range(0,ids.shape[1],128):
-            hs_2d=hidden[:,start:start+128].reshape(-1,self.hidden); labels_1d=ids[:,start:start+128].reshape(-1)
-            def ce(x,y): return F.cross_entropy(self.get_output_embeddings()(x).float().reshape(-1,self.config.vocab_size),y,reduction='sum',label_smoothing=ls)
+            hs_2d=hidden[:,start:start+128].reshape(-1,self.hidden); labels_1d=labels[:,start:start+128].reshape(-1)
+            def ce(x,y): return F.cross_entropy(self.get_output_embeddings()(x).float().reshape(-1,self.config.vocab_size),y,ignore_index=-100,reduction='sum',label_smoothing=ls)
             total=total+checkpoint(ce,hs_2d,labels_1d,use_reentrant=False)
-        return total/ids.numel(),ids.numel()
+        loss_val=total/sup_cnt
+        if router_z_loss is not None and self.training and torch.is_grad_enabled():
+            loss_val=loss_val+float(self.policy.get('router_z_loss_weight',1e-4))*router_z_loss
+        return loss_val,sup_cnt
 
     def text_batch_loss(self,examples):
         """One padded Spark forward for text-producing records; pure-text batches bypass all visual modules."""
         all_pure_text = all(not has_multimodal_context(media) for _, media in examples)
-        has_active_xattn = len(getattr(self, 'visual_cross_attn', ())) > 0 and any(
-            has_multimodal_context(media) and bool(media.get('images')) for _, media in examples
-        )
-        if has_active_xattn and len(examples) > 1:
-            # Per-example visual context tokens differ across rows; evaluate cleanly per example.
+        has_per_row_vis = (
+            len(getattr(self, 'visual_cross_attn', ())) > 0 or getattr(self, 'enable_loop_engram', False)
+        ) and any(has_multimodal_context(media) and bool(media.get('images')) for _, media in examples)
+        if has_per_row_vis and len(examples) > 1:
+            # Per-example visual context tokens / multimodal router summaries differ across rows; evaluate cleanly per example.
             losses, units = [], []
             for row, media in examples:
                 l_val, u_val = self.text_loss(row, media)
@@ -1458,63 +2088,108 @@ class SparkNative(nn.Module):
                 pre,post=self.prompt_ids_for_row(sup_row,for_generation=False)
                 p_ids=torch.tensor(pre+post,device=self.device,dtype=torch.long)[None]
                 bot_close=self.chat.layouts[bool(sup_row.get('enable_thinking',False))]['bot_close']
-                a_ids=self.tokenizer(sup_row['answer']+bot_close,add_special_tokens=False,return_tensors='pt').input_ids.to(self.device)
+                a_ids,a_lbls,a_sup=self._encode_answer_ids_and_labels(sup_row['answer']+bot_close)
                 if a_ids.shape[1]>self.policy['max_answer_tokens'] or p_ids.shape[1]+a_ids.shape[1]>self.policy['max_sequence']:
                     raise ValueError('Supervision would be truncated; revise a versioned context policy')
-                prepared_ids.append((p_ids,a_ids))
-            width=max(p.shape[1]+a.shape[1] for p,a in prepared_ids)
+                prepared_ids.append((p_ids,a_ids,a_lbls,a_sup))
+            width=max(p.shape[1]+a.shape[1] for p,a,_,_ in prepared_ids)
             input_ids=torch.full((len(prepared_ids),width),pad_id,device=self.device,dtype=torch.long)
             mask=torch.zeros((len(prepared_ids),width),device=self.device,dtype=torch.long)
-            for i,(p_ids,a_ids) in enumerate(prepared_ids):
+            for i,(p_ids,a_ids,_,_) in enumerate(prepared_ids):
                 seq=torch.cat([p_ids,a_ids],dim=1)[0]
                 input_ids[i,:seq.shape[0]]=seq
                 mask[i,:seq.shape[0]]=1
             if width>self.policy['max_sequence']: raise ValueError('Input exceeds qualified context; no silent truncation')
-            with self._visual_cross_attn_scope(None):
-                hidden=self.spark.model(input_ids=input_ids,attention_mask=mask,use_cache=False,return_dict=True).last_hidden_state
+            router_z_loss=None
+            if getattr(self,'enable_loop_engram',False):
+                out=self.forward_looped_model(
+                    input_ids=input_ids,
+                    text_token_mask=mask.bool(),
+                    attention_mask=mask,
+                    visual_context=None,
+                    use_cache=False,
+                )
+                hidden=out.last_hidden_state
+                router_z_loss=out.router_z_loss
+            else:
+                with self._visual_cross_attn_scope(None):
+                    hidden=self.spark.model(input_ids=input_ids,attention_mask=mask,use_cache=False,return_dict=True).last_hidden_state
             from torch.utils.checkpoint import checkpoint
             ls=float(self.policy.get('label_smoothing',0.0)) if self.training else 0.0
+            z_add=(
+                float(self.policy.get('router_z_loss_weight',1e-4))*router_z_loss
+                if (router_z_loss is not None and self.training and torch.is_grad_enabled())
+                else None
+            )
             losses=[]; units=[]
-            for i,(p_ids,a_ids) in enumerate(prepared_ids):
+            for i,(p_ids,a_ids,a_lbls,a_sup) in enumerate(prepared_ids):
                 start=p_ids.shape[1]-1; count=a_ids.shape[1]
                 hs=hidden[i:i+1,start:start+count]; total=hidden.new_zeros((),dtype=torch.float32)
                 for offset in range(0,count,128):
-                    hs_2d=hs[:,offset:offset+128].reshape(-1,self.hidden); lbl_1d=a_ids[:,offset:offset+128].reshape(-1)
-                    def ce(x,y): return F.cross_entropy(self.get_output_embeddings()(x).float().reshape(-1,self.config.vocab_size),y,reduction='sum',label_smoothing=ls)
+                    hs_2d=hs[:,offset:offset+128].reshape(-1,self.hidden); lbl_1d=a_lbls[:,offset:offset+128].reshape(-1)
+                    def ce(x,y): return F.cross_entropy(self.get_output_embeddings()(x).float().reshape(-1,self.config.vocab_size),y,ignore_index=-100,reduction='sum',label_smoothing=ls)
                     total=total+checkpoint(ce,hs_2d,lbl_1d,use_reentrant=False)
-                losses.append(total/count); units.append(count)
+                l_i=total/a_sup
+                if z_add is not None: l_i=l_i+z_add
+                losses.append(l_i); units.append(a_sup)
             return losses,units
 
         prepared=[]
         single_vis_ctx=None
         for row,media in examples:
             sup_row=self._effective_supervised_row(row)
-            prefix,vis_ctx=self.prefix_with_visual_context(sup_row,media,for_generation=False)
+            prefix,vis_ctx,pref_ids,pref_tmask=self.prefix_with_visual_context_and_ids(sup_row,media,for_generation=False)
             if vis_ctx is not None: single_vis_ctx=vis_ctx
             bot_close=self.chat.layouts[bool(sup_row.get('enable_thinking',False))]['bot_close']
-            ids=self.tokenizer(sup_row['answer']+bot_close,add_special_tokens=False,return_tensors='pt').input_ids.to(self.device)
+            ids,lbls,sup_cnt=self._encode_answer_ids_and_labels(sup_row['answer']+bot_close)
             if ids.shape[1]>self.policy['max_answer_tokens'] or prefix.shape[1]+ids.shape[1]>self.policy['max_sequence']:
                 raise ValueError('Supervision would be truncated; revise a versioned context policy')
-            prepared.append((prefix,self.get_input_embeddings()(ids),ids))
-        width=max(prefix.shape[1]+answer.shape[1] for prefix,answer,_ in prepared)
+            full_tids=torch.cat([pref_ids,ids],dim=1)
+            full_tmask=torch.cat([pref_tmask,torch.ones_like(ids,dtype=torch.bool)],dim=1)
+            prepared.append((prefix,self.get_input_embeddings()(ids),ids,lbls,sup_cnt,full_tids,full_tmask))
+        width=max(prefix.shape[1]+answer.shape[1] for prefix,answer,_,_,_,_,_ in prepared)
         embeds=torch.zeros(len(prepared),width,self.hidden,device=self.device,dtype=prepared[0][0].dtype)
         mask=torch.zeros(len(prepared),width,device=self.device,dtype=torch.long)
-        for i,(prefix,answer,_) in enumerate(prepared):
+        batch_tids=torch.zeros((len(prepared),width),device=self.device,dtype=torch.long)
+        batch_tmask=torch.zeros((len(prepared),width),device=self.device,dtype=torch.bool)
+        for i,(prefix,answer,_,_,_,ftids,ftmask) in enumerate(prepared):
             length=prefix.shape[1]+answer.shape[1]
             embeds[i,:length]=torch.cat([prefix,answer],dim=1)[0]
             mask[i,:length]=1
-        hidden=self.hidden_batch(embeds,mask,visual_context=single_vis_ctx if len(prepared)==1 else None)
+            batch_tids[i,:length]=ftids[0]
+            batch_tmask[i,:length]=ftmask[0]
+        router_z_loss=None
+        if getattr(self,'enable_loop_engram',False):
+            out=self.forward_looped_model(
+                inputs_embeds=embeds,
+                token_ids_for_engram=batch_tids,
+                text_token_mask=batch_tmask,
+                attention_mask=mask,
+                visual_context=single_vis_ctx if len(prepared)==1 else None,
+                use_cache=False,
+            )
+            hidden=out.last_hidden_state
+            router_z_loss=out.router_z_loss
+        else:
+            hidden=self.hidden_batch(embeds,mask,visual_context=single_vis_ctx if len(prepared)==1 else None)
         from torch.utils.checkpoint import checkpoint
         ls=float(self.policy.get('label_smoothing',0.0)) if self.training else 0.0
+        z_add=(
+            float(self.policy.get('router_z_loss_weight',1e-4))*router_z_loss
+            if (router_z_loss is not None and self.training and torch.is_grad_enabled())
+            else None
+        )
         losses=[]; units=[]
-        for i,(prefix,_,ids) in enumerate(prepared):
+        for i,(prefix,_,ids,lbls,sup_cnt,_,_) in enumerate(prepared):
             start=prefix.shape[1]-1; count=ids.shape[1]
             hs=hidden[i:i+1,start:start+count]; total=hidden.new_zeros((),dtype=torch.float32)
             for offset in range(0,count,128):
-                hs_2d=hs[:,offset:offset+128].reshape(-1,self.hidden); lbl_1d=ids[:,offset:offset+128].reshape(-1)
-                def ce(x,y): return F.cross_entropy(self.get_output_embeddings()(x).float().reshape(-1,self.config.vocab_size),y,reduction='sum',label_smoothing=ls)
+                hs_2d=hs[:,offset:offset+128].reshape(-1,self.hidden); lbl_1d=lbls[:,offset:offset+128].reshape(-1)
+                def ce(x,y): return F.cross_entropy(self.get_output_embeddings()(x).float().reshape(-1,self.config.vocab_size),y,ignore_index=-100,reduction='sum',label_smoothing=ls)
                 total=total+checkpoint(ce,hs_2d,lbl_1d,use_reentrant=False)
-            losses.append(total/count); units.append(count)
+            l_i=total/sup_cnt
+            if z_add is not None: l_i=l_i+z_add
+            losses.append(l_i); units.append(sup_cnt)
         return losses,units
 
     def forward(self,examples=None,**kwargs):
@@ -1550,15 +2225,18 @@ class SparkNative(nn.Module):
         top_k: int | None = None,
         repetition_penalty: float = 1.0,
         max_think_tokens: int | None = None,
+        num_passes: int | None = None,
     ) -> list[int]:
-        """KV-cached pure-text decoding directly on `self.spark.model(input_ids=...)` with zero visual overhead."""
+        """KV-cached pure-text decoding directly on `self.spark.model` (or `forward_looped_model`) with zero visual overhead."""
         generated: list[int] = []
         past = None
         cur_ids = input_ids
+        fed_tail_ids: torch.Tensor | None = None
         length = int(input_ids.shape[1])
         max_seq = int(getattr(self, 'policy', {}).get('max_sequence', 8192))
         eos_id = self.tokenizer.eos_token_id
         think_budget_checked = False
+        use_loop = bool(getattr(self, 'enable_loop_engram', False))
         with self._visual_cross_attn_scope(None):
             for _ in range(max_new_tokens):
                 if length + len(generated) >= max_seq:
@@ -1580,22 +2258,52 @@ class SparkNative(nn.Module):
                                 device=input_ids.device,
                                 dtype=torch.long,
                             )
-                            out_b = self.spark.model(
-                                input_ids=bridge_ids,
-                                past_key_values=past,
-                                use_cache=True,
-                                return_dict=True,
-                            )
+                            if use_loop:
+                                out_b = self.forward_looped_model(
+                                    input_ids=bridge_ids,
+                                    text_token_mask=torch.ones_like(bridge_ids, dtype=torch.bool),
+                                    prev_ids=fed_tail_ids,
+                                    past_key_values=past,
+                                    use_cache=True,
+                                    num_passes=num_passes,
+                                )
+                                fed_tail_ids = (
+                                    torch.cat([fed_tail_ids, bridge_ids], dim=1)[:, -2:]
+                                    if fed_tail_ids is not None
+                                    else bridge_ids[:, -2:]
+                                )
+                            else:
+                                out_b = self.spark.model(
+                                    input_ids=bridge_ids,
+                                    past_key_values=past,
+                                    use_cache=True,
+                                    return_dict=True,
+                                )
                             past = out_b.past_key_values
                             generated.extend(int(x) for x in close_ids)
                             cur_ids = torch.tensor([[int(close_ids[-1])]], device=input_ids.device, dtype=torch.long)
 
-                output = self.spark.model(
-                    input_ids=cur_ids,
-                    past_key_values=past,
-                    use_cache=True,
-                    return_dict=True,
-                )
+                if use_loop:
+                    output = self.forward_looped_model(
+                        input_ids=cur_ids,
+                        text_token_mask=torch.ones_like(cur_ids, dtype=torch.bool),
+                        prev_ids=fed_tail_ids,
+                        past_key_values=past,
+                        use_cache=True,
+                        num_passes=num_passes,
+                    )
+                    fed_tail_ids = (
+                        torch.cat([fed_tail_ids, cur_ids], dim=1)[:, -2:]
+                        if fed_tail_ids is not None
+                        else cur_ids[:, -2:]
+                    )
+                else:
+                    output = self.spark.model(
+                        input_ids=cur_ids,
+                        past_key_values=past,
+                        use_cache=True,
+                        return_dict=True,
+                    )
                 past = output.past_key_values
                 logits = self.get_output_embeddings()(output.last_hidden_state[:, -1:])
                 token = _sample_next_token(
@@ -1627,6 +2335,7 @@ class SparkNative(nn.Module):
         top_k: int | None = None,
         repetition_penalty: float = 1.0,
         max_think_tokens: int | None = None,
+        num_passes: int | None = None,
     ):
         effective_row = row if enable_thinking is None else {**row, 'enable_thinking': bool(enable_thinking)}
         if max_new_tokens is None:
@@ -1674,6 +2383,7 @@ class SparkNative(nn.Module):
                 top_k=top_k,
                 repetition_penalty=repetition_penalty,
                 max_think_tokens=eff_max_think,
+                num_passes=num_passes,
             )
             decoded = self.tokenizer.decode(generated, skip_special_tokens=True)
             return self.chat.restore_thinking_prefix(
@@ -1682,16 +2392,23 @@ class SparkNative(nn.Module):
                 bool(effective_row.get('enable_thinking', False)),
             )
 
-        embeds, vis_ctx = self.prefix_with_visual_context(
+        embeds, vis_ctx, pref_tids, pref_tmask = self.prefix_with_visual_context_and_ids(
             effective_row,
             media,
             for_generation=True,
         )
-        generated=[]; past=None; state=None; length=embeds.shape[1]
+        use_loop = bool(getattr(self, 'enable_loop_engram', False))
+        generated = []
+        past = None
+        state = None
+        cur_tok: torch.Tensor | None = None
+        fed_tail_ids: torch.Tensor | None = None
+        length = embeds.shape[1]
         think_budget_checked = False
         with self._visual_cross_attn_scope(vis_ctx):
             for _ in range(max_new_tokens):
-                if length+len(generated)>=self.policy['max_sequence']: break
+                if length + len(generated) >= self.policy['max_sequence']:
+                    break
                 if (
                     eff_max_think is not None
                     and eff_max_think > 0
@@ -1710,24 +2427,67 @@ class SparkNative(nn.Module):
                                 device=self.device,
                                 dtype=torch.long,
                             )
-                            out_b = self.spark.model(
-                                inputs_embeds=self.get_input_embeddings()(bridge_toks),
-                                past_key_values=past,
-                                use_cache=True,
-                                return_dict=True,
-                            )
+                            if use_loop:
+                                out_b = self.forward_looped_model(
+                                    input_ids=bridge_toks,
+                                    text_token_mask=torch.ones_like(bridge_toks, dtype=torch.bool),
+                                    prev_ids=fed_tail_ids,
+                                    visual_context=vis_ctx,
+                                    past_key_values=past,
+                                    use_cache=True,
+                                    num_passes=num_passes,
+                                )
+                                fed_tail_ids = (
+                                    torch.cat([fed_tail_ids, bridge_toks], dim=1)[:, -2:]
+                                    if fed_tail_ids is not None
+                                    else bridge_toks[:, -2:]
+                                )
+                            else:
+                                out_b = self.spark.model(
+                                    inputs_embeds=self.get_input_embeddings()(bridge_toks),
+                                    past_key_values=past,
+                                    use_cache=True,
+                                    return_dict=True,
+                                )
                             past = out_b.past_key_values
                             generated.extend(int(x) for x in close_ids)
-                            state = self.get_input_embeddings()(
-                                torch.tensor([[int(close_ids[-1])]], device=self.device, dtype=torch.long)
-                            )
+                            cur_tok = torch.tensor([[int(close_ids[-1])]], device=self.device, dtype=torch.long)
+                            state = self.get_input_embeddings()(cur_tok)
                 if past is None:
-                    output=self.spark.model(inputs_embeds=embeds,use_cache=True,return_dict=True)
+                    if use_loop:
+                        output = self.forward_looped_model(
+                            inputs_embeds=embeds,
+                            token_ids_for_engram=pref_tids,
+                            text_token_mask=pref_tmask,
+                            prev_ids=None,
+                            visual_context=vis_ctx,
+                            use_cache=True,
+                            num_passes=num_passes,
+                        )
+                        fed_tail_ids = pref_tids[:, -2:]
+                    else:
+                        output = self.spark.model(inputs_embeds=embeds, use_cache=True, return_dict=True)
                 else:
-                    output=self.spark.model(inputs_embeds=state,past_key_values=past,use_cache=True,return_dict=True)
-                past=output.past_key_values
-                logits=self.get_output_embeddings()(output.last_hidden_state[:,-1:])
-                token=_sample_next_token(
+                    if use_loop and cur_tok is not None:
+                        output = self.forward_looped_model(
+                            input_ids=cur_tok,
+                            text_token_mask=torch.ones_like(cur_tok, dtype=torch.bool),
+                            prev_ids=fed_tail_ids,
+                            visual_context=vis_ctx,
+                            past_key_values=past,
+                            use_cache=True,
+                            num_passes=num_passes,
+                        )
+                        fed_tail_ids = (
+                            torch.cat([fed_tail_ids, cur_tok], dim=1)[:, -2:]
+                            if fed_tail_ids is not None
+                            else cur_tok[:, -2:]
+                        )
+                    else:
+                        output = self.spark.model(inputs_embeds=state, past_key_values=past, use_cache=True, return_dict=True)
+                past = output.past_key_values
+                logits = self.get_output_embeddings()(output.last_hidden_state[:, -1:])
+                token = _sample_next_token(
                     logits,
                     generated_ids=generated,
                     do_sample=do_sample,
@@ -1736,9 +2496,12 @@ class SparkNative(nn.Module):
                     top_k=top_k,
                     repetition_penalty=repetition_penalty,
                 )
-                if token.item()==self.tokenizer.eos_token_id: break
-                generated.append(token.item()); state=self.get_input_embeddings()(token)
-        decoded = self.tokenizer.decode(generated,skip_special_tokens=True)
+                if token.item() == self.tokenizer.eos_token_id:
+                    break
+                generated.append(token.item())
+                cur_tok = token
+                state = self.get_input_embeddings()(token)
+        decoded = self.tokenizer.decode(generated, skip_special_tokens=True)
         return self.chat.restore_thinking_prefix(
             decoded,
             self.chat.layouts[True],

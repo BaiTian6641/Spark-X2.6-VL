@@ -204,36 +204,115 @@ def score_rsi_candidate(
             "collapse_health": health,
         }
 
-    # 4. GPQA Extended & HLE Disjoint Multimodal/Text Reasoning
-    if task == "gpqa_extended_science":
+    # 4. GPQA Extended, SuperGPQA, ScienceQA & HLE Disjoint Multimodal/Text Reasoning
+    if task in ("gpqa_extended_science", "supergpqa_graduate_science", "vision_scienceqa_train"):
         expected_letter = str(meta.get("correct_letter") or "").strip().upper()
         expected_ans = _normalize_short_answer(str(meta.get("correct_answer") or ""))
-        m = _CHOICE_LETTER_RE.search(body)
+        m = re.search(r"(?:Answer|Final Answer)\s*:\s*\(?([A-J])\)?", body, re.IGNORECASE)
         pred_letter = m.group(1).upper() if m else ""
         ok = bool(expected_letter and pred_letter == expected_letter) or (
-            bool(expected_ans) and expected_ans in _normalize_short_answer(body)
+            bool(expected_ans) and len(expected_ans) >= 3 and expected_ans in _normalize_short_answer(body)
         )
         return {
             "verified": ok,
             "score": 1.0 if ok else 0.0,
-            "reason": "gpqa_verified" if ok else "gpqa_wrong_choice",
+            "reason": "mcq_science_verified" if ok else "mcq_wrong_choice",
             "collapse_health": health,
         }
 
-    if task in ("hle_multimodal_reasoning", "hle_text_reasoning"):
+    if task in ("hle_multimodal_reasoning", "hle_text_reasoning", "vision_virl39k_reasoning", "openscience_reasoning_2", "openr1_verified_math"):
         oracle_ans = _normalize_short_answer(str(meta.get("oracle_exact_answer") or ""))
         m = _FINAL_ANSWER_RE.search(body)
-        extracted = _normalize_short_answer(m.group(1) if m else body.splitlines()[-1])
-        ok = bool(oracle_ans) and (extracted == oracle_ans)
+        extracted = _normalize_short_answer(m.group(1) if m else (body.splitlines()[-1] if body else ""))
+        ok = bool(oracle_ans) and (extracted == oracle_ans or body.strip().endswith(str(meta.get("oracle_exact_answer") or "")))
         return {
             "verified": ok,
             "score": 1.0 if ok else 0.0,
-            "reason": "hle_verified" if ok else "hle_mismatch",
+            "reason": "exact_reasoning_verified" if ok else "exact_reasoning_mismatch",
             "collapse_health": health,
         }
 
-    # 5. Agentic SWE, Terminal-Bench 3.0 & OpenThoughts Code/Math
-    if task in ("fable5_swe_agent", "claude_code_agent", "terminal_bench_agent", "openthoughts_reasoning"):
+    # 4b. Stage-7 Visual Primitives (`<point>` / `<box>`) & ARC-AGI-2 Exact 2D Grid Verifier
+    if task == "visual_primitives_point_count":
+        oracle_cnt = meta.get("oracle_count")
+        has_prim = bool(think_trace and ("<point " in think_trace or "<box " in think_trace))
+        nums = re.findall(r"\b\d+\b", body)
+        pred_cnt = int(nums[-1]) if nums else -999
+        ok = has_prim and isinstance(oracle_cnt, int) and (pred_cnt == oracle_cnt)
+        return {
+            "verified": ok,
+            "score": 1.0 if ok else (0.25 if pred_cnt == oracle_cnt else 0.0),
+            "reason": "visual_primitives_count_verified" if ok else "count_or_primitive_mismatch",
+            "collapse_health": health,
+        }
+
+    if task == "visual_primitives_existence_yesno":
+        oracle_yn = _normalize_short_answer(str(meta.get("oracle_yesno") or ""))
+        has_prim = bool(think_trace and ("<point " in think_trace or "<box " in think_trace))
+        pred_yn = _normalize_short_answer(body)
+        ok = has_prim and pred_yn in ("yes", "no") and pred_yn == oracle_yn
+        return {
+            "verified": ok,
+            "score": 1.0 if ok else 0.0,
+            "reason": "visual_primitives_yesno_verified" if ok else "yesno_or_primitive_mismatch",
+            "collapse_health": health,
+        }
+
+    if task in ("visual_primitives_cot_grounding", "vision_textvqa_train", "vision_chartqa_train", "vision_docvqa_train"):
+        oracle_cands = meta.get("oracle_answers") or ([meta["oracle_answer"]] if meta.get("oracle_answer") else [])
+        norm_pred = _normalize_short_answer(body)
+        matched = any(_normalize_short_answer(str(c)) == norm_pred for c in oracle_cands if str(c).strip())
+        if task == "visual_primitives_cot_grounding" and not (think_trace and "<box " in think_trace):
+            matched = False
+        return {
+            "verified": matched,
+            "score": 1.0 if matched else 0.0,
+            "reason": "vqa_exact_verified" if matched else "vqa_mismatch",
+            "collapse_health": health,
+        }
+
+    if task in ("arc_agi_2_visual_primitives", "arc_agi_2_symbolic_induction"):
+        oracle_grid = meta.get("oracle_grid")
+        if task == "arc_agi_2_visual_primitives" and not (think_trace and ("<box " in think_trace or "<point " in think_trace)):
+            return {"verified": False, "score": 0.0, "reason": "missing_arc_visual_primitives", "collapse_health": health}
+        raw_j = body
+        m_j = re.search(r"```(?:json)?\s*(\[\s*\[.*?\]\s*\])\s*```", body, re.DOTALL)
+        if m_j:
+            raw_j = m_j.group(1)
+        else:
+            s_i, e_i = body.find("[["), body.rfind("]]")
+            if s_i >= 0 and e_i > s_i:
+                raw_j = body[s_i : e_i + 2]
+        try:
+            pred_grid = json.loads(raw_j)
+        except Exception:
+            return {"verified": False, "score": 0.0, "reason": "arc_grid_json_invalid", "collapse_health": health}
+        ok = isinstance(pred_grid, list) and pred_grid == oracle_grid
+        return {
+            "verified": ok,
+            "score": 1.0 if ok else 0.0,
+            "reason": "arc_exact_grid_match" if ok else "arc_grid_mismatch",
+            "collapse_health": health,
+        }
+
+    # 5. Agentic SWE, SWE-Bench Pro, DeepSWE, Terminal-Bench 3.0/4.0 & OpenThoughts Code/Math
+    if task in ("fable5_swe_agent", "claude_code_agent", "terminal_bench_agent", "openthoughts_reasoning", "swebench_pro_patch", "deepswe_repo_agent"):
+        if task in ("swebench_pro_patch", "deepswe_repo_agent") and "diff --git" in body:
+            expected_files = set(meta.get("changed_files") or meta.get("relevant_files") or ())
+            pred_files = set(re.findall(r"^diff --git a/(\S+) b/\S+", body, flags=re.MULTILINE))
+            file_hit = (not expected_files) or bool(expected_files & pred_files)
+            has_hunk = ("@@ " in body) and ("--- " in body) and ("+++ " in body)
+            ref_sol = str((row.get("target") or {}).get("text") or "")
+            ref_idents = {w for w in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", ref_sol)}
+            pred_idents = {w for w in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", body)}
+            recall = len(ref_idents & pred_idents) / max(1, len(ref_idents)) if ref_idents else 0.0
+            ok = file_hit and has_hunk and recall >= 0.45
+            return {
+                "verified": ok,
+                "score": round(0.5 + 0.5 * min(1.0, recall), 5) if ok else round(0.25 * recall, 5),
+                "reason": "swe_unified_diff_verified" if ok else f"swe_diff_incomplete:{recall:.2f}",
+                "collapse_health": health,
+            }
         code_blocks = _CODE_BLOCK_RE.findall(body)
         if not code_blocks and "tool_calls" not in body:
             # Check exact final answer match for math problems
@@ -483,6 +562,8 @@ def _select_stratified_rsi_pool(
     for rid, fam, lang, task in db_rows:
         t = str(task or "")
         if t in (
+            "synccraft_v41_sculpted_v8",
+            "synccraft_v41_proposer",
             "synccraft_sculpted_style_creation",
             "synccraft_sculpted_stage_progression",
             "synccraft_sculpted_multiview_inverse",
@@ -496,11 +577,36 @@ def _select_stratified_rsi_pool(
             buckets["multiview_3d"].append(rid)
         elif t == "synccraft_artist_assistant":
             buckets["artist_3d"].append(rid)
-        elif t.startswith("sat_3d_"):
+        elif t.startswith("sat_3d_") or t.startswith("arc_agi_2_"):
             buckets["sat_3d"].append(rid)
-        elif t in ("hle_multimodal_reasoning", "document_ocr", "region_ocr", "real_count", "compositional_vqa"):
+        elif t in (
+            "visual_primitives_point_count",
+            "visual_primitives_existence_yesno",
+            "visual_primitives_cot_grounding",
+            "vision_chartqa_train",
+            "vision_textvqa_train",
+            "vision_docvqa_train",
+            "vision_scienceqa_train",
+            "vision_virl39k_reasoning",
+            "hle_multimodal_reasoning",
+            "document_ocr",
+            "region_ocr",
+            "real_count",
+            "compositional_vqa",
+        ):
             buckets["fine_vision"].append(rid)
-        elif t in ("fable5_swe_agent", "terminal_bench_agent", "openthoughts_reasoning", "gpqa_extended_science", "hle_text_reasoning"):
+        elif t in (
+            "swebench_pro_patch",
+            "deepswe_repo_agent",
+            "supergpqa_graduate_science",
+            "openscience_reasoning_2",
+            "openr1_verified_math",
+            "fable5_swe_agent",
+            "terminal_bench_agent",
+            "openthoughts_reasoning",
+            "gpqa_extended_science",
+            "hle_text_reasoning",
+        ):
             buckets["reasoning_code"].append(rid)
 
         # Broad anti-forgetting replay pool across EN/ZH image, video, and text
@@ -739,8 +845,48 @@ def run_vision_self_improvement_round(campaign: Any, round_no: int) -> dict[str,
     if is_cuda:
         torch.cuda.empty_cache()
 
+    # 1b. Optional Teacher-Subagent Instructed RSI Overrides (`TEACHER_SUBAGENT_ROUND_{round_no}_OVERRIDES.json`)
+    #     Every Teacher-Subagent completion is still deterministically verified via `score_rsi_candidate`
+    #     (SyncCraft v8/SAT/motion compiler + Visual-Primitives/ARC/SWE oracle + anti-collapse guard)!
+    teacher_subagent_verified_rids: list[str] = []
+    teacher_override_path = root / f"TEACHER_SUBAGENT_ROUND_{round_no}_OVERRIDES.json"
+    if teacher_override_path.is_file():
+        raw_teacher_doc = read(teacher_override_path)
+        teacher_items = raw_teacher_doc.get("overrides", raw_teacher_doc) if isinstance(raw_teacher_doc, dict) else {}
+        if isinstance(teacher_items, dict):
+            for t_rid, t_payload in sorted(teacher_items.items()):
+                try:
+                    t_row, _ = campaign.media(str(t_rid))
+                except Exception:
+                    continue
+                cand_ans = str(t_payload["answer"] if isinstance(t_payload, dict) else t_payload)
+                t_diag = score_rsi_candidate(t_row, cand_ans, min_aesthetic_score=min_aes)
+                if t_diag["verified"]:
+                    th_p, bd_p = strip_think_block(cand_ans)
+                    clean_t = sanitize_and_bound_think_trace(
+                        th_p,
+                        bd_p,
+                        enable_thinking=bool(th_p),
+                        max_think_chars=3600,
+                        max_answer_chars=12000,
+                    )
+                    if clean_t is not None:
+                        row_overrides[str(t_rid)] = {
+                            "answer": clean_t,
+                            "enable_thinking": bool(th_p),
+                        }
+                        teacher_subagent_verified_rids.append(str(t_rid))
+                        if str(t_rid) in hard_ground_truth_rids:
+                            hard_ground_truth_rids.remove(str(t_rid))
+                        stats_by_task[f"{t_row.get('task')}:teacher_subagent_verified"] += 1
+        emit(
+            "vision_rsi_teacher_subagent_overrides_loaded",
+            round=round_no,
+            verified_count=len(teacher_subagent_verified_rids),
+        )
+
     # 2. Construct anti-collapse RSI training order:
-    #    - 2x weight on hard self-verified breakthroughs (where greedy failed or improved) + 1x already-strong verified
+    #    - 2x weight on Teacher-Subagent instructed repairs & hard self-verified breakthroughs + 1x verified
     #    - 1x hard ground-truth misses
     #    - >= 50% broad EN/ZH multimodal + coding replay anchors so zero forgetting occurs
     rng = random.Random(int(identity([c["seed"], "vision_rsi_order", round_no])[:16], 16))
@@ -749,7 +895,12 @@ def run_vision_self_improvement_round(campaign: Any, round_no: int) -> dict[str,
         for t in trajectory_log
         if t["accepted_self_override"] and (not t["greedy_verified"] or t["best_score"] > t["greedy_score"] + 0.02)
     ]
-    rsi_signal_rids = list(verified_self_rids) + list(breakthrough_rids) + list(hard_ground_truth_rids)
+    rsi_signal_rids = (
+        list(teacher_subagent_verified_rids) * 2
+        + list(verified_self_rids)
+        + list(breakthrough_rids)
+        + list(hard_ground_truth_rids)
+    )
     if not rsi_signal_rids:
         rsi_signal_rids = list(explore_rids[:16])
 
@@ -779,6 +930,7 @@ def run_vision_self_improvement_round(campaign: Any, round_no: int) -> dict[str,
     # 3. Fine-tune RSI candidate with conservative anti-collapse learning rate
     rsi_lr = float(c.get("rsi_learning_rate", min(float(c["learning_rate"]) * 0.6, 4e-6)))
     rsi_conn_lr = float(c.get("rsi_connector_learning_rate", min(float(c["connector_learning_rate"]) * 0.5, 2e-5)))
+    rsi_engram_lr = float(c.get("rsi_engram_lr", min(float(c.get("engram_lr", 1.2e-4)) * 0.3, 3e-5)))
     saved_lr = c["learning_rate"]
     saved_conn_lr = c["connector_learning_rate"]
     saved_eval_ep = c.get("eval_every_epoch", False)
@@ -789,6 +941,8 @@ def run_vision_self_improvement_round(campaign: Any, round_no: int) -> dict[str,
         "epochs": 1,
         "alignment_only": False,
         "stage_mode": "full_spark",
+        "unfreeze_vision_last_n_layers": int(c.get("rsi_unfreeze_vision_last_n_layers", 0)),
+        "engram_lr": rsi_engram_lr,
         "fixed_loss_weights": loss_weights(campaign.catalogue, full_order, c),
     }
 

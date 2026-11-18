@@ -97,11 +97,33 @@ def export_and_upload(campaign,config):
         if src.exists(): shutil.copy2(src,design/name)
         guide=guide.replace('../../reports/spark_multimodal/'+name,'design/'+name)
     (out/'RUN.md').write_text(guide)
-    architecture={'kind':'SparkNative','inference_entrypoint':'runtime/colab/final/inference.py','vision':'SigLIP2 So400m NaFlex +0/2/4tiles +2x2 spatial downshuffle','motion':'V-JEPA2.1 base384, 16-frame adaptation','speech_input':'multilingual Whisper-small encoder','sound_input':'CLAP audio encoder','speech_output':'Qwen3-TTS0.6B pretrained native talker +16-group12.5Hz codec, Spark-state bridge','sound_output':'Stable Audio Open1.0 DiT v-prediction +Oobleck, Spark-state bridge','native_output':'generator losses backpropagate into Spark; no inference API'}
+    architecture={
+        'kind':'SparkNativeLoop48En1BVL' if config.get('enable_loop_engram') else 'SparkNative',
+        'inference_entrypoint':'runtime/colab/final/inference.py',
+        'vision':'SigLIP2 So400m NaFlex + adaptive resolution-guarded 0/2/4 tiles + 2x2 spatial downshuffle + Visual Primitives (<point>/<box>)',
+        'recurrent_loop':(
+            {
+                'enabled':True,
+                'loop_range':[config.get('loop_start',12),config.get('loop_end',24)],
+                'loop_passes':config.get('loop_passes',2),
+                'effective_layers':36+(config.get('loop_end',24)-config.get('loop_start',12))*(config.get('loop_passes',2)-1),
+                'controller':'SublayerDualMHC (2x2 Sinkhorn Birkhoff + Pass-2 Visual Cross-Attn Re-Attendance)',
+                'engram':'MultimodalTieredMoEEngram En1B-A256M across 8 macro-block anchors (Tier1A GPU + Tier1B Host DRAM + Shared + E=16 TopK=4)',
+            }
+            if config.get('enable_loop_engram')
+            else {'enabled':False}
+        ),
+        'motion':'V-JEPA2.1 base384, 16-frame adaptation',
+        'speech_input':'multilingual Whisper-small encoder',
+        'sound_input':'CLAP audio encoder',
+        'speech_output':'Qwen3-TTS0.6B pretrained native talker +16-group12.5Hz codec, Spark-state bridge',
+        'sound_output':'Stable Audio Open1.0 DiT v-prediction +Oobleck, Spark-state bridge',
+        'native_output':'generator losses backpropagate into Spark; no inference API',
+    }
     write(out/'multimodal_architecture.json',architecture)
     # Scan all publishable text for the exact in-memory credentials, without
     # printing either value. Binary weights are produced only by safetensors.
-    forbidden=('optimizer.pt','scheduler.pt','rng.pt','LEDGER.json','STATE.json','.ipynb')
+    forbidden=('optimizer.pt','scheduler.pt','rng.pt','tier1b_optim.pt','LEDGER.json','STATE.json','.ipynb')
     for path in out.rglob('*'):
         if not path.is_file(): continue
         if any(v in path.name for v in forbidden): raise ValueError('Private training artifact in final export')
@@ -112,7 +134,7 @@ def export_and_upload(campaign,config):
     files=manifest(out); write(out/'MODEL_RELEASE.json',{'schema_version':1,'campaign_id':config['campaign_id'],'binding':campaign.bound,'training_complete':True,**files})
     if config.get('checkpoint_backend')=='local' and not config.get('publish_to_huggingface',False):
         result_payload={'status':'local_export_closed','export_directory':str(out),'model_release_sha256':sha(out/'MODEL_RELEASE.json')}
-        if config.get('spark_component')=='spark_fp8' and campaign.model is not None:
+        if (config.get('spark_component')=='spark_fp8' or config.get('export_fp8_bundle',False)) and campaign.model is not None:
             from .model import export_spark_native_fp8_safetensors
             out_fp8=campaign.root/'final-model-fp8'; out_fp8.mkdir(exist_ok=True)
             for path in out.rglob('*'):

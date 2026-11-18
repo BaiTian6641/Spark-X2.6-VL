@@ -1,399 +1,650 @@
 ---
 name: "blockbench-sculpted-style"
-description: "Use when designing, critiquing or generating Blockbench/Minecraft-style 3D models (creatures, dragons, vehicles, props, scenes) in the sculpted cuboid, hand-painted pixel-texture style, including Block-DSL test and dataset assets."
+description: "Use when designing, critiquing or generating Blockbench/Minecraft-style 3D models (dragons, Monster Hunter-style monsters, environment creatures, gathering points, props, vehicles, scenes) in the sculpted cuboid, hand-painted pixel-texture style, including SyncCraft Block-DSL assets. Pass it to every subagent."
 ---
 
 # Sculpted Blockbench style
 
-The target look is the one used by high-end Blockbench artists for large creatures and cosy dioramas. It is built from cuboids and flat planes, but it is **not voxel art** and **not vanilla Minecraft minimalism**. Think of it as sculpture with boxes: capture what makes the subject recognisable, simplify the rest, and paint light and material into a pixel texture.
+This skill defines one look and one way of working.
 
-## 1. Style traits (the definition of done)
+**The look:** large, deliberate cuboid masses; real block horns and spikes; cut-out planes for thin edges; calm, banded, vibrant pixel paint. It is the look of top Blockbench creature artists, sculpture made of boxes. It is **not** voxel art, **not** a scatter of shards, and **not** vanilla Minecraft minimalism.
 
-**Form**
-- Cuboids are freely rotated and overlapped to make slopes, tapers and curves. Nothing important sits on a rigid grid.
-- Silhouette first. Every part must read as a black shape from front, side, three-quarter and top.
-- Clear size hierarchy: a few big masses, a handful of medium forms, small accents. Roughly 70 / 25 / 5 by volume.
-- Proportions are pushed: larger heads, hands, horns, claws and props than real life; thick-to-thin tapers on limbs, tails, horns.
-- Thin things are flat planes or half-unit slabs: leaves, feathers, membranes, pages, cloth, fins, hair tufts. Tilt and layer them; never leave them coplanar.
-- Deliberate imperfection: books lean, planks are slightly skewed, spikes vary in size and angle. Perfect symmetry and equal spacing look machine-made.
-- Curves are 3+ segments with a steady angle step (10-25 degrees each), tapering as they go.
-- Dense, purposeful clusters of small props or spikes around focal areas; calm, larger surfaces elsewhere.
+Models that fail this style rarely fail at *seeing* the reference. They fail at **construction**: one form gets broken into many small, randomly angled pieces, the face becomes a long flat box, horns become sheets or sticks, and the paint gets noisy. Most rules below exist to stop exactly that.
 
-**Texture**
-- Hand-painted pixel art at one consistent texel density per asset (16 px per block for chibi and standard creatures; 32 for hero and elder tiers).
-- Shading is banded: 3-5 distinct value steps per colour, placed as bands and stepped diagonal clusters, not as smooth blends or noise.
-- Transparent cut-out edges on planes are a core tool, not an extra.
-- Light is painted in: top faces lightest, sides mid, undersides darkest, plus a 1 px lighter top edge and 1 px darker bottom or contact edge on most boxes.
-- Hue-shifted ramps of 4-6 steps: highlights drift warm (toward yellow), shadows drift cool (toward blue or purple) and slightly more saturated. Never shade by adding black or white only.
-- Clusters and strokes, not noise: wood grain as broken lines, scales as offset rows, stone as a few chips, fabric as folds.
-- Vibrant, limited palette: one dominant hue family, one supporting, one accent near its complement (for example warm orange glow against violet and teal). Saturation is highest in mid-tones.
-- Glow is a material: emissive eyes, embers, windows, crystals, with their colour bleeding 1-3 px onto neighbours.
-- Features are placed by hand: eyes with a highlight pixel, nostrils, teeth gaps, scars, markings, stitches.
+## 0. How to use this skill
 
-**Not this style**
-- Stair-stepped voxel volumes; axis-aligned box robots; uniform limb thickness.
-- Flat single-colour faces, random per-pixel noise, grey shadows, pure black outlines everywhere.
-- Smooth subdivided meshes or photo textures.
-- Detail spread evenly over the whole model.
+- **Read it in full** before the first reference review, the first construction step and the first critique of every pass. Read it again whenever a pass is rejected. Re-read Section 1 before every build or edit call.
+- **Open the approved style anchors** (2.3) every time you read the skill. If you cannot open them, say so in the pass log; never describe an image you did not see.
+- **Subagents:** give every subagent this skill, the anchor images and the brief in Section 12. A subagent that has not read both may not build, review or paint.
+- **Start clean.** Do not reuse models, scripts, textures or notes from earlier projects as templates. Reuse only this skill, the anchors and SyncCraft.
+- **Keep a project log** (`PROJECT_GOAL.md`) holding:
+  - the non-negotiables;
+  - the roster;
+  - each model's current pass;
+  - the owner's latest corrections, word for word.
 
-## 2. Workflow
+  Re-read it at the start of every pass so instructions survive context compression.
 
-Work like a sculptor: reference, analysis, big to small, with a visual check at every stage. Do not skip to detail.
+## 1. Non-negotiables
 
-### A. Gather reference
-Search for and collect, per subject: official art or renders, in-game or turnaround views (front, side, back, top, three-quarter), community fan models, and any block or low-poly interpretations. Prefer at least five images covering different angles. Note which traits appear in every source; those are identity traits.
+1. **Construct, don't scatter.** Every box is a named form (skull, brow, cheek, thigh, horn segment 2, plate 3 in row B). Before adding a box, name its form and the view in which it changes the silhouette. If you can't, don't add it.
+2. **Big first.** Primary masses keep most of the volume: at every stage the 10 largest boxes hold at least half of all box volume. Detail never replaces a mass.
+3. **No fake curves or spheres.** Never stack or slice many small boxes to imitate a sphere, dome, smooth curve, long slope or tapering spike. Use the remap table (3.2).
+4. **Real block horns and spikes.** A horn is 2-4 thick box segments; a spike is one box. Never a flat plane for a horn, never a staircase of cubes.
+5. **Every rotation has a reason:** the pose, the form's own slope, or a row's shared lean. No random jitter. Mirrored parts get mirrored angles.
+6. **Everything connects.** Each element touches or overlaps a neighbour. Overlap is good; floating parts are bugs. Cross-bone seams use `blend_with`.
+7. **Build symmetric.** Build only the left side and centre; the right comes from mirroring. The rest pose is symmetric (Section 4). Attitude lives in animation, not in the model.
+8. **The head passes first.** Build and approve the head alone before the body (6.6). The jaw is a separate bone on anything player-sized or larger.
+9. **Place eyes, don't drop them.** Eyes sit on the side of the skull at the brow-snout junction, under the brow, in the upper half of the head (6.3).
+10. **Epic for monsters, simple only when small.** Creatures as large as the player or larger get deliberate hero-level form. Only creatures smaller than the player (fish, birds, insects, small critters) may be simplified.
+11. **Calm, clean paint.**
+    - 85-90% of each surface is calm mid-tone.
+    - Banded light, no per-pixel noise.
+    - One accent colour.
 
-### B. Write a trait sheet (reference document, with the images)
-Go through the body in order and write two to five short lines per region. Use a head-length or block as the unit.
+    "Dirty" means too much contrast in too many places (Section 10).
+12. **Minimum passes:** 3 white-model, 2 detail, 2 texture, plus 1 rig-and-motion check. More passes are welcome. More passes never permit more fragments.
+13. **Punch back early.** A model that fails a gate in 5.4 returns to white pass 1. Never patch a broken base with detail.
+14. **Count is an outcome.** Budgets are ceilings, not targets. Never add elements to reach a number or raise a score.
+15. **Audit, then look.** A passing SyncCraft audit is necessary, never sufficient. Every pass, compare renders against zoomed reference crops.
 
-1. **Whole**: gesture line (the single curve from nose to tail tip), stance, centre of mass, overall length:height:width, the three things anyone would recognise.
-2. **Head**: skull block shape, snout length and taper, jaw, eye position and size, horns or crests (count, direction, curve), teeth, frills, ears.
-3. **Neck and torso**: neck length and S-curve, chest depth versus waist, shoulder and hip mass, back line, dorsal features, belly plates.
-4. **Wings or arms**: attachment point, segment lengths as ratios, fold pattern, finger count, membrane or feather layering, span versus body length.
-5. **Limbs**: segment count and angles (plantigrade, digitigrade, sprawled), thigh mass, foot shape, claw count and size.
-6. **Tail**: length versus body, taper, curve, tip feature.
-7. **Surface**: materials per region, palette (name 3-5 colours with roles), pattern type, glow, wear.
+## 2. The look
 
-For each trait mark one of: **keep** (identity), **exaggerate** (make it 1.2-1.5x), **merge** (several small things become one form), **paint** (texture only, no geometry), **drop**.
-Rule of thumb: geometry for anything that changes the silhouette; texture for everything else.
+### 2.1 What it is
+- **Form**
+  - A few large cuboids, rotated as whole masses to make slopes and gesture.
+  - They overlap at joints so the body reads as one continuous form.
+  - Silhouette first: each part reads as a dark shape from front, side, three-quarter and top.
+- **Hierarchy, about 70 / 25 / 5 by volume:**
+  - primary masses;
+  - secondary forms that change the outline (brow, cheek, jaw, shoulder, knee, horn);
+  - tertiary accents (claws, teeth, fangs, spike tips).
+- **Pushed proportions:** heads, horns, claws and the signature feature are bigger than life, and everything tapers thick to thin.
+- **Thin things are planes with cut-out alpha:** membranes, fins, frills, fur tufts, manes, leaves, cloth.
+- **Paint**
+  - Hand-painted pixel art at one texel density.
+  - 3-5 banded values per colour, with hue-shifted ramps (warm lights, cool shadows).
+  - A 1 px light top edge and a 1 px dark contact edge.
+  - A limited vibrant palette: dominant, supporting and one accent.
+  - Glow is a small, focal material.
 
-### C. Blockout (primary masses)
-8-20 boxes total. One box per major mass: skull, snout, neck segments, chest, belly, hips, each limb segment, tail segments, wing spars. Set rotations now, including the gesture curve. Check silhouettes from four views against the trait sheet. Fix proportions here; later stages cannot rescue them.
+### 2.2 What it is not
+- **Shard armour:** dozens of small slabs at random angles covering the body. This is the most common failure (see 2.5).
+- **Voxel volumes:** staircase spheres, domes and slopes.
+- **Horns as stick chains or sheets;** spikes as cube staircases.
+- **A long flat face:** the head as one long box with features painted on, or eyes in the wrong place.
+- **Toy monsters:** few boxes, straight limbs, flat colours, everything axis-aligned on a creature that should be epic.
+- **Dirty paint:** noise, many high-contrast specks, black outlines, grey shadows.
+- **Repulsive rendering of creepy creatures:** slime, veins, gore, eye clusters (see 9.5).
 
-### D. Secondary forms
-Add what changes the outline at medium scale: brow, jaw, cheek, shoulder and haunch masses, knees and elbows, horn segments, dorsal row, wing fingers, feet. Taper by stepping size down each segment. Break long straight edges with a second, slightly rotated box.
+### 2.3 Style anchors (owner-approved)
+Open these every time you read the skill. Community art you find yourself becomes an anchor only after the owner approves it; the owner has rejected agent-picked references before.
+- The owner's image set (5 dragons, 4 scenes), described in 2.4.
+- **Primary anchors:** x.com/zyhfisme/status/1733516648437719544 and x.com/zyhfisme/status/1733044355840213081.
+- x.com/AnzSamaEr (including status 1965148236198674683).
+- ArtStation `g0BAae` and `obdg2m`; Pinterest pins 822188475757578039 and 978618194031219174; Sketchfab "stygian-zinogre"; YouTube `y6y96xnMplM`.
+- blockbench.net/gallery. **Ignore the fox piece.**
+- **Cobblemon assets** (gitlab.com/cable-mc/cobblemon-assets, CC-BY-NC). Use them for construction discipline: clean large forms, strict symmetry, separate jaw and eye elements ready for animation. Their creatures are simpler than this style's monsters, so borrow the discipline, not the detail level.
 
-### E. Tertiary detail and planes
-Claws, teeth, spikes, plates, membranes, tufts, straps, props. Vary size and angle within a row (largest near the focal point, shrinking away). Layer planes at different heights and tilts. Stop when the focal areas are rich and the rest is calm.
+If a URL cannot be opened in your environment, use the owner's saved copies in the project's `style_anchors/` folder. If there are none, ask.
 
-### F. Texture
-1. Flat base colours per material from the palette.
-2. Painted light: top, side, underside values; edge highlight and contact shadow lines.
-3. Material strokes in clusters.
-4. Features: eyes, mouth, markings, glow and its colour bleed.
-5. Squint test: the model should still read at a quarter size.
+### 2.4 What the owner's set shows
+1. **Rotated, stacked cuboids that read as flowing curves.** You can count the boxes, but the outline reads as one flowing form.
+2. **Silhouette edges drawn in pixels:** torn membranes, fringes, drips and tatters on cut-out planes. Hard box edges alone look unfinished.
+3. **Banded cel shading** in 3-5 steps per colour; shadows toward violet or blue, lights toward cyan, yellow or cream.
+4. **Two body colours plus one hard-part colour plus at most one glow:** red and cream, blue and navy, tan and sand, with ivory horns.
+5. **Segmented undersides are geometry:** wide overlapping plates in the underside colour.
+6. **Round machine parts are octagons** (wheels, hubs, pots). Round *organic* parts are single boxes with painted light.
+7. **Saturation is controlled:** the strongest colour and value sit at the focal point.
 
-### G. Rig readiness
-Pivots at anatomical joints; overlapping boxes at joints act as miters so bends do not open gaps; nothing essential breaks when a limb rotates 30 degrees.
+Per image:
+- **Red and cream dragon:** thick spar chains, a dithered cream-to-tan membrane per bay with a ragged trailing edge, pale antler-like horns that change direction at each segment, cream toes.
+- **Black and blue elder dragon:** dense detail that is still *organised*. A row of rounded scale boxes armours the wing's leading edge; cyan crystal horns are the only saturated accent; a pale chest panel.
+- **Blue ice dragon:** a head about a third of the body mass, a heavy block jaw with a row of yellow teeth, one red eye set deep under the brow, crystal prisms on rock bases.
+- **Pink chibi dragon:** about 25 boxes, a head nearly half the body. Proof that the style scales down without losing banded paint or a clear silhouette.
+- **Tan club-tailed wyvern:** thick wing arms, sand membranes, a row of curved dorsal spikes, a studded mace tail, grey segmented ram horns.
+- **Plated beast and quill beast:** built from overlapping slabs in *coherent rows* that all lean the same way. That is density, not scatter.
+- **Scenes:** warm emissive lights against cool ambient; props that lean slightly; chamfered hard surfaces; weathering that follows gravity.
 
-### Visual checks (after every stage C-F)
-- **Regional**: render or view each region close up (head, torso, wing, limb, tail). Compare with its trait-sheet lines. Name one thing that is wrong before moving on.
-- **Whole**: front, side, three-quarter front, three-quarter back, top. Check gesture, balance, hierarchy, and that feet meet the ground.
-- **Silhouette**: view as a flat dark shape. If the subject is not identifiable, go back to C.
-Record each check with its image in the working document.
+### 2.5 Exemplars
+- **Good: "Saffron Squallwing" test flight,** which the owner judged amazing.
+  - 151 elements, 50 bones, about 2.5 boxes per bone.
+  - The 10 largest boxes hold 55% of the volume; the median element is about 6 x 3.5 x 6 units on a 170-unit span.
+  - Partitioned membranes, 4-segment block horns, a banded texture with chevrons on the dorsal parts only and calm flanks.
+  - **Its one rule break:** the head was turned 8 degrees and the tail curved sideways in the rest pose, which broke mirror symmetry. That attitude belongs in a display clip.
+- **Bad: SyncCraft v9 Zinogre** (repo commit `ba969f3`).
+  - 262 elements, 6.4 boxes per bone; the 10 largest boxes hold only 48% of the volume.
+  - The median element is about 2 x 3 x 5 units on a 94-unit body.
+  - The white render is shard armour: the head is a pile of plates with no readable skull, snout, jaw or eye; the horns are thin bars; the tail is a stack of tilted slabs; mirror parity is broken.
 
-## What the owner's reference set shows
+## 3. Construction grammar
 
-These notes come from nine images the owner supplied: five dragons (a red-and-cream western dragon, a black-and-blue upright elder dragon, a chunky blue ice dragon, a pink chibi dragon, a tan club-tailed wyvern) and four scenes (an artist's studio, a harvest robot in an orchard, a snow expedition truck, an airship among cliff houses). Where a rule elsewhere in this skill disagrees with these notes, these notes win.
+### 3.1 Build order inside any part
+1. Host mass.
+2. Secondary forms that change the outline.
+3. Rows of plates following the flow lines.
+4. Tips: claws, teeth, spike points.
+5. Planes for thin edges.
+6. Paint.
 
-### Shared signature
-1. **Cuboids stay cuboids, but they are rotated and stacked into organic flow.** No stair-stepped voxel volumes and no smooth meshes on creatures. You can count the boxes, yet the outline reads as a curve.
-2. **The silhouette edge is drawn in pixels.** Thin planes with transparent, hand-cut edges do the work geometry cannot: torn wing membranes with holes, spiky fur or spine fringes along the neck and limbs, dripping moss, cloth tatters, leaf clusters. This is the single most distinctive trait. Hard box edges alone look unfinished.
-3. **Banded cel shading.** Three to five clearly separate value steps per colour, laid as bands and stepped diagonal clusters that follow the form. Shadows shift toward purple or blue, highlights toward cyan, yellow or cream. Almost no soft noise.
-4. **Two-colour body scheme plus one accent.** Each dragon is a body colour and an underside or membrane colour (red and cream, blue and navy, black and violet-blue, tan and sand), with one hard-part colour for horns, claws and crystals and at most one glow accent.
-5. **Segmented undersides are geometry.** Throat, chest and belly are a column of separate overlapping plate boxes, each a little wider or narrower than its neighbour, in the underside colour.
-6. **Round things are octagons.** Wheels, joints, hubs, balloons, tree crowns and pots are built from two or three boxes rotated 45 degrees, or a low faceted prism. Never a single square, never a smooth cylinder.
-7. **Saturated but controlled.** Large areas are mid-saturation; the strongest colour and brightest value sit at the focal point (eyes, crystals, lamps, fruit, headlights).
-8. **Presentation is part of the piece.** Dark neutral backdrop for turnarounds; for hero shots a simple scene, a key light with coloured rim, soft bloom on emissive parts, and a cast shadow.
+Each step must improve the silhouette or the focal area. If it doesn't, undo it.
 
-### What each dragon teaches
-- **Red and cream western dragon (clean, mid detail):** wing spars are thick box chains in the body colour: upper arm, forearm, and three long fingers radiating from the wrist. The membrane is one large plane per bay, painted as a dithered gradient from cream at the spar to deeper tan at the body, with a ragged pixel-cut trailing edge and a few holes near the tip. Horns are pale, long, and change direction at each segment like antlers, with shorter secondary horns at the cheek. Legs carry horizontal bands of alternating body tones to suggest scale rows. Toes and claws are cream. The tail's cream underside continues the belly column to the tip.
-- **Black and blue elder dragon (maximum detail):** hundreds of small boxes. Upright stance on long digitigrade legs with three long toes. The wing's leading edge is armoured with a row of overlapping rounded scale boxes. Membranes are large planes with a smooth pixel gradient from deep blue to violet and heavily torn edges with interior holes. Bright cyan crystal horns and shards are the only saturated accent and read from any distance. A pale chest panel breaks the dark mass. Long thin clawed fingers are separate boxes.
-- **Blue ice dragon (chunky, expressive):** the head is about one third of the body mass, with a heavy block jaw, a row of large yellow teeth, and a single red eye pixel set deep under the brow. Scales are painted as stepped diagonal clusters in four blues from cyan highlight to purple shadow. Back crystals are tall white-to-cyan prisms rising from small brown rock bases. Neck and limb edges carry a fringe of pixel spikes. Belly plates are dark navy segments. Claws are long, thin and brown.
-- **Pink chibi dragon (minimal):** about 25 boxes. Head nearly half the body, stub legs, tiny wings, three short horns, one large dark eye with a highlight. Pastel palette, soft glow. Proof that the style scales down: fewer boxes, same banded shading and same clear silhouette.
-- **Tan club-tailed wyvern (dynamic pose):** crouched, wing-arms planted, tail raised. Thick wing arms, sand membranes with ragged edges, a row of curved yellow dorsal spikes made as small pixel-cut planes, a mace tail studded with white spikes, grey segmented ram horns, a glowing eye. Shows posing, rim light and a strong signature feature.
+### 3.2 Remap table: real shapes into box language
+| Real shape | Build it as | Never |
+|---|---|---|
+| Sphere, egg, round belly, dome, skull cap | 1 box, optionally plus 1-2 chamfer boxes on the edges that show in silhouette; painted light does the roundness | stacked rings, concentric rotated boxes, `prism(n)` with n > 8, slices |
+| Long slope (snout ridge, back line, wing root) | 1 box rotated to the slope; 2 overlapping boxes if the angle changes | a staircase of offset boxes |
+| Smooth curve (neck, tail, horn arc) | 3-5 seated segments with a steady angle step (10-25 degrees) and steady taper; each segment at least 1.5x as long as it is thick | 8+ thin slices; segments shorter than their thickness |
+| Spike, thorn, claw, fang | 1 box, pointed by its size, texture or cut-out; 2 boxes (base plus tip) only if it is longer than 4x its base and bends | 3+ shrinking cubes; a flat plane |
+| Horn | 2-4 thick box segments (7.1) | a plane; thin sticks; a cube staircase |
+| Many thin spikes (quills, fur spikes, crystal fringe) | cut-out planes (`edge: spikes`), 2-3 layers | dozens of thin boxes |
+| Membrane, fin, frill, ear fin | plane(s) with alpha cut-out, one panel per bone | thick slabs; one plane spanning moving bones |
+| Fur, mane | 2-3 layers of cut-out planes or tilted slabs in rows | a fuzzy block; scattered cubes |
+| Armour plates, scales | rows of slabs with the same lean, overlapping 30-50%; small scales are painted | random shards |
+| Tentacle, trunk, whip tail | 4-7 seated segments, each 0.8-0.85 of the previous, gentle steady curl | many short slices; uniform pipes |
+| Wheel, hub, cylinder (hard surface) | `octagon` (2 boxes) | `prism(12)` on organic parts |
+| Eye | painted stamp on the skull's side face; a shallow box only for bulging eyes (frogs, insects, chameleons) | a cube stuck on the surface |
 
-### What the scenes teach
-- **Studio interior:** warm emissive light sources against cool violet ambient; dense prop clusters (books, bottles, candles) with slight tilts; plants as layered leaf planes; a clear focal object lit brightest.
-- **Harvest robot:** hard-surface forms get chamfers from extra rotated boxes; joints and wheels are octagons with a painted bolt; hoses are chains of many short segments following a curve; foliage is large rotated cubes with leaf-cluster textures and cut-out edges; palette is three hues (yellow, green, sky blue) at high saturation.
-- **Expedition truck:** silhouette greebles from thin boxes (rails, ladders, antennas, lamps); painted weathering as vertical pixel streaks and chipped edges; pixel-font lettering and hazard stripes as decals; emissive white lamps; a second material layered on top surfaces (snow caps as white slabs). Muted base, small orange and blue accents.
-- **Airship and cliff houses:** large faceted volumes with bold diagonal pixel patterns; a teal, cream and terracotta triad; hanging cloth and moss as drippy cut-out planes; steep roofs as rotated slabs; rock faces painted with angular highlight shapes rather than noise.
+### 3.3 Rotation discipline
+- **Allowed sources:**
+  - (a) the pose, through bone rest angles;
+  - (b) the form's own slope, for example a snout pitched down 5-15 degrees;
+  - (c) a row's shared lean: all plates in a row lean back about 15 degrees, changing by at most 5 degrees along the row, in a steady progression.
+- **Not allowed:**
+  - per-box random angles;
+  - "hand-made wobble" on structural parts;
+  - rotation added to raise a style score.
+- Comment every non-zero `rotate` with its reason (`// slope`, `// row lean`, `// pose`).
+- Prefer clean angles: 5, 7.5, 10, 15, 22.5, 30, 45.
 
-### Detail tiers (pick one before starting)
-| Tier | Boxes | Texel density | Head share | Use |
-|---|---|---|---|---|
-| Chibi | 15-40 | 16 px per block | 40-50% | pets, icons, small mobs |
-| Standard | 80-200 | 16 px per block | 20-30% | most mobs and mounts |
-| Hero | 200-450 | 16-32 px per block | 15-25% | bosses, showcase creatures |
-| Elder | 450-900 | 32 px per block | 10-18% | flagship monsters |
+### 3.4 Size floors
+- **On creatures larger than the player,** no box is thinner than 1.5 units in two dimensions. Exceptions: tips (claw, tooth, fang, horn tip, spike tip) and eyes. Finer detail goes into texture or a cut-out plane.
+- **Minimum add-on size:** a plate or add-on is at least one eighth the size of the part it sits on. Anything smaller is painted.
 
-### Cut-out planes: how to use them
-- Paint the edge shape in the texture's alpha, with a jagged or stepped pixel outline; avoid straight plane borders showing.
-- Membranes: one plane per wing bay, edge scalloped between spars, 2-6 holes clustered near the outer trailing edge, more damage on older or fiercer creatures.
-- Fringes: narrow planes along the back of the neck, jaw line, elbows and tail, spikes 1-3 px wide, pointing away from the direction of travel.
-- Hanging and growing things: moss, cloth, roots, icicles as vertical planes with dripping edges of uneven length.
-- Always double-sided, and never coplanar with a box face.
+### 3.5 Connection
+- Every element touches or overlaps a neighbour; nothing floats.
+- Seat chain segments (neck, spine, tail, horn) 25-30% into the parent: `attach(..., seat=0.28)`.
+- **Overlap where forms flow together,** but each box must still show a real part of itself. SyncCraft rejects a box that is more than about 65% buried.
+- **Cross-bone seams use `blend_with`.** For a seam into a mirrored subtree, list both names, because `mirror_x` does not rename `blend_with` targets.
+- **Joint test:** rotate each joint 30 degrees both ways. Overlap must cover the gap.
 
-### Vehicles, machines and buildings
-- Start from two or three big volumes, then chamfer corners with rotated boxes.
-- Add function-driven detail: every greeble should look like it does something (hinge, vent, lamp, rail, pipe).
-- Wheels: octagon rim, darker octagon tyre with tread pixels, hub with a bolt pattern.
-- Decals carry story: numbers, names, warning stripes, patched panels.
-- Weathering follows gravity and use: streaks under seams, wear on edges and steps, dirt near the ground, a top-surface layer (snow, moss, dust).
+### 3.6 Construction check (run every pass)
+**Guards:**
+- An average of at most 3.5 boxes per bone outside the head. Any bone with more than 8 boxes needs a written reason.
+- The 10 largest boxes hold at least 50% of box volume.
+- Mirror parity is OK.
 
-## Body-part guide for entities
+These are starting thresholds, measured on one good model and several bad ones; tighten them with your own approved models. Passing them does not make a model good. Failing them almost always means shard armour or broken symmetry.
 
-Sizes are in head-lengths (HL) unless stated. Box counts are for a large creature; halve them for small animals. Each part lists structure first, then what to paint.
+```python
+# usage: python construct_check.py <SyncCraft repo> <model.blockdsl>
+import sys, collections, numpy as np
+sys.path.insert(0, sys.argv[1] + "/src")
+from synccraft.dsl.parser import parse_program
+from synccraft.kinematics.se3_chain import compile_geometry
+s = compile_geometry(parse_program(open(sys.argv[2]).read()))
+boxes = [b for b in s.boxes if min(b.size) > 0]
+vol = np.array(sorted((float(np.prod(b.size)) for b in boxes), reverse=True))
+per_bone = collections.Counter(b.bone_name for b in boxes)
+key = lambda b, sx: (round(sx * float(b.center[0]), 1), round(float(b.center[1]), 1), round(float(b.center[2]), 1))
+left = sorted(key(b, -1) for b in s.boxes if b.center[0] < -0.05)
+right = sorted(key(b, 1) for b in s.boxes if b.center[0] > 0.05)
+print(f"elements {len(s.boxes)}  boxes/bone {len(boxes)/len(per_bone):.1f}  top-10 volume {vol[:10].sum()/vol.sum():.0%}")
+print("busiest bones", per_bone.most_common(4))
+print("mirror parity", "OK" if left == right else f"BROKEN ({len(left)} left vs {len(right)} right)")
+```
 
-### Head (spend the most here)
-- **Skull**: one main block, slightly wider at the back than the front. Add a brow box per side that overhangs the eye by half a unit; the shadow under it gives expression. Tilt brows inward 5-10 degrees for a predator, outward for a gentle look.
-- **Snout**: one or two boxes, narrower and lower than the skull, stepping down toward the nose. Rotate the top box down 5-15 degrees so the profile slopes. Add a nose or nostril bump at the tip.
-- **Jaw**: separate bone hinged at the back-bottom of the skull. Make it narrower than the upper jaw so upper teeth overlap it. Add a chin box; a jaw with depth reads stronger than a flat plate.
-- **Teeth**: do not model every tooth. Two to four large fangs as geometry (canines, tusks); the rest as a painted row with dark gaps. Fangs angle slightly outward and back.
-- **Eyes**: usually painted, set in the shadowed zone under the brow, 2x1 or 2x2 px with one highlight pixel and a dark upper lid line. Glowing eyes bleed 1-2 px of colour onto the socket. Model an eye bump only for frogs, chameleons, crocodiles and insects.
-- **Cheeks and jaw muscles**: one box per side behind the mouth corner widens the head and anchors frills or tufts.
-- **Ears, frills, fins**: planes or half-unit slabs on their own bones, angled back and outward 20-45 degrees, never flat against the head.
-- **Horns**: 3-5 tapering segments, each rotated 10-25 degrees from the last, so the curve is visible in side and front views. Base overlaps the skull. Pair a main horn with one or two smaller ones of a different length; identical horns look generated.
-- **Paint**: darker around the mouth and eye sockets, lighter on the brow ridge and snout top, a lighter underjaw, lip line one shade darker.
+## 4. Symmetry and the rest pose
+- **Build only the left side (-X) and the centreline.** Generate the right side with `mirror_x(name)` or `mirror(axis=x)` on bones and macros, and `mirror: true` on stamps. Never hand-place a right-side part.
+- **Centreline parts:** centre at x = 0 exactly, symmetric sizes, no yaw or roll.
+- **The rest (bind) pose is symmetric about the X = 0 plane.**
+  - Spine, neck, head and tail use pitch only.
+  - Left and right limbs mirror each other.
+  - Gesture comes from pitch: an S-curved neck, a lifted tail, a lowered head.
+- **Attitude goes in a display pose or animation clip,** never the rest pose. That means a turned head, a tail swing, a raised paw or one wing higher.
+- **Real asymmetric anatomy** (a broken horn, a one-sided molt) is declared in the trait sheet. Build it as a clearly named overlay *after* symmetry is verified.
+- **Verify three ways:**
+  1. the construction check (mirror parity);
+  2. `analyze_morphology(program).symmetry_pairs`;
+  3. front and top renders beside a mirrored copy.
 
-### Neck
-- 2-5 segments. Give it an S-curve: first segments rise, last segment and head pitch back down. A straight neck is the most common cause of a toy-like look.
-- Each segment slightly smaller than the last toward the head; the base is nearly as deep as the chest front.
-- Throat plates or a lighter underside strip, and a dorsal row (spikes, mane, fin) that continues from the back.
+## 5. Pipeline and pass gates
 
-### Torso
-- Three masses, not one box: **chest** (deepest and widest), **waist** (narrowest), **hips**. Rotate chest and hips a few degrees relative to each other so the back line arches or dips.
-- Add shoulder and haunch masses as separate boxes on the flanks; limbs attach to these, not to a flat side. They are the main cue that the creature has muscles.
-- Belly: a lighter, slightly narrower strip of plates below. Back: a dorsal ridge that peaks over the shoulders.
-- Break the top edge. Stack a smaller rotated box on the chest for withers or a hump so the silhouette is not a rectangle.
-- **Paint**: countershade (dark back, mid flank, light belly) with a soft band at each transition; pattern (stripes, spots, scale rows) follows the body's long axis and thins toward the belly.
+### 5.1 Reference board (before any box)
+- **At least 10 images per model, filed by category:**
+  - front, side, back, top;
+  - three-quarter front and back;
+  - head close-ups (side and front);
+  - limb or foot close-up;
+  - wing or tail close-up;
+  - official render;
+  - gameplay screenshot;
+  - approved community Blockbench work.
+- **Label missing views.** If images cannot be viewed in your environment, say so and ask for them. Never invent what a picture shows.
+- **Part map.** For each region (head, neck and torso, forelimbs or wings, hind limbs, tail, surface), write 2-5 lines in head-lengths: shape, proportion, angles, counts of horns, spikes and toes, and colours. Mark each trait keep, exaggerate, merge, paint or drop. Geometry is for whatever changes the silhouette; texture is for everything else.
+- **Zoomed crops** of the head, horns, limbs and tail tip are what every regional check compares against.
 
-### Limbs
-- Three segments plus foot, each with a different length, thickness and angle. Zig-zag in side view: digitigrade hind leg goes forward-back-forward; a fore leg goes back-forward.
-- **Upper segment** is the thickest and partly merges into the shoulder or haunch mass. **Lower segment** is 60-75% of its thickness. Add a small box for the knee or elbow point.
-- **Feet** are larger than realistic: about 1.3x the lower leg's width. Toes as 2-4 separate boxes that splay 5-15 degrees; claws as tapered boxes pitched down, with the middle claw longest.
-- Feet rest flat on the ground plane; heels may lift on digitigrade legs but toes do not float.
-- Forelimbs that grasp: the hand is a palm box plus 3 fingers and a thumb, each a single box with a claw.
-- **Paint**: darker toward the feet, lighter kneecap highlight, claws with a light top edge and dark base.
+### 5.2 Passes
+| Pass | Goal | Must produce |
+|---|---|---|
+| W1 Blockout | 12-25 primary masses, gesture, proportions in head-lengths; head gate (6.6) | white renders: front, side, top, three-quarter front and back, side and front silhouettes |
+| W2 Secondary | forms that change the outline: brow, cheek, jaw, shoulder and haunch, knees and elbows, horn segments, wing fingers, feet | the same, plus a region sheet: head side, three-quarter and front; torso side; limb side; wing top; tail top |
+| W3 Refine | fix every regional critique; recheck proportions with numbers; delete or merge anything that does not change the silhouette | the same |
+| D1 Detail | plate rows, claws, teeth, spike rows, membranes, fur planes, on focal areas first | the same |
+| D2 Detail | tilts, joint overlaps, connection and symmetry; remove anything noisy | the same |
+| T1 Texture | base colours per material, banded light, features (eyes, mouth, markings) | textured renders plus the atlas |
+| T2 Texture | calm the surfaces, sharpen focal contrast, place glow, squint test | the same |
+| A1 Rig and motion | pivots at joints, 30-degree test at every joint, symmetric rest pose, idle plus walk (`gait`), swept-motion audit | clip previews or key stills |
 
-### Wings
-- **Membrane wings**: shoulder, forearm, wrist, then 3-4 finger spars fanned from the wrist. Spars are thin tapered boxes; membranes are planes between them, each at its own height so they layer. The trailing edge should scallop: let each membrane end shorter between spars.
-- **Feathered wings**: arm boxes hidden under 3 rows of plane feathers (coverts, secondaries, primaries), each row longer and darker, with 3-5 separate primaries splayed at the tip.
-- Folded pose: forearm folds back over the upper arm, fingers gather and point to the tail; keep it for ground poses to avoid a wall of membrane.
-- Span for a believable flyer is 2-3x body length, wing root is at least as thick as the upper foreleg, and a thumb claw at the wrist gives scale.
-- **Paint**: spars take the body colour and are clearly thicker than a pure skeleton would be. The membrane takes the underside colour as a stepped or dithered pixel gradient running from spar to trailing edge. Cut the trailing edge ragged in the texture's alpha and add holes near the outer tip; see "Cut-out planes".
+The white model is a draft. It must survive W2 and W3 before any detail.
 
-### Tail
-- 5-9 segments tapering to 20-30% of the base thickness. Continue the body's gesture curve; lift or curl the tip.
-- Base is nearly as thick as the hips so the body flows into it.
-- Carry the dorsal row down it, shrinking, then end with one signature feature (blade, club, fin, tuft, stinger, crystal cluster).
-- Length 1-1.5x the torso for balance on bipeds and long-necked forms.
+### 5.3 Every pass
+1. Re-read this skill, open the anchors, and open this model's reference board.
+2. Build or edit.
+3. Run the SyncCraft audit and the construction check (3.6).
+4. Render the view set and the region sheet.
+5. For each region, write: "reference shows ...; model shows ...; change ...".
+6. Log in `PROJECT_GOAL.md`: what changed, the check results and the open issues.
 
-### Surface add-ons
-- **Spikes and plates**: rows of 5-12, largest at the shoulders or skull, shrinking both ways; alternate two sizes; lean them back 10-30 degrees.
-- **Fur and manes**: clumps as tilted slabs or planes in 2-3 layers, tips lighter; never a single fuzzy block.
-- **Armour and scales**: large plates as geometry only where they overlap an edge; everything else as painted scale rows.
-- **Crystals, embers, growths**: clusters of 3-7 rotated prisms of mixed height, emissive, with glow bleed painted on the surface beneath.
+### 5.4 Punch back to W1 when any of these is true
+- The silhouette does not read as the subject from the side and front.
+- The head fails its gate or its proportions (6.1).
+- Mirror parity is broken without a declared reason.
+- The construction guards fail (3.6).
+- A forbidden construction from 3.2 is present.
+- The owner or a reviewer says it does not look like the reference or the style.
 
-## Connected bodies: overlap, seating and shingles
+Detail and texture passes may not be used to fix base problems.
 
-A creature must read as one continuous form. Boxes that merely touch face to face look like a train of crates. The references solve this with deliberate overlap, and the two densest ones (a tan-and-teal plated beast and a quill-covered beast) are built almost entirely from overlapping slabs.
+## 6. Heads (most failures happen here)
 
-### Seat every segment
-- Push each neck, torso and tail segment 25-30% of its length into its parent. In Block-DSL set the attach anchor to about 0.72 of the face distance instead of 1.
-- Seat limbs one to two units into the shoulder or haunch mass, and the head into the last neck segment.
-- After seating, re-check ground contact and total length; proportions shrink a little.
+### 6.1 Proportions
+- **Head length to head height** (back of skull to nose tip, against top of cranium to bottom of the closed jaw):
 
-### Cover every joint
-- Lay a pair of plates over the top corners of each segment, tilted outward 15-20 degrees and pitched 8 degrees, reaching one to three units past the joint. They hide the seam and turn when the joint turns.
-- From the back of the skull, fan three crest plates over the first neck segment (one centre, two angled out 20-25 degrees). This is what connects head to neck.
-- Use the same idea at shoulder, hip and tail root.
+  | Head type | Length : height |
+  |---|---|
+  | Wolf-like and fanged heads | 1.3-1.7 |
+  | Flying wyverns and dragons | 1.6-2.1 |
+  | Brutes | 1.2-1.6 |
+  | Long-snouted leviathans and crocodilians | up to 2.6 |
 
-### Shingle for armour and fur
-- Lay plates like roof tiles: each covers 30-50% of the next, all leaning the same way (back and outward), in rows that follow the body's flow lines.
-- Vary length and tilt slightly within a row; make plates largest over the shoulders and smaller toward head and tail.
-- Dense tier: several rows deep, hundreds of slabs; standard tier: one row at joints plus a dorsal row.
-- Quills and spines are the same technique with thin, long slabs fanned 10-15 degrees apart from a shared root area.
-- Alternate two or three tones of the body colour plate by plate so each tile reads.
+  Above the range, the face is too long: **shorten the snout first.**
+- **Muzzle:**
+  - length 0.6-1.0x the cranium length;
+  - width 0.6-0.8x the cranium width;
+  - its top 10-25% lower than the brow.
+- **Widest at the cheeks or the back of the skull, never at the snout.** SyncCraft flags a snout wider than 0.88 of the skull as a "doghouse" head.
+- **Size:** a large monster's head is 15-25% of its body length without the tail. Never shrink the head to make room for detail.
 
-### Limits
-- Every box must still show a real part of itself. If a plate is more than about two thirds buried, shrink or move it.
-- In Block-DSL the sculpted profile accepts overlap only inside one bone or between a bone and its direct parent. A plate that reaches a grandparent or a sibling chain is rejected; shorten it or parent it differently. Two concentric boxes as an octagon are also rejected.
-- Underside plates should be wide (nearly the body's width) and sunk so only about one unit protrudes; narrow protruding plates read as planks.
+### 6.2 Depth: no flat faces
+A face is flat when the front and three-quarter views show one plane. Build at least three depth steps:
+1. **Brow ridge** per side, overhanging the eye by 0.5-1 unit and tilted 10-20 degrees (inward for predators). Its shadow gives the expression.
+2. **Cheek (zygomatic) box** per side behind the eye, widening the head.
+3. **Muzzle**, stepped down and narrower, pitched down 5-15 degrees, with a nasal ridge and a nose.
 
-### Connection check
-Render the side view and look only at the outline of the back and belly from skull to tail tip. It should be one flowing line with small steps, never a row of rectangles with notches between them. Then view each joint close up.
+Then the **jaw**: a separate bone, narrower than the upper jaw, deep at the back, its top meeting the tooth line. Add a chin if the reference has one.
 
-## Wings and limbs in depth
+**Tests:**
+- *Front view:* the head outline is a wedge or shield (wide at the cheeks and top, narrower at the muzzle), never a rectangle.
+- *Side view:* the profile shows the brow step, the muzzle top, the nose, a clear mouth line and the jaw angle.
 
-Blockbench and Minecraft animate rigid pieces only: bones rotate, move and scale; nothing bends. Every wing and limb must therefore be designed as a set of rigid parts that still look right when each part rotates. Decide the creature type first, because the process differs.
+### 6.3 Eyes
+- **Where:**
+  - on the side faces of the cranium, where it meets the muzzle (the front quarter to third of the cranium);
+  - just under the brow;
+  - about 55-65% of the way up from the bottom of the jaw.
+- **Facing:** predators' eyes angle forward 15-30 degrees and show in the three-quarter front view and partly in the front view, under the brow. Herbivores' eyes sit more to the side.
+- **How:** a painted stamp, mirrored.
+  - A dark socket of about 4 x 3 px at 32 px per block.
+  - Iris 2 x 2 or 2 x 1.
+  - A 1 px pupil or slit and a 1 px glint.
+  - Glowing eyes bleed 1-2 px into the socket.
+  - Only bulging eyes get a shallow box.
+- **Wrong:**
+  - on the top face or on the muzzle;
+  - centred at mid-height on the side of the skull;
+  - left and right at different heights;
+  - a cube stuck on the surface;
+  - a cluster of equal eyes.
+- **Many-eyed creatures:** two main readable eyes; the rest are smaller painted pairs.
 
-### Choose the process by type
+### 6.4 Horns, crests and ears on the head
+- Roots sit at the back-top of the cranium or on the brow, overlapping the skull. Directions follow the reference; construction follows 7.1.
+- Crest plates fan from the back of the skull over the first neck segment. This is what joins head to neck.
 
+### 6.5 Mouth
+- **Teeth:** 2-4 fangs as boxes. The rest are a painted row with dark gaps over a dark gum line.
+- **Rest pose:** the mouth is slightly open if the reference shows it.
+- **The jaw stays.** Only creatures smaller than the player that never open their mouth may merge it into the head.
+
+### 6.6 Head gate (end of W1 and every later pass)
+Render the head alone at 9 px per unit or more: side, front and three-quarter front. Compare with the head close-ups.
+
+**It passes only when:**
+- the proportions are in range (6.1);
+- there are at least three depth steps;
+- the eyes are placed per 6.3;
+- the horns read as real blocks;
+- the jaw is present and meets the upper jaw;
+- a viewer could name the species from the head alone.
+
+Otherwise stop and rebuild the head before anything else.
+
+## 7. Horns, spikes and plates
+
+### 7.1 Horns
+- **Segments:** 2-4. Use 5 only for a signature horn longer than the head.
+- **Root thickness:** at least one fifth of the cranium width, and at least 2 x 2 units on large creatures.
+- **Taper:** each segment 70-85% of the previous one, and at least twice as long as it is thick.
+- **Curve:** bend 10-25 degrees per segment in one consistent direction, so the curve reads from both front and side. Seat each segment 25% into the previous one.
+- **Pairs and secondaries:** pairs are mirrored. Secondary horns are shorter and a different length from the main pair.
+- **Tip:** the last segment may be a small box. Paint the light tip on the last segment only, so the horn doesn't look striped.
+
+### 7.2 Spikes
+- **One box each** (3.2).
+- **Rows of 5-12:** graded, largest at the focal point, leaning back 10-30 degrees with the row.
+- **Clusters of thin spikes** are cut-out planes.
+
+### 7.3 Plates and armour
+- **Rows:** plates follow the body's flow lines, and each covers 30-50% of the next. A row shares one lean.
+- **Size:** largest over the shoulders, smaller toward head and tail.
+- **Underside scutes:** wide (nearly the body's width), sunk so about 1 unit protrudes, parallel to the body.
+- **Only plates that change the silhouette are geometry.** The rest are paint.
+
+## 8. Body parts
+
+### 8.0 Choose the process by body type
 | Type | Wing or front limb | Legs | Build order |
 |---|---|---|---|
-| Six-limbed dragon | separate wings rooted on a shoulder mass above the forelegs | four pillar legs, fore pair straighter, hind pair zig-zag | torso masses, legs, then wings last so they clear the legs |
-| Wyvern (wing-walker) | the wing arm is the foreleg: thick humerus and forearm, wrist with a claw that touches the ground, fingers folded back along the forearm | two heavy hind legs with a large thigh, crouched | hind legs and tail first for balance, then wing arms posed as props |
-| Upright elder or biped | wings on the back, often two layers; long arms with clawed hands | long digitigrade legs, three long toes | spine curve first, legs, arms, wings |
-| Feathered or bird-like | arm hidden under three rows of feather planes | thin tarsus, big thigh fluff, splayed toes | body, feather rows inner to outer |
+| Six-limbed dragon | wings rooted on their own shoulder mass above the forelegs | four legs: fore pair straighter, hind pair zig-zag | torso masses, legs, then wings so they clear the legs |
+| Wyvern (wing-walker) | the wing arm is the foreleg: thick humerus and forearm, a wrist claw that touches the ground, fingers folded back along the forearm | two heavy hind legs with a large thigh, crouched | hind legs and tail first for balance, then wing arms |
+| Upright elder or biped | wings on the back; long arms with clawed hands | long digitigrade legs, three long toes | spine curve, legs, arms, wings |
+| Feathered or bird-like | arm hidden under three rows of feather planes | thin tarsus, big thigh fluff, splayed toes | body, then feather rows from inner to outer |
 | Insect or many-legged | thin plane wings with a vein texture, or wing cases | femur up and out, tibia down, small foot | body segments, then legs in mirrored pairs |
-| Machine | panels, rotors, or none | pistons and linkages; see below | chassis, joints, then limbs |
+| Machine | panels, rotors or none | pistons and linkages (8.7) | chassis, joints, then limbs |
 
-### Membrane wings: skeleton
-- Four spar levels: **root mass** on the body, **upper arm**, **forearm**, then **fingers** from the wrist. The elbow is the high point when the wing is raised; the wrist is the outermost corner of the leading edge.
-- Spars are thick: 2-4 units on a standard dragon, roughly the thickness of the lower leg. Thin sticks look weak and vanish at distance. Taper only the last third of each finger.
-- Three fingers are enough at standard tier, four at hero tier. The first continues the leading edge; the last points back toward the hip. Spread 25-40 degrees between neighbours when open.
-- Give the two longest fingers a knuckle (two bones each) so the tip can curl and the wing can fold tighter.
-- Mark elbow and wrist with a slightly larger rotated box and add a thumb claw at the wrist.
-- Open-wing size: each wing about one body length (nose to hip) from root to tip; total span two to three body lengths.
+**Starting proportions in head-lengths (head : neck : torso : tail):**
 
-### Membrane wings: partition the membrane
-A membrane cannot bend, so slice it along the bones.
-- **One panel per bone.** Each finger bone carries the panel behind it; a two-bone finger carries two panels. The forearm and upper arm each carry one. A standard three-finger wing has seven panels per side.
-- **Parent each panel to the spar on its leading side**, so the panel follows that spar when it rotates.
-- **Shape each bay as a triangle fanning from the wrist**, cut in the texture's alpha: a panel is opaque only as deep as its distance from the wrist times the tangent of the gap to the next finger. The rectangle is the carrier; the alpha draws the sector.
-- **Layer the panels.** Put neighbouring panels at slightly different heights (a quarter to half a unit) and let each overlap the next by 1-2 units. When fingers close, panels slide over one another like a hand fan and no gap opens. Panels at the same height flicker and are rejected by the audit.
-- **Scallop and tear only the trailing edge.** Keep the edge along the next finger clean so the overlap hides it. Holes belong in the outer panels only, two at most per panel.
-- **Test the fold before texturing.** Rotate the fingers and forearm to a folded pose and view from above: no gaps between panels, no panel poking through the body. In the second test flight this check passed visually and also revealed two spar collisions at the tightest fold, which set the joint limits.
-- For large wings, split a long bay again across its length (inner and outer panel on the same bone) only if the wing must curl in animation.
+| Body plan | Ratio | Notes |
+|---|---|---|
+| Western dragon | 1 : 2 : 3 : 4 | chest deep enough for two shoulder girdles |
+| Wyvern | 1 : 1.5 : 2.5 : 3.5 | big chest, small hips |
+| Drake or fanged beast | 1 : 0.8 : 3 : 2.5 | heavy forequarters |
+| Brute | 1.2 : 0.6 : 2.5 : 2.5 | thick counterweight tail |
+| Eastern dragon | 1 : body 10-14 in one long S | the body is the neck |
+| Serpent or leviathan | 1 : body 8-12 | the read comes from the curve and the fin rhythm |
+| Elder or boss | add 20% to the head and the signature feature | |
 
-### Membrane wings: poses
-- **Raised display** (the reference red dragon): upper arm up and back, forearm up and forward, fingers fanned down and out. Best for turnarounds.
-- **Folded at rest:** forearm back along the upper arm, fingers closed and pointing to the tail, wing held against the flank.
-- **Wing-walk** (the reference tan wyvern): wrist on the ground, fingers folded up and back so the panels stack along the forearm.
-- Roll the whole wing at the shoulder for flapping; fold with yaw at elbow, wrist and fingers. Keeping these two motions on different joints keeps the panels parallel.
+### 8.1 Neck
+- 2-5 segments in an S-curve made with pitch. Each segment is slightly smaller than the last toward the head.
+- The base is nearly as deep as the front of the chest.
+- Add throat plates and a dorsal row that continues from the back.
 
-### Legs: structure
-- Read the reference's stance first: **pillar** (elephant, heavy dragons: nearly straight, wide feet), **cursorial zig-zag** (wolf, deer, most dragons' hind legs), **crouched biped** (wyvern, theropod), **sprawled** (lizard, crocodile, insects).
-- Each leg is thigh or shoulder mass on the body, upper segment, lower segment, foot. Thickness steps down about 30% per segment, then the foot widens again.
-- Add the shapes that make it a leg and not a post: a knee or elbow box, a calf bulge on the back of the lower segment, a heel block behind the foot. In the second test flight these three boxes per leg changed the read more than doubling the leg's thickness did.
-- **Feet:** a pad in the body colour, three toes in the underside colour, and separate claws in the hard-part colour pitched down 15-20 degrees. Outer toes splay about 14 degrees. Reference dragons all show pale toes against a darker leg.
-- Hind thighs are the biggest mass on the leg and overlap the hip by one to two units so the leg seems to grow out of the body.
-- Paint horizontal bands sparingly on the upper and lower segments; one darker row in five.
-- Before rigging, rotate each joint 30 degrees both ways and look: overlapping boxes at knee and ankle must cover the gap.
+### 8.2 Torso
+- **Three masses:** chest (deepest), waist (narrowest) and hips, pitched a few degrees relative to each other so the back line arches.
+- **Shoulder and haunch boxes** on the flanks; limbs attach to these.
+- A smaller box on the chest for withers or a hump, so the top edge isn't a straight rectangle.
+- **Connection check:** in side view the outline from skull to tail tip is one flowing line, never a row of crates.
 
-### Arms and hands
-- Shoulder, upper arm, forearm, palm, then three fingers and a thumb, each one box plus a claw. Long thin fingers are separate boxes splayed at different angles (the reference elder dragon).
-- Rest pose with elbows bent and fingers half curled; a straight arm with flat fingers looks like a toy.
+### 8.3 Limbs
+- **Choose the stance from the reference:** pillar (heavy), cursorial zig-zag (most dragons' hind legs), crouched biped (wyverns) or sprawled (lizards, insects).
+- **Segments:** thigh or shoulder mass, then upper segment, lower segment and foot.
+  - Thickness steps down about 30% per segment.
+  - The foot widens again, to about 1.3x the lower leg.
+- **Knee or elbow box, calf bulge and heel block.** These three boxes per leg turn a post into a leg.
+- **Toes:** 3 boxes, splayed 5-15 degrees. Claws are single boxes pitched down 15-20 degrees, the middle one longest.
+- **Grounding:** toes rest on the ground (y = 0). Splay legs at the knee, with the opposite roll on the foot, not at the hip.
 
-### Machine limbs and wheels
-- Joints are octagons: a hub box rotated 45 degrees, with a painted bolt, larger than the limb it joins. Note that Block-DSL's sculpted audit rejects two concentric boxes as an octagon; use one rotated box or offset the second.
-- Limbs are beams with visible mechanics: a piston (thin rod sliding in a thicker sleeve), a parallel link, a cable or hose made of many short segments.
-- Feet are plates or pads with toes as chamfered slabs. Wheels are an octagon tyre, a rim and a hub.
-- Machines move by rigid rotation and sliding, which suits the format; design each moving part with a clear axis and leave a visible gap around it.
+### 8.4 Wings
+- **Skeleton:** root mass, upper arm, forearm, wrist, then 3-4 fingers.
+  - Spars 2-4 units thick, tapering only in their last third.
+  - Knuckles on the two longest fingers.
+  - A thumb claw at the wrist.
+- **Membrane partition:** one cut-out panel per bone, parented to the spar on its leading side.
+  - Cut each panel in alpha to its bay polygon: wrist, tip of the leading finger, tip of the next finger.
+  - Scallop and tear only the trailing edge; at most two holes in the outer panels.
+- **Panel heights** (in each spar's frame):
+  - inside the panel's own spar's thickness, outside the neighbour's;
+  - consecutive panels differ by at least 0.125 (use `layer: k`).
+- **Folding:** fold with yaw at the elbow, wrist and fingers; flap with roll at the shoulder. Test the folded pose from above before texturing.
+- **Span:** each wing about one body length (nose to hip).
+- **Poses:**
+  - *raised display* for turnarounds: upper arm up and back, forearm up and forward, fingers fanned down and out;
+  - *folded at rest*: fingers closed and pointing to the tail, the wing held against the flank;
+  - *wing-walk*: wrist on the ground, panels stacked along the forearm.
 
-## Dragons and imaginary creatures
+  The folded and wing-walk poses are mirrored on both sides.
+- **Feathered wings:** arm boxes under 3 rows of feather planes, with 3-5 separate primaries at the tip.
 
-An invented creature is convincing when it borrows real anatomy and commits to one idea.
+### 8.5 Tail
+- 5-7 segments tapering to 20-30% of the base thickness. The base is nearly as thick as the hips.
+- Continue the gesture with pitch, and lift or curl the tip.
+- Carry the dorsal row down the tail, shrinking.
+- End with **one** signature feature: a blade, club, fin, tuft or stinger.
 
-### Design recipe
-1. **One-line concept**: element or habitat + temperament + role ("storm-charged alpine ambusher").
-2. **Two or three animal anchors** for anatomy: for example wolf body, eagle wing, crocodile tail. Take proportions and joint layout from them.
-3. **Shape language**: pick one and apply it to horns, spikes, plates and claws alike.
-   - Triangles and blades: aggressive, fast.
-   - Squares and slabs: heavy, armoured, ancient.
-   - Curves and circles: gentle, aquatic, young.
-4. **One signature feature** exaggerated 1.5x (a crown of horns, a hammer tail, glowing back crystals) and at most two supporting features. Everything else stays quiet.
-5. **Palette of 3 + 1**: body colour, underside colour, hard-part colour (horn, claw, plate), plus one saturated accent that also glows.
-6. **Plausibility pass**: where are the muscles that move each limb, where is the centre of mass, how does it fold its wings, how does it eat.
+### 8.6 Arms and hands
+- **Chain:** shoulder, upper arm, forearm, palm, then three fingers and a thumb. Each finger is one box plus a claw.
+- **Rest pose:** elbows bent and fingers half curled. A straight arm with flat fingers looks like a toy.
 
-### Body plans and starting proportions
+### 8.7 Machines, vehicles and buildings
+- **Volumes:** start from two or three big volumes, then chamfer the corners that show in silhouette with rotated boxes.
+- **Greebles:** every one must look like it does something: hinge, vent, lamp, rail, pipe.
+- **Joints and wheels:**
+  - joints are octagon hubs with a painted bolt, larger than the limb they join;
+  - wheels are an octagon tyre with tread pixels, a rim and a hub;
+  - a piston is a rod sliding in a thicker sleeve;
+  - a hose is 4-7 seated segments, not dozens.
+- **Decals tell the story:** numbers, hazard stripes, patched panels.
+- **Weathering follows gravity and use:** streaks under seams, wear on edges, a top-surface layer (snow, moss, dust).
 
-| Type | Limbs | Head : neck : torso : tail | Notes |
-|---|---|---|---|
-| Western dragon | 4 legs + 2 wings | 1 : 2 : 3 : 4 | Wings root above and behind the fore shoulders on their own mass; chest must be deep enough for two shoulder girdles |
-| Wyvern | 2 legs + wing-arms | 1 : 1.5 : 2.5 : 3.5 | Walks on wing wrists or stands bird-like; big chest, small hips |
-| Drake or fanged beast | 4 legs, no wings | 1 : 0.8 : 3 : 2.5 | Mammal-like stance, heavy forequarters, expressive head and mane |
-| Brute | 2 heavy legs, small arms | 1.2 : 0.6 : 2.5 : 2.5 | Oversized head and jaw, thick tail as counterweight |
-| Eastern dragon | 4 short legs | 1 : body 10-14 in one long S | Body is the neck; antlers, whiskers, mane, no wings |
-| Serpent or leviathan | fins or none | 1 : body 8-12 | Read comes from the curve and the fin rhythm |
-| Hydra | 4 legs, 3+ necks | necks 3 each | Vary neck heights and head poses; widest chest |
-| Elder or boss | any | add 20% to head and signature feature | More layers of plates and a second glow colour |
+### 8.8 Cut-out planes
+- Paint the edge shape in alpha with a stepped pixel outline; no straight plane borders should show.
+- Planes are always double-sided, and never coplanar with a box face or another plane (use `layer`).
+- **Fringes:** run along the back of the neck, the jaw line, the elbows and the tail, with spikes 1-3 px wide pointing away from the direction of travel.
+- **Hanging things** (moss, cloth, roots, icicles): drips of uneven length.
 
-### Element and theme motifs
+## 9. Creature classes, scale and categories
 
-| Theme | Forms | Surface and palette | Glow |
-|---|---|---|---|
-| Fire, magma | cracked plates, swept-back horns, ember vents | charcoal and deep red hide, bone horns | orange-yellow in cracks, throat, wing veins |
-| Ice | crystal clusters, smooth blades, fur ruffs | pale blue and white, navy shadows | cyan in crystals and eyes |
-| Storm | fin-like crests, forked horns, long whip tail | slate blue with gold plates | electric blue or white along the dorsal row |
-| Poison, swamp | sacs, frills, drooping barbels, moss | olive and teal, sickly yellow belly | acid green in throat and sacs |
-| Earth, stone | slab armour, club tail, short thick horns | ochre, grey, lichen patches | amber in seams, or none |
-| Water, abyss | fins, trailing whiskers, smooth body | deep blue to pale belly, coral accents | bioluminescent spots in rows |
-| Shadow, void | torn membranes, extra eyes, thin limbs | near-black purple with one hot accent | magenta or violet |
+### 9.1 Scale tiers
+| Subject | Treatment | Element ceiling (guide) |
+|---|---|---|
+| Elder dragons and boss monsters, any size | hero or elder, epic and deliberate | 200-450 |
+| Large monsters (bigger than the player) | hero | 150-350 |
+| Player-sized monsters and mounts | standard to hero | 80-220 |
+| Smaller than the player (fish, birds, insects, critters) | simplified, but still clean and banded | 15-80 |
+| Gathering points and props | prop | 8-60 |
 
-### Dragon head recipe
-Skull, sloped two-part snout, deep jaw, strong brow, cheek box, two main horns of 4 segments, two shorter horns or frills, 2-4 visible fangs, a nose feature, and a dorsal crest starting between the horns. Around 35-60 boxes for a large dragon. View it alone from front, side and three-quarter before attaching it.
+**Texel density:** 32 px per block for hero and elder creatures, 16 for standard and small ones. Keep one density per asset.
 
-### Posing the bind pose
-Do not model in a stiff T-pose. Give the rest pose a slight attitude: head lowered and turned a little, one fore foot ahead, tail curved, wings half open and raised. The rig can still animate from it, and every render looks alive.
+**Community scale anchor:** a popular animated community fire dragon is about 415 cubes, 8 blocks tall, at 16 px per block. That is a practical ceiling for a hero creature that still animates smoothly, not a target.
 
-### Common failures on invented creatures
-- Wings attached to the same spot as the forelegs with no extra shoulder mass.
-- Head too small; neck a straight pipe; tail a straight stick.
-- Five different motifs fighting (spikes, fur, crystals, fins, armour). Keep one main, one supporting.
-- Glow everywhere. Limit it to 3-5% of the surface, concentrated near the focal point.
-- Symmetric, evenly spaced, same-size spikes down the whole back.
-- A recognisable existing monster with the colours changed. Change the body plan, shape language and signature feature, not just the palette.
+### 9.2 Monster Hunter classes as body plans
+| Class | Body plan and construction notes | Examples |
+|---|---|---|
+| Flying wyvern | 2 legs, wing-arms; deep chest, small hips; wings 1.3-1.5x nose-to-tail span; tail tip is the signature | Rathalos, Rathian |
+| Elder dragon | often six limbs (4 legs + wings) or a unique plan; horns that sweep into the dorsal line; one strong signature | Fatalis, Kushala Daora, Velkhana, Valstrax, Alatreon, Kirin |
+| Fanged wyvern | wolf-like quadruped; heavy forequarters; short deep muzzle (6.1); fur as cut-out rows; one glow accent | Zinogre |
+| Leviathan | long body in an S made with pitch, low limbs, fins and frills as partitioned planes | Lagiacrus, Mizutsune |
+| Brute wyvern | biped, oversized head and jaw, thick counterweight tail | Anjanath, Deviljho |
+| Bird wyvern | light biped, beak or crest; often player-sized | Yian Kut-Ku |
+| Fanged beast | mammal-like, fur rows, expressive face | Rajang |
+| Temnoceran | spider-like; see 9.5 | Nerscylla |
+| Cephalopod | tentacled; see 9.5 | Nu Udra, Xu Wu |
 
-## 3. Spatial reasoning rules
+Check each game's current roster on the web, and file each monster under its class from an official source.
 
-- Measure in head-lengths first, convert to units second. Write ratios before sizes.
-- Preferred angles: multiples of 7.5 or 11.25 degrees read as intentional; use 15, 22.5, 30, 45 for structure and small off-angles (3-8 degrees) for hand-made wobble.
-- A slope is two overlapping boxes rotated toward each other, not a staircase.
-- A taper is a chain of boxes each 70-85% of the previous cross-section.
-- Overlap is allowed where one form flows into the next. Each box must still show a meaningful part of itself; never hide a box inside another.
-- Keep at least a half-unit offset or a tilt between neighbouring planes and faces to avoid flicker.
-- Left and right may differ slightly in pose (a raised paw, a tilted horn) once the base is symmetric.
+### 9.3 Environment creatures
+- **Smaller than the player** (fish, birds, small herbivores, insects): simplified per 9.1. The silhouette, symmetry, banded paint and a readable eye still apply.
+- **Herbivores larger than the player** follow the standard tier.
 
-## 4. Budgets
+### 9.4 Gathering points
+- **Rocks and ore outcrops:** 3-7 large rotated boxes, never voxel boulders.
+- **Crystals:** 3-7 single-box prisms of mixed height.
+- **Plants and mushrooms:** cut-out planes or chunky caps (one box each).
+- **Bones:** a few large box bones.
+- **Marker:** a small focal glow or contrasting accent that shows the point is interactable.
 
-| Subject | Boxes and planes | Bones | Texture |
-|---|---|---|---|
-| Small prop or item | 10-40 | 1-5 | 32-64 px |
-| Furniture, weapon, small animal | 30-90 | 5-20 | 64-128 px |
-| Large creature | 120-350 | 40-110 | 128-256 px |
-| Boss-scale dragon | 300-700 | 80-200 | 256-512 px |
-| Room diorama | 300-1500 | few | several atlases |
+### 9.5 Unsettling creatures (spiders, cephalopods, parasites): faithful, not repulsive
+- **Keep the identity:** body plan, limb count, signature shapes.
+- **Clean the presentation:**
+  - Limbs and tentacles are thicker, tapered 3-4 segment chains with a steady rhythm. No tangles, no hair-thin legs.
+  - A slightly larger body and head relative to the legs.
+  - Two clear main eyes with highlights; any extra eyes small and painted.
+  - Mouthparts simplified into 2-3 shapes; no gore, no detailed mouth interior.
+  - A graphic, saturated palette instead of flesh tones; no slime, veins or wet noise.
+- **The aim:** not cute, not disgusting. Imposing and readable.
 
-Spend about half the budget on the head and the other focal feature.
+## 10. Texture
 
-## 5. Mapping to Block-DSL
+### 10.1 Workflow
+1. Flat base colour per material from the palette.
+2. Banded light: top faces lightest, sides middle, undersides darkest. A 1 px light top edge and a 1 px dark contact edge.
+3. Material strokes in clusters, on focal zones and edges only.
+4. Features: eyes, mouth, markings, glow with a 1-3 px bleed.
+5. Squint test at 25% size.
 
-- Use `audit_profile: sculpted` for this style and `size_step: 0.5`. Strict mode suits grid-aligned test assets only.
-- Slopes and wobble: per-box `rotate` with `pivot`; curves: nested bones or `chain` with a `rest_euler` step and `taper`.
-- Thin forms: `plane`, layered at different heights; fan by yaw so sheets stay parallel.
-- Repeated detail with variation: macros with size and angle parameters, called with different values each time.
-- Palettes: ramps with `hue_shift` set so lights go warm and shadows cool; lightness 0.6-0.9 because the bake darkens.
-- Plain coats need `rd_feed=0.09, rd_kill=0.059`; lower feed gives blotches.
-- Eyes, teeth, markings, glow bleed: stamps (or hand-painted `@textures` when the bake cannot express the look).
-- Spinning parts carry no `joint_limits`. Leave a one-unit gap between surface plates and joint faces.
-- After each stage run the audits and render front, side, top and both three-quarter views. Passing the audit is necessary, not sufficient: look at the render.
+### 10.2 Clean, not dirty
+- **Calm area:** 85-90% of each surface is calm mid-tone.
+- **Scales and grain:** at most one value step of contrast, in regular offset rows.
+- **Markings:** large graphic shapes that follow the form, such as dorsal chevrons or stripes along the long axis.
+- **Colour budget:** at most 5 colours per material; 3 + 1 per creature (body, underside, hard parts, one accent).
+- **Never:** per-pixel noise, black outlines, grey shadows, or stripes reset on every segment (candy-cane horns).
+- **Glow:** at most 4% of the surface, near the focal point.
+- **Paint follows geometry:** eyes go where 6.3 says, teeth on the tooth line, highlights on top faces.
+- **Second texture pass:** it removes as much as it adds.
 
-## Lessons from test flights
+### 10.3 Paint by region
+- **Head:** darker around the mouth and eye sockets; lighter on the brow ridge and snout top. The underjaw is in the underside colour, with a lip line one shade darker.
+- **Torso:** countershaded (dark back, mid flank, light belly), with one soft band at each transition. Patterns follow the long axis and thin toward the belly.
+- **Limbs:** darker toward the feet, a lighter kneecap highlight. Bands are at most one dark row in five.
+- **Claws, horns, teeth:** a light top edge and a dark base. The lighter tip goes on the last segment only.
+- **Membranes:** the underside colour as a stepped gradient from spar to trailing edge.
 
-From the first full run (an original antlered forest dragon, 127 boxes):
+### 10.4 Presentation
+- **Turnarounds:** a dark neutral backdrop.
+- **Hero shots:** a simple scene, a key light with a coloured rim, a little bloom on emissive parts, and a cast shadow.
 
-- **Check proportions with numbers before detailing.** In the side silhouette measure head length against torso length and leg thickness against torso depth. On a standard-tier dragon the head should be at least a third of the torso length and the upper leg at least half the torso depth. The first pass had a head and legs about 30% too small and it was not obvious until rendered.
-- **Look for floating parts in a close-up of every joint.** A jaw hung a unit and a half below the snout and still passed the audit. View the head alone from the side with the mouth at rest; the lower jaw's top must meet the tooth row.
-- **Make the lower jaw the underside colour.** A cream jaw under a tooth row reads immediately; a body-coloured jaw with a small chin does not.
-- **Underside plates must hug the body.** Plates that are rotated or stick out more than half a unit read as loose planks. Sink them one unit into the body and keep them parallel to it.
-- **Bands on limbs: one dark row in five, not alternating halves.** Heavy alternating bands look like striped socks.
-- **In Block-DSL a plane with `normal: x` takes `size: [height, length]`; with `normal: y` it is `[width, length]`; with `normal: z` it is `[width, height]`.** Getting this wrong still passes the audit.
-- **Sibling planes on the centre line are coplanar.** Offset every second mane or fringe plane by a quarter unit sideways.
-- **The repository's bake and renderer do not support this style's textures.** Paint onto the exported UV layout with a script or by hand, with alpha, and preview with a renderer that respects transparency. Record that the texture was produced outside the language.
-- **Second run (wings and limbs):** partitioned seven-panel wings with triangular alpha bays folded cleanly in a top-view fold test; knee, calf and heel boxes fixed the stick-leg read. Still short of the references: wings about 70% of the size they should be, no continuous bay from the last finger to the body, underside plates on the chest still read as planks.
-- **Third run (connection):** seating segments 28% into their parents, joint shingles and skull crest plates turned the row-of-boxes body into one form; wings enlarged to full size. Remaining gaps against the references: only one row of shingles (references use many), symmetric pose, rule-generated texture, no glow or scene.
-- **Still weak after one run, so check these first next time:** torso reading as a row of boxes in side view (overlap and tilt the three masses more), dorsal fringe too short to change the silhouette (make it 15-20% of body depth), no asymmetry in the pose.
+## 11. SyncCraft and Block-DSL v4.1 (the harness)
 
-## 6. Self-critique before delivering
+### 11.1 Specifications
+Read `docs/BLOCK_DSL_V3_2_SPECIFICATION.md` (base constructs) and `docs/BLOCK_DSL_V4_SPECIFICATION.md` (v4.0 / v4.1 additions). Use SyncCraft for every model. The audits are your error correction: the SE(3) chain, SAT collisions, connectivity and grounding.
 
-- Recognisable in silhouette from two angles?
-- Is there a gesture curve, or is the spine a straight line?
-- Do limbs and tail taper? Do horns and spikes vary?
-- Is anything important still axis-aligned for no reason?
-- Are there three clear value groups and a focal point with the strongest contrast and saturation?
-- Do shadows shift hue? Any grey or noisy faces?
-- Do the feet touch the ground and does the centre of mass sit over them?
-- Does each kept identity trait from the sheet appear? Was anything copied one-to-one that should have been simplified?
+### 11.2 Meta and layout
+- `@meta { dsl_version: "4.1", audit_profile: sculpted, size_step: 0.5, units_per_block: 16, texel_density: 32 }`.
+- `@layout { budget max_boxes = ..., envelope grounded = true }`. Budgets are ceilings.
 
-## 7. Reference use and originality
+### 11.3 Constructs
+- `attach(..., seat=0.28)` for chains.
+- `mirror_x(name)` / `mirror(axis=x)` for symmetry; `mirror: true` on stamps.
+- `chain <name> attach(...) segments=N taper=... seat=... bend=[...]` for necks, tails and horns, with N within the remap limits.
+- `plane` with `layer: k` (0.25 units per step) and `edge: ragged|spikes|drip|scallop|triangle_bay`.
+- `blend_with: [...]` for cross-bone seams.
+- `octagon` for hard-surface round parts. `prism(n)` never on organic parts.
+- **Plane `size` order:**
+  - `normal: x` is `[height, length]`;
+  - `normal: y` is `[width, length]`;
+  - `normal: z` is `[width, height]`.
 
-Study existing designs to learn traits and proportions, then abstract. The goal is translation into this style, not a part-for-part reconstruction. For assets that go into a dataset or product, design original creatures that borrow *kinds* of traits (a storm-themed fanged wolf-dragon) rather than reproducing a named character from a game or another artist's model. Record the references studied and credit artists whose work informed the style.
+  A wrong order still passes the audit.
 
-## 8. Deliverables per asset
+### 11.4 Surface
+- `@style { shade: banded(steps=4, direction=down, cluster=diagonal), glow_bleed: 2 }`.
+- Coats: `scale_rows`, `banded_limb`, `plain`, `striped`, `spotted`.
+- `@stamps` for eyes and teeth.
+- Paint by hand or by script on the exported UV layout when the bake can't express the look, and record that you did.
 
-1. Trait sheet with reference images and keep/exaggerate/merge/paint/drop marks.
-2. Stage renders (blockout, secondary, detail, textured) with the regional and whole checks.
-3. The model source (Block-DSL or .bbmodel), texture, and audit result.
-4. A short note on what was simplified and why.
+### 11.5 Checks
+- `audit_scene(scene, audit_profile="sculpted")`: collisions, coplanar faces, contact and burial, budget, grounding.
+- The construction check (3.6).
+- `analyze_morphology(program)`: limbs, posture, `symmetry_pairs`.
+- `audit_behavior_clip(...)`: joint limits and swept motion.
+- `evaluate_sculpted_style_anchor(program, scene, atlas_rgba=...)`.
+
+### 11.6 Stage files and renders
+`scripts/inspect_mh_sculpt.py <id> --stage 1|2|3 --dsl-root <your dsl dir>` renders stage files laid out as `dsl/<id>/stage1_blockout.blockdsl` (W passes), `stage2_secondary.blockdsl` (D passes) and `<id>.blockdsl` (final). Keep every pass as `passes/<id>_<pass>.blockdsl`.
+
+### 11.7 Scores are diagnostics, not targets
+The style evaluator rewards a high share of rotated boxes, and the dataset tests demand at least 260 elements. Chasing either produces shard armour. Treat both as diagnostics, never as targets.
+
+### 11.8 Gotchas
+- **Re-ground** after every pose change, so the lowest toe sits at y = 0.
+- **The audit tests a plane's whole rectangle,** not its alpha shape.
+- **Every size** is a multiple of `size_step`.
+
+## 12. Subagent brief (paste into every subagent call)
+
+```
+You are working on <model> in the sculpted Blockbench style.
+Before any visual reasoning or construction, and again at the start of every pass:
+  1. read SKILL.md (blockbench-sculpted-style) in full;
+  2. open every image in style_anchors/;
+  3. open this model's reference board and its zoomed crops;
+  4. read PROJECT_GOAL.md (owner corrections included).
+Your pass: <W1|W2|W3|D1|D2|T1|T2|A1>. Inputs: <files>. Outputs: <files>, renders, region sheet, pass log.
+Hard rules - Section 1 of the skill, all 15, apply without exception.
+Use Block-DSL v4.1 through SyncCraft; run audit_scene and the construction check (3.6);
+render the view set and region sheet; for each region write "reference shows / model shows / change".
+If any punch-back test (5.4) fails, stop and report "PUNCH BACK TO W1: <reason>". Do not patch with detail.
+Report: changes, check results, region comparisons, open issues. Say plainly if you could not see an image.
+```
+
+## 13. Review rubric (every pass, by a reviewer who did not build it)
+Score each item 0, 1 or 2:
+1. silhouette
+2. head (6.6)
+3. eyes
+4. horns and spikes as real blocks
+5. construction (no shards, no fake curves)
+6. connection
+7. symmetry
+8. proportions against the reference
+9. volume hierarchy
+10. calm, clean paint
+11. vibrancy and focal point
+12. fidelity to the reference's identity traits
+13. animation readiness
+
+**Pass:** no zeros and at least 20 of 26. Any zero on items 1, 2, 5 or 7 means punch back to W1.
+
+## 14. Lessons from test flights
+- **Measure proportions before detailing.** On a standard dragon the head is at least a third of the torso length, and the upper leg at least half the torso's depth.
+- **Check every joint close up.** A jaw that floats 1.5 units below the snout can still pass the audit.
+- **Colour the lower jaw like the underside.** A cream jaw under a tooth row reads at once.
+- **Seat segments about 28% into their parents.** Shingle the joints and fan crest plates from the skull over the neck; the row of boxes becomes one form.
+- **Partitioned wings fold cleanly.** Size each panel to its bay polygon and regenerate it whenever a bone changes.
+- **The Squallwing run.**
+  - What moved it most: a wedge snout (down 5 degrees, nasal ridge down 12), jaw open 14 degrees, horns swept back 52 degrees and splayed 34, dorsal fins graded largest at the withers, a forked tail with flat streamers.
+  - Texture: low-contrast brick scale rows, dorsal-only chevrons, an eye in a dark socket under the brow.
+  - Its mistake: attitude in the rest pose.
+- **Repo v9 diagnosis.** Visual reasoning was fine, but construction shattered every form. Most of the owner's complaints trace to that one cause: dirty, ugly, a flat long face, eyes in odd places, sheet horns, broken symmetry.
+
+## 15. References, originality and licensing
+- **Monster Hunter monsters are Capcom's IP.** Fan reconstructions are for non-commercial research only. Tag them like the repo's `research_nc`, keep them out of commercial weights, and never copy textures from screenshots.
+- **For commercial work,** design originals:
+  1. one concept line (habitat + temperament + role);
+  2. 2-3 animal anchors for anatomy;
+  3. one shape language (blades: fast and aggressive; slabs: heavy and ancient; curves: aquatic or young);
+  4. one signature feature at 1.5x, plus at most two supporting features;
+  5. a 3 + 1 palette;
+  6. a plausibility pass: muscles, centre of mass, how the wings fold, how it eats.
+
+  Change the body plan, shape language and signature feature, not just the colours.
+
+  **Theme motifs:**
+
+  | Theme | Forms | Surface | Glow |
+  |---|---|---|---|
+  | Fire | cracked plates, swept horns, vents | charcoal and deep red, bone horns | orange in cracks and throat |
+  | Ice | crystal clusters, blades, fur ruffs | pale blue and white, navy shadow | cyan in crystals and eyes |
+  | Storm | fin crests, forked horns, whip tail | slate blue with gold | electric blue along the dorsal row |
+  | Poison | sacs, frills, barbels | olive, teal, yellow belly | acid green |
+  | Earth | slab armour, club tail, thick horns | ochre and grey | amber in seams, or none |
+  | Water | fins, whiskers, smooth body | deep blue to pale belly | bioluminescent rows |
+  | Shadow | torn membranes, thin limbs | near-black purple | magenta or violet |
+- **Credit** community artists and Cobblemon (CC-BY-NC) where their work informed a model.
+
+## 16. Deliverables per asset
+1. The reference board and part map.
+2. Pass files W1-W3, D1-D2, T1-T2 and A1, each with renders, a region sheet, check results and a pass log.
+3. The final Block-DSL source, the texture atlas, the `.bbmodel` export, the audit report and the rubric score.
+4. A short note on what was simplified or exaggerated, and why.

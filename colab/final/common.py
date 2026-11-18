@@ -122,8 +122,12 @@ def validate_config(c):
         local(c['init_from_release_dir'], execution_target=target)
     if 'vision_rsi_rounds' in c and (type(c['vision_rsi_rounds']) is not int or not 0 <= c['vision_rsi_rounds'] <= 8):
         raise ValueError('vision_rsi_rounds must be an integer between 0 and 8')
-    if 'rsi_mode' in c and c['rsi_mode'] not in ('instructor', 'vision_self_improvement'):
-        raise ValueError('rsi_mode must be instructor or vision_self_improvement')
+    if 'rsi_mode' in c and c['rsi_mode'] not in ('instructor', 'vision_self_improvement', 'teacher_subagent_v8'):
+        raise ValueError('rsi_mode must be instructor, vision_self_improvement, or teacher_subagent_v8')
+    if 'enable_loop_engram' in c and type(c['enable_loop_engram']) is not bool:
+        raise ValueError('enable_loop_engram must be an explicit boolean')
+    if 'loop_passes' in c and (type(c['loop_passes']) is not int or not 1 <= c['loop_passes'] <= 4):
+        raise ValueError('loop_passes must be an integer between 1 and 4')
     if any(k in c for k in ('HF_TOKEN','OPENCODE_API_KEY','token','api_key')): raise ValueError('Secrets do not belong in configuration')
     return c
 
