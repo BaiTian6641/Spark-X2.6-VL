@@ -485,8 +485,8 @@ def test_chunked_linear_cross_entropy_exact_grads_and_pinned_stage() -> None:
     assert torch.allclose(head_ref.bias.grad, head_chk.bias.grad, atol=1e-5, rtol=1e-5)
 
     # Verify single-flush integration with MergedGradientAccumulator across 2 weighted microbatches!
-    acc_head = torch.nn.Linear(hidden, vocab, bias=False)
-    acc_head.load_state_dict({"weight": head_ref.weight.detach().clone()})
+    acc_head = torch.nn.Linear(hidden, vocab, bias=True)
+    acc_head.load_state_dict(head_ref.state_dict())
     acc = MergedGradientAccumulator(acc_head, accum_mode="fp32")
     try:
         hs_m1 = hs_ref.detach().clone().requires_grad_(True)
