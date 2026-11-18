@@ -69,7 +69,7 @@
   "enforce_compute_budget": false,
   "compute_reserve_cu": 25,
   "balance_refresh_hours": 12,
-  "seed": 40702,
+  "seed": 40701,
   "gradient_accumulation": 12,
   "dataloader_workers": 4,
   "dataloader_prefetch": 2,
@@ -178,9 +178,9 @@
       "warmup_ratio": 0.05,
       "include_synccraft_animation": true,
       "dynamic_epoch_records_per_family": {
-        "image": 7020,
+        "image": 6990,
         "video": 240,
-        "text": 6780
+        "text": 6756
       },
       "task_weight_multipliers": {
         "visual_primitives_point_count": 5.0,
