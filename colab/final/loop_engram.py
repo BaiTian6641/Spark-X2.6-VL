@@ -324,6 +324,9 @@ def patch_spark_attention_for_loglinear_kv(base_model: nn.Module, exact_threshol
         )
         return result, None
 
+    prev_fwd = getattr(attn_mod, "eager_attention_forward", None)
+    sdpa_loglinear_forward._spark_reference = getattr(prev_fwd, "_spark_reference", prev_fwd)
+    sdpa_loglinear_forward._spark_native_sdpa = True
     attn_mod.eager_attention_forward = sdpa_loglinear_forward
     attn_mod._spark_vl_loglinear_patched = True
     return len(layers)
@@ -400,6 +403,7 @@ class MultimodalTieredMoEEngram(nn.Module):
 
         self.norm_eps = 1e-6
         self.norm_weight = nn.Parameter(torch.ones(self.width, dtype=torch.float32))
+        self.lex_dropout = nn.Dropout(0.10)
 
         self.lexical_up = nn.Linear(self.eng_dim, self.width, bias=False, dtype=param_dtype)
         nn.init.normal_(self.lexical_up.weight, mean=0.0, std=0.02)
@@ -693,7 +697,7 @@ class MultimodalTieredMoEEngram(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         out_dtype = hidden_states.dtype
         param_dtype = self.project.weight.dtype
-        lex_dropped = F.dropout(e_lexical, p=0.10, training=self.training)
+        lex_dropped = self.lex_dropout(e_lexical)
         lex_hidden = self.lexical_up(lex_dropped)
 
         h_norm = fast_rmsnorm(hidden_states.to(param_dtype), self.norm_weight, self.norm_eps)
