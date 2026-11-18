@@ -252,6 +252,183 @@ def _imm_linear(mod: nn.Linear, x: torch.Tensor) -> torch.Tensor:
     return mod(x)
 
 
+class _ChunkedLinearCrossEntropyFn(torch.autograd.Function):
+    """Fused chunked `lm_head` + `cross_entropy(..., ignore_index=-100, reduction='sum')`.
+
+    Accumulates `grad_w` across all `chunk_tokens` slices in GPU HBM via Tensor Core `addmm_`
+    and flushes to `MergedGradientAccumulator` at most ONCE per sequence (eliminating 10x-60x
+    repeated 671 MB `embed_tokens`/`lm_head` PCIe transfers and `checkpoint()` overhead).
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        hs_2d: torch.Tensor,
+        labels_1d: torch.Tensor,
+        w: torch.Tensor,
+        b: Optional[torch.Tensor],
+        label_smoothing: float,
+        chunk_tokens: int,
+    ) -> torch.Tensor:
+        mm_dtype = (
+            torch.get_autocast_gpu_dtype()
+            if (hs_2d.is_cuda and torch.is_autocast_enabled())
+            else hs_2d.dtype
+        )
+        ctx.mm_dtype = mm_dtype
+        ctx.hs_dtype = hs_2d.dtype
+        ctx.w_dtype = w.dtype
+        ctx.b_dtype = b.dtype if b is not None else None
+        ctx.w_ref = w if w.requires_grad else None
+        ctx.b_ref = b if (b is not None and b.requires_grad) else None
+        ctx.label_smoothing = float(label_smoothing)
+        ctx.chunk_tokens = max(1, int(chunk_tokens))
+        ctx.has_bias = b is not None
+        if b is not None:
+            ctx.save_for_backward(hs_2d, labels_1d, w, b)
+        else:
+            ctx.save_for_backward(hs_2d, labels_1d, w)
+
+        n_rows = int(hs_2d.shape[0])
+        total = hs_2d.new_zeros((), dtype=torch.float32)
+        if n_rows == 0:
+            return total
+        with torch.no_grad():
+            w_f = w if w.dtype == mm_dtype else w.to(mm_dtype)
+            b_f = None if b is None else (b if b.dtype == mm_dtype else b.to(mm_dtype))
+            for start in range(0, n_rows, ctx.chunk_tokens):
+                end = min(n_rows, start + ctx.chunk_tokens)
+                x_c = hs_2d[start:end]
+                if x_c.dtype != mm_dtype:
+                    x_c = x_c.to(mm_dtype)
+                logits = F.linear(x_c, w_f, b_f).float()
+                total = total + F.cross_entropy(
+                    logits,
+                    labels_1d[start:end],
+                    ignore_index=-100,
+                    reduction="sum",
+                    label_smoothing=ctx.label_smoothing,
+                )
+        return total
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        saved = ctx.saved_tensors
+        if ctx.has_bias:
+            hs_2d, labels_1d, w, b = saved
+        else:
+            hs_2d, labels_1d, w = saved
+            b = None
+
+        n_rows = int(hs_2d.shape[0])
+        vocab_size = int(w.shape[0])
+        mm_dtype = ctx.mm_dtype
+        ls = ctx.label_smoothing
+        need_dx = bool(ctx.needs_input_grad[0])
+        need_dw = bool(ctx.needs_input_grad[2] and ctx.w_ref is not None)
+        need_db = bool(ctx.has_bias and ctx.needs_input_grad[3] and ctx.b_ref is not None)
+
+        grad_hs = torch.zeros_like(hs_2d) if need_dx else None
+        if n_rows == 0 or (not need_dx and not need_dw and not need_db):
+            return grad_hs, None, None, None, None, None
+
+        with torch.no_grad():
+            scale = grad_out.detach().to(torch.float32)
+            w_mm = w if w.dtype == mm_dtype else w.to(mm_dtype)
+            b_mm = None if b is None else (b if b.dtype == mm_dtype else b.to(mm_dtype))
+            grad_w_acc = torch.zeros(w.shape, device=w.device, dtype=mm_dtype) if need_dw else None
+            grad_b_acc = torch.zeros(b.shape, device=b.device, dtype=torch.float32) if need_db else None
+
+            for start in range(0, n_rows, ctx.chunk_tokens):
+                end = min(n_rows, start + ctx.chunk_tokens)
+                m_len = end - start
+                x_c = hs_2d[start:end]
+                x_mm = x_c if x_c.dtype == mm_dtype else x_c.to(mm_dtype)
+                y_c = labels_1d[start:end]
+
+                logits = F.linear(x_mm, w_mm, b_mm).float()
+                probs = torch.softmax(logits, dim=-1)
+                del logits
+                if ls > 0.0:
+                    probs.sub_(ls / float(vocab_size))
+                safe_y = y_c.clamp(0, vocab_size - 1).unsqueeze(1)
+                probs.scatter_add_(
+                    1,
+                    safe_y,
+                    torch.full((m_len, 1), -(1.0 - ls), device=probs.device, dtype=torch.float32),
+                )
+                valid_scale = (y_c != -100).to(torch.float32).unsqueeze(1) * scale
+                probs.mul_(valid_scale)
+
+                if need_db and grad_b_acc is not None:
+                    grad_b_acc.add_(probs.sum(dim=0))
+                dlogits_mm = probs if probs.dtype == mm_dtype else probs.to(mm_dtype)
+                del probs
+
+                if need_dx and grad_hs is not None:
+                    dx_c = torch.matmul(dlogits_mm, w_mm)
+                    grad_hs[start:end] = dx_c if dx_c.dtype == ctx.hs_dtype else dx_c.to(ctx.hs_dtype)
+                if need_dw and grad_w_acc is not None:
+                    grad_w_acc.addmm_(dlogits_mm.t(), x_mm)
+                del dlogits_mm
+
+            grad_w_out = None
+            if need_dw and grad_w_acc is not None:
+                gw_typed = grad_w_acc if grad_w_acc.dtype == ctx.w_dtype else grad_w_acc.to(ctx.w_dtype)
+                del grad_w_acc
+                consume_w = getattr(ctx.w_ref, "_immediate_accum_fn", None)
+                if consume_w is None or not consume_w(gw_typed):
+                    grad_w_out = gw_typed
+
+            grad_b_out = None
+            if need_db and grad_b_acc is not None:
+                gb_typed = grad_b_acc.to(ctx.b_dtype)
+                del grad_b_acc
+                consume_b = getattr(ctx.b_ref, "_immediate_accum_fn", None)
+                if consume_b is None or not consume_b(gb_typed):
+                    grad_b_out = gb_typed
+
+        return grad_hs, None, grad_w_out, grad_b_out, None, None
+
+
+def chunked_linear_cross_entropy(
+    hs_2d: torch.Tensor,
+    labels_1d: torch.Tensor,
+    out_emb: nn.Module,
+    *,
+    label_smoothing: float = 0.0,
+    chunk_tokens: int = 512,
+) -> torch.Tensor:
+    w = out_emb.weight
+    b = getattr(out_emb, "bias", None)
+    if not torch.is_grad_enabled():
+        mm_dtype = (
+            torch.get_autocast_gpu_dtype()
+            if (hs_2d.is_cuda and torch.is_autocast_enabled())
+            else hs_2d.dtype
+        )
+        n_rows = int(hs_2d.shape[0])
+        total = hs_2d.new_zeros((), dtype=torch.float32)
+        w_f = w if w.dtype == mm_dtype else w.to(mm_dtype)
+        b_f = None if b is None else (b if b.dtype == mm_dtype else b.to(mm_dtype))
+        step = max(1, int(chunk_tokens))
+        for start in range(0, n_rows, step):
+            end = min(n_rows, start + step)
+            x_c = hs_2d[start:end]
+            if x_c.dtype != mm_dtype:
+                x_c = x_c.to(mm_dtype)
+            logits = F.linear(x_c, w_f, b_f).float()
+            total = total + F.cross_entropy(
+                logits,
+                labels_1d[start:end],
+                ignore_index=-100,
+                reduction="sum",
+                label_smoothing=float(label_smoothing),
+            )
+        return total
+    return _ChunkedLinearCrossEntropyFn.apply(hs_2d, labels_1d, w, b, float(label_smoothing), int(chunk_tokens))
+
+
 def fast_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     if x.is_cuda and HAS_LIGER_RMSNORM and torch.is_grad_enabled():
         return LigerRMSNormFunction.apply(x, weight.to(x.dtype), eps)

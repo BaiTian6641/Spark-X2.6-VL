@@ -440,3 +440,69 @@ def test_intel_arc_xpu_vision_coproc_bridge_roundtrip(tmp_path: Path) -> None:
     finally:
         bridge.close()
 
+
+def test_chunked_linear_cross_entropy_exact_grads_and_pinned_stage() -> None:
+    import torch.nn.functional as F
+    from colab.final.loop_engram import chunked_linear_cross_entropy
+    from colab.final.optimizer import MergedGradientAccumulator
+
+    torch.manual_seed(42)
+    n_tok, hidden, vocab = 97, 32, 71
+    hs_ref = torch.randn(n_tok, hidden, dtype=torch.float32, requires_grad=True)
+    hs_chk = hs_ref.detach().clone().requires_grad_(True)
+
+    labels = torch.randint(0, vocab, (n_tok,), dtype=torch.int64)
+    # Include an entire unsupervised chunk (`-100`) plus scattered `-100` tokens.
+    labels[:20] = -100
+    labels[43] = -100
+    labels[88] = -100
+
+    head_ref = torch.nn.Linear(hidden, vocab, bias=True)
+    head_chk = torch.nn.Linear(hidden, vocab, bias=True)
+    head_chk.load_state_dict(head_ref.state_dict())
+
+    ls = 0.008
+    loss_ref = F.cross_entropy(
+        head_ref(hs_ref).float(),
+        labels,
+        ignore_index=-100,
+        reduction="sum",
+        label_smoothing=ls,
+    )
+    loss_chk = chunked_linear_cross_entropy(
+        hs_chk,
+        labels,
+        head_chk,
+        label_smoothing=ls,
+        chunk_tokens=16,
+    )
+    assert torch.allclose(loss_ref, loss_chk, atol=1e-4, rtol=1e-4)
+
+    (loss_ref * 0.37).backward()
+    (loss_chk * 0.37).backward()
+    assert torch.allclose(hs_ref.grad, hs_chk.grad, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(head_ref.weight.grad, head_chk.weight.grad, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(head_ref.bias.grad, head_chk.bias.grad, atol=1e-5, rtol=1e-5)
+
+    # Verify single-flush integration with MergedGradientAccumulator across 2 weighted microbatches!
+    acc_head = torch.nn.Linear(hidden, vocab, bias=False)
+    acc_head.load_state_dict({"weight": head_ref.weight.detach().clone()})
+    acc = MergedGradientAccumulator(acc_head, accum_mode="fp32")
+    try:
+        hs_m1 = hs_ref.detach().clone().requires_grad_(True)
+        l_m1 = chunked_linear_cross_entropy(hs_m1, labels, acc_head, label_smoothing=ls, chunk_tokens=16)
+        with acc.microbatch(weight=0.37, supervised_units=10):
+            l_m1.backward()
+        assert acc_head.weight.grad is None
+        assert torch.allclose(acc.buffers[id(acc_head.weight)], head_ref.weight.grad, atol=1e-5, rtol=1e-5)
+
+        hs_m2 = hs_ref.detach().clone().requires_grad_(True)
+        l_m2 = chunked_linear_cross_entropy(hs_m2, labels, acc_head, label_smoothing=ls, chunk_tokens=16)
+        with acc.microbatch(weight=0.63, supervised_units=10):
+            l_m2.backward()
+        expected_sum = head_ref.weight.grad * (1.0 / 0.37)
+        assert torch.allclose(acc.buffers[id(acc_head.weight)], expected_sum, atol=1e-4, rtol=1e-4)
+    finally:
+        acc.close()
+
+

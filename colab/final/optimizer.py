@@ -925,6 +925,8 @@ class MergedGradientAccumulator:
         self.params: list[nn.Parameter] = []
         self.param_names: dict[int, str] = {}
         self.buffers: dict[int, torch.Tensor] = {}
+        self._buf_dirty: dict[int, bool] = {}
+        self._pinned_cpu_stage: torch.Tensor | None = None
         self._handles: list[Any] = []
         self._active_weight: float = 1.0
         self._hook_enabled: bool = attach_hooks
@@ -938,8 +940,9 @@ class MergedGradientAccumulator:
         enable_cpu_accum = bool(getattr(model, "enable_loop_engram", False))
         has_b50_offload = bool(hasattr(model, "has_intel_vision_bridge") and model.has_intel_vision_bridge())
         # Under Dual-GPU B50 vision offload, `cuda:0` frees ~3.2 GiB of HBM: keep ALL 36 Spark decoder layers
-        # AND all 8 Engram anchors in `672 GB/s` GDDR7 HBM, pinning only `embed_tokens` (`>= 100M` elems = 0.78 GB)
-        # in DDR5 so 99.9% of backward hooks run purely in HBM with zero PCIe traffic!
+        # AND all 8 Engram anchors in `672 GB/s` GDDR7 HBM, pinning only `embed_tokens` (`>= 100M` elems = 0.67 GB)
+        # in DDR5 with a persistent pinned DMA staging buffer (`28.4 GB/s` Gen5 x8 instead of pageable `3.5 GB/s`).
+        max_cpu_buf_bytes = 0
         seen: set[int] = set()
         for name, p in model.named_parameters():
             if not p.requires_grad or id(p) in seen:
@@ -954,13 +957,20 @@ class MergedGradientAccumulator:
                 in_recurrent = any(name.startswith(f"spark.model.layers.{k}.") for k in range(loop_start, loop_end))
                 offload_to_cpu = enable_cpu_accum and p.is_cuda and p.ndim == 2 and p.numel() >= 1_000_000 and not in_recurrent
             if offload_to_cpu:
-                self.buffers[id(p)] = torch.zeros(p.shape, dtype=buf_dtype, device="cpu", pin_memory=True)
+                buf = torch.zeros(p.shape, dtype=buf_dtype, device="cpu", pin_memory=True)
+                self.buffers[id(p)] = buf
+                max_cpu_buf_bytes = max(max_cpu_buf_bytes, buf.numel() * buf.element_size())
             else:
                 self.buffers[id(p)] = torch.zeros_like(p, dtype=buf_dtype)
+            self._buf_dirty[id(p)] = False
             if attach_hooks:
                 p._immediate_accum_fn = self._make_direct_consumer(id(p))
                 if hasattr(p, "register_post_accumulate_grad_hook"):
                     self._handles.append(p.register_post_accumulate_grad_hook(self._make_hook(id(p))))
+        if max_cpu_buf_bytes > 0 and torch.cuda.is_available():
+            self._pinned_cpu_stage = torch.empty(max_cpu_buf_bytes, dtype=torch.uint8, device="cpu", pin_memory=True)
+            # Pre-fault pages once so the first backward pass pays zero OS page-fault latency.
+            self._pinned_cpu_stage.zero_()
 
     def _buffer_dtype_for(self, name: str, p: nn.Parameter) -> torch.dtype:
         if self.accum_mode == "fp32":
@@ -977,20 +987,45 @@ class MergedGradientAccumulator:
             return torch.float32
         return torch.bfloat16
 
+    def _accum_into_buffer(self, pid: int, grad: torch.Tensor) -> bool:
+        buf = self.buffers.get(pid)
+        if buf is None:
+            return False
+        g = grad.detach()
+        if g.dtype != buf.dtype:
+            g = g.to(dtype=buf.dtype)  # Cast on fast GPU HBM BEFORE any PCIe transfer!
+        w = self._active_weight
+        if g.device == buf.device:
+            if not self._buf_dirty.get(pid, False) and w == 1.0:
+                buf.copy_(g)
+            else:
+                buf.add_(g, alpha=w)
+            self._buf_dirty[pid] = True
+            return True
+        if buf.device.type == "cpu" and g.is_cuda:
+            g_contig = g.contiguous()
+            if not self._buf_dirty.get(pid, False) and w == 1.0:
+                # Direct 28.4 GB/s GPU->Pinned-Host DMA straight into `buf` with zero CPU add!
+                buf.copy_(g_contig, non_blocking=False)
+                self._buf_dirty[pid] = True
+                return True
+            nbytes = buf.numel() * buf.element_size()
+            if self._pinned_cpu_stage is not None and self._pinned_cpu_stage.numel() >= nbytes:
+                stage_view = self._pinned_cpu_stage[:nbytes].view(buf.dtype).reshape(buf.shape)
+                stage_view.copy_(g_contig, non_blocking=False)
+                buf.add_(stage_view, alpha=w)
+                self._buf_dirty[pid] = True
+                return True
+        g_host = g.to(device=buf.device)
+        buf.add_(g_host, alpha=w)
+        self._buf_dirty[pid] = True
+        return True
+
     def _make_direct_consumer(self, pid: int) -> Callable[[torch.Tensor], bool]:
         def _consume(grad: torch.Tensor) -> bool:
             if not self._hook_enabled or grad is None:
                 return False
-            buf = self.buffers.get(pid)
-            if buf is None:
-                return False
-            g = grad.detach()
-            if g.dtype != buf.dtype:
-                g = g.to(dtype=buf.dtype)  # Cast on fast GPU HBM BEFORE any PCIe transfer!
-            if g.device != buf.device:
-                g = g.to(device=buf.device)
-            buf.add_(g, alpha=self._active_weight)
-            return True
+            return self._accum_into_buffer(pid, grad)
 
         return _consume
 
@@ -998,13 +1033,7 @@ class MergedGradientAccumulator:
         def _hook(param: torch.Tensor) -> None:
             if not self._hook_enabled or param.grad is None:
                 return
-            buf = self.buffers[pid]
-            g = param.grad.detach()
-            if g.dtype != buf.dtype:
-                g = g.to(dtype=buf.dtype)
-            if g.device != buf.device:
-                g = g.to(device=buf.device)
-            buf.add_(g, alpha=self._active_weight)
+            self._accum_into_buffer(pid, param.grad)
             param.grad = None
 
         return _hook
@@ -1019,6 +1048,8 @@ class MergedGradientAccumulator:
             h.remove()
         self._handles.clear()
         self.buffers.clear()
+        self._buf_dirty.clear()
+        self._pinned_cpu_stage = None
         self.params.clear()
         self.param_names.clear()
 
@@ -1030,8 +1061,9 @@ class MergedGradientAccumulator:
             self.model.zero_intel_vision_buffers()
         for p in self.params:
             p.grad = None
-        for buf in self.buffers.values():
+        for pid, buf in self.buffers.items():
             buf.zero_()
+            self._buf_dirty[pid] = False
         self.microbatches_in_step = 0
         self.units_in_step = 0
 
@@ -1068,15 +1100,16 @@ class MergedGradientAccumulator:
 
     @torch.no_grad()
     def merge_existing_grads(self, *, weight: float = 1.0) -> None:
-        for p in self.params:
-            if p.grad is None:
-                continue
-            buf = self.buffers[id(p)]
-            g = p.grad.detach()
-            if g.device != buf.device or g.dtype != buf.dtype:
-                g = g.to(device=buf.device, dtype=buf.dtype)
-            buf.add_(g, alpha=weight)
-            p.grad = None
+        prev_w = self._active_weight
+        self._active_weight = float(weight)
+        try:
+            for p in self.params:
+                if p.grad is None:
+                    continue
+                self._accum_into_buffer(id(p), p.grad)
+                p.grad = None
+        finally:
+            self._active_weight = prev_w
 
     @torch.no_grad()
     def rescale_buffers(self, factor: float) -> None:
