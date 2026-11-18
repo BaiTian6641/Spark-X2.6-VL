@@ -115,17 +115,28 @@ class _ImmediateMatmulFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         ctx.save_for_backward(x, w)
+        ctx.x_dtype = x.dtype
         ctx.w_ref = w if w.requires_grad else None
-        return torch.matmul(x, w)
+        w_f = w if w.dtype == x.dtype else w.to(x.dtype)
+        return torch.matmul(x, w_f)
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
         x, w = ctx.saved_tensors
-        grad_x = torch.matmul(grad_out, w.t()) if ctx.needs_input_grad[0] else None
+        grad_x = None
+        if ctx.needs_input_grad[0]:
+            w_t = w.t()
+            if w_t.dtype != grad_out.dtype:
+                w_t = w_t.to(grad_out.dtype)
+            grad_x = torch.matmul(grad_out, w_t)
+            if grad_x.dtype != ctx.x_dtype:
+                grad_x = grad_x.to(ctx.x_dtype)
         grad_w = None
         if ctx.needs_input_grad[1] and ctx.w_ref is not None:
-            x2 = x.reshape(-1, x.shape[-1])
             go2 = grad_out.reshape(-1, grad_out.shape[-1])
+            x2 = x.reshape(-1, x.shape[-1])
+            if x2.dtype != go2.dtype:
+                x2 = x2.to(go2.dtype)
             grad_w = x2.t().matmul(go2).to(w.dtype)
             consume = getattr(ctx.w_ref, "_immediate_accum_fn", None)
             if consume is not None and consume(grad_w):
@@ -139,20 +150,30 @@ class _ImmediateLinearFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x: torch.Tensor, w: torch.Tensor, b: Optional[torch.Tensor]) -> torch.Tensor:
         ctx.save_for_backward(x, w)
+        ctx.x_dtype = x.dtype
         ctx.w_ref = w if w.requires_grad else None
         ctx.b_ref = b if (b is not None and b.requires_grad) else None
         ctx.b_dtype = b.dtype if b is not None else None
-        return F.linear(x, w, b)
+        w_f = w if w.dtype == x.dtype else w.to(x.dtype)
+        b_f = None if b is None else (b if b.dtype == x.dtype else b.to(x.dtype))
+        return F.linear(x, w_f, b_f)
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
         x, w = ctx.saved_tensors
-        grad_x = torch.matmul(grad_out, w) if ctx.needs_input_grad[0] else None
+        grad_x = None
+        if ctx.needs_input_grad[0]:
+            w_dx = w if w.dtype == grad_out.dtype else w.to(grad_out.dtype)
+            grad_x = torch.matmul(grad_out, w_dx)
+            if grad_x.dtype != ctx.x_dtype:
+                grad_x = grad_x.to(ctx.x_dtype)
         grad_w = None
         grad_b = None
         if ctx.needs_input_grad[1] and ctx.w_ref is not None:
-            x2 = x.reshape(-1, x.shape[-1])
             go2 = grad_out.reshape(-1, grad_out.shape[-1])
+            x2 = x.reshape(-1, x.shape[-1])
+            if x2.dtype != go2.dtype:
+                x2 = x2.to(go2.dtype)
             grad_w = go2.t().matmul(x2).to(w.dtype)
             consume_w = getattr(ctx.w_ref, "_immediate_accum_fn", None)
             if consume_w is not None and consume_w(grad_w):
