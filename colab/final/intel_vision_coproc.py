@@ -83,11 +83,23 @@ def intel_arc_runtime_env(
 
 
 def apply_inprocess_intel_arc_env(runtime_prefix: str | Path | None = None) -> None:
-    """Apply `OCL_ICD_VENDORS` and `ZE_ALT_DRIVERS` in-process before initializing OpenVINO."""
+    """Apply `OCL_ICD_VENDORS`/`ZE_ALT_DRIVERS` and preload user-space IGC `.so` dependencies in-process."""
+    import ctypes
+
     env = intel_arc_runtime_env(runtime_prefix=runtime_prefix)
     for key in ("OCL_ICD_VENDORS", "ZE_ALT_DRIVERS", "LD_LIBRARY_PATH"):
         if key in env:
             os.environ[key] = env[key]
+    prefix = Path(runtime_prefix or os.environ.get("INTEL_B50_RUNTIME_PREFIX") or DEFAULT_RUNTIME_PREFIX)
+    lib64 = prefix / "root" / "usr" / "lib64"
+    if lib64.is_dir():
+        for soname in ("libiga64.so.2", "libigc.so.2", "libigdfcl.so.2", "libze_loader.so.1"):
+            cand = lib64 / soname
+            if cand.is_file():
+                try:
+                    ctypes.CDLL(str(cand), mode=ctypes.RTLD_GLOBAL)
+                except OSError:
+                    pass
 
 
 def _shm_base_dir() -> Path:
@@ -606,7 +618,8 @@ class OpenVinoArcVisionRunner:
                 first_dt = next(iter(orig_dtypes.values()))
                 cpu_vis.to(dtype=first_dt)
 
-        compiled = self.core.compile_model(ov_model, self.device_name)
+        compile_props = {"INFERENCE_PRECISION_HINT": "f16"} if self.device_name.startswith("GPU") else {}
+        compiled = self.core.compile_model(ov_model, self.device_name, compile_props)
         self._compiled_cache[key] = compiled
         return compiled
 
