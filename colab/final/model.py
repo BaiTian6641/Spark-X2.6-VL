@@ -2089,9 +2089,11 @@ class SparkNative(nn.Module):
         total=hidden.new_zeros((),dtype=torch.float32)
         ls=float(self.policy.get('label_smoothing',0.0)) if self.training else 0.0
         from torch.utils.checkpoint import checkpoint
+        from .loop_engram import _imm_linear
+        out_emb=self.get_output_embeddings()
         for start in range(0,ids.shape[1],128):
             hs_2d=hidden[:,start:start+128].reshape(-1,self.hidden); labels_1d=labels[:,start:start+128].reshape(-1)
-            def ce(x,y): return F.cross_entropy(self.get_output_embeddings()(x).float().reshape(-1,self.config.vocab_size),y,ignore_index=-100,reduction='sum',label_smoothing=ls)
+            def ce(x,y): return F.cross_entropy(_imm_linear(out_emb,x).float().reshape(-1,self.config.vocab_size),y,ignore_index=-100,reduction='sum',label_smoothing=ls)
             total=total+checkpoint(ce,hs_2d,labels_1d,use_reentrant=False)
         loss_val=total/sup_cnt
         if router_z_loss is not None and self.training and torch.is_grad_enabled():
@@ -2148,6 +2150,8 @@ class SparkNative(nn.Module):
                 with self._visual_cross_attn_scope(None):
                     hidden=self.spark.model(input_ids=input_ids,attention_mask=mask,use_cache=False,return_dict=True).last_hidden_state
             from torch.utils.checkpoint import checkpoint
+            from .loop_engram import _imm_linear
+            out_emb=self.get_output_embeddings()
             ls=float(self.policy.get('label_smoothing',0.0)) if self.training else 0.0
             z_add=(
                 float(self.policy.get('router_z_loss_weight',1e-4))*router_z_loss
@@ -2160,7 +2164,7 @@ class SparkNative(nn.Module):
                 hs=hidden[i:i+1,start:start+count]; total=hidden.new_zeros((),dtype=torch.float32)
                 for offset in range(0,count,128):
                     hs_2d=hs[:,offset:offset+128].reshape(-1,self.hidden); lbl_1d=a_lbls[:,offset:offset+128].reshape(-1)
-                    def ce(x,y): return F.cross_entropy(self.get_output_embeddings()(x).float().reshape(-1,self.config.vocab_size),y,ignore_index=-100,reduction='sum',label_smoothing=ls)
+                    def ce(x,y): return F.cross_entropy(_imm_linear(out_emb,x).float().reshape(-1,self.config.vocab_size),y,ignore_index=-100,reduction='sum',label_smoothing=ls)
                     total=total+checkpoint(ce,hs_2d,lbl_1d,use_reentrant=False)
                 l_i=total/a_sup
                 if z_add is not None: l_i=l_i+z_add
@@ -2206,6 +2210,8 @@ class SparkNative(nn.Module):
         else:
             hidden=self.hidden_batch(embeds,mask,visual_context=single_vis_ctx if len(prepared)==1 else None)
         from torch.utils.checkpoint import checkpoint
+        from .loop_engram import _imm_linear
+        out_emb=self.get_output_embeddings()
         ls=float(self.policy.get('label_smoothing',0.0)) if self.training else 0.0
         z_add=(
             float(self.policy.get('router_z_loss_weight',1e-4))*router_z_loss
@@ -2218,7 +2224,7 @@ class SparkNative(nn.Module):
             hs=hidden[i:i+1,start:start+count]; total=hidden.new_zeros((),dtype=torch.float32)
             for offset in range(0,count,128):
                 hs_2d=hs[:,offset:offset+128].reshape(-1,self.hidden); lbl_1d=lbls[:,offset:offset+128].reshape(-1)
-                def ce(x,y): return F.cross_entropy(self.get_output_embeddings()(x).float().reshape(-1,self.config.vocab_size),y,ignore_index=-100,reduction='sum',label_smoothing=ls)
+                def ce(x,y): return F.cross_entropy(_imm_linear(out_emb,x).float().reshape(-1,self.config.vocab_size),y,ignore_index=-100,reduction='sum',label_smoothing=ls)
                 total=total+checkpoint(ce,hs_2d,lbl_1d,use_reentrant=False)
             l_i=total/sup_cnt
             if z_add is not None: l_i=l_i+z_add

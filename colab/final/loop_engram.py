@@ -1193,31 +1193,55 @@ def build_spark_loop_context(
     if not _attn_accepts_position_embeddings(spark_model.layers[0].self_attn):
         return {lt: None for lt in layer_types}, {lt: None for lt in layer_types}, cache_position
 
+    layer_mod = importlib.import_module(type(spark_model.layers[0]).__module__)
+    using_sdpa = bool(getattr(getattr(layer_mod, "eager_attention_forward", None), "_spark_native_sdpa", False))
+
     if past_key_values is not None and q_len == 1 and attention_mask is None:
         masks = {lt: None for lt in layer_types}
     elif not custom_cache_pos and past_key_values is None and hasattr(spark_model, "make_loop_context"):
         m_ctx, r_ctx = spark_model.make_loop_context(embeds, attention_mask)
         return m_ctx, r_ctx, cache_position
     else:
-        q_idx = cache_position.view(1, 1, q_len, 1)
-        if past_key_values is None:
-            k_len = q_len
-            k_idx = cache_position.view(1, 1, 1, q_len)
+        has_pad = (
+            attention_mask is not None
+            and isinstance(attention_mask, torch.Tensor)
+            and attention_mask.ndim == 2
+            and not bool(attention_mask.all())
+        )
+        if using_sdpa and past_key_values is None and not custom_cache_pos and not has_pad:
+            # Unpadded causal training/prefill: `None` enables pure FlashAttention2 (`is_causal=True`, O(T) memory)!
+            masks = {"full_attention": None}
+            if "sliding_attention" in layer_types or getattr(spark_model, "has_sliding_layers", False):
+                sw = int(getattr(cfg, "sliding_window", 512) or 512)
+                q_idx = cache_position.view(1, 1, q_len, 1)
+                k_idx = cache_position.view(1, 1, 1, q_len)
+                masks["sliding_attention"] = (k_idx <= q_idx) & ((q_idx - k_idx) < sw)
         else:
-            k_len = int(cache_position[-1].item()) + 1 if cache_position.numel() > 0 else q_len
-            k_idx = torch.arange(k_len, device=device).view(1, 1, 1, k_len)
-        causal_ok = k_idx <= q_idx
-        if attention_mask is not None and isinstance(attention_mask, torch.Tensor) and attention_mask.ndim == 2:
-            pad_ok = attention_mask[:, :k_len].bool().view(bsz, 1, 1, -1)
-            if pad_ok.shape[-1] == k_len:
-                causal_ok = causal_ok & pad_ok
-        min_val = torch.finfo(embeds.dtype).min
-        zero_val = torch.tensor(0.0, dtype=embeds.dtype, device=device)
-        masks = {"full_attention": torch.where(causal_ok, zero_val, min_val)}
-        if "sliding_attention" in layer_types or getattr(spark_model, "has_sliding_layers", False):
-            sw = int(getattr(cfg, "sliding_window", 512) or 512)
-            sw_ok = causal_ok & ((q_idx - k_idx) < sw)
-            masks["sliding_attention"] = torch.where(sw_ok, zero_val, min_val)
+            q_idx = cache_position.view(1, 1, q_len, 1)
+            if past_key_values is None:
+                k_len = q_len
+                k_idx = cache_position.view(1, 1, 1, q_len)
+            else:
+                k_len = int(cache_position[-1].item()) + 1 if cache_position.numel() > 0 else q_len
+                k_idx = torch.arange(k_len, device=device).view(1, 1, 1, k_len)
+            causal_ok = k_idx <= q_idx
+            if attention_mask is not None and isinstance(attention_mask, torch.Tensor) and attention_mask.ndim == 2:
+                pad_ok = attention_mask[:, :k_len].bool().view(bsz, 1, 1, -1)
+                if pad_ok.shape[-1] == k_len:
+                    causal_ok = causal_ok & pad_ok
+            if using_sdpa:
+                masks = {"full_attention": causal_ok}
+                if "sliding_attention" in layer_types or getattr(spark_model, "has_sliding_layers", False):
+                    sw = int(getattr(cfg, "sliding_window", 512) or 512)
+                    masks["sliding_attention"] = causal_ok & ((q_idx - k_idx) < sw)
+            else:
+                min_val = torch.finfo(embeds.dtype).min
+                zero_val = torch.tensor(0.0, dtype=embeds.dtype, device=device)
+                masks = {"full_attention": torch.where(causal_ok, zero_val, min_val)}
+                if "sliding_attention" in layer_types or getattr(spark_model, "has_sliding_layers", False):
+                    sw = int(getattr(cfg, "sliding_window", 512) or 512)
+                    sw_ok = causal_ok & ((q_idx - k_idx) < sw)
+                    masks["sliding_attention"] = torch.where(sw_ok, zero_val, min_val)
 
     rope: dict[str, Any] = {}
     attn_mod = importlib.import_module(type(spark_model.layers[0].self_attn).__module__)
