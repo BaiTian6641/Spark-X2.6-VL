@@ -430,8 +430,8 @@ def load_spark_backbone(spark_path, *, spark_dtype: torch.dtype, pretrained: boo
         attn_implementation='eager',
     ).to(dtype=spark_dtype)
 
-    param_map = dict(spark.named_parameters())
-    buf_map = dict(spark.named_buffers())
+    param_map = dict(spark.named_parameters(remove_duplicate=False))
+    buf_map = dict(spark.named_buffers(remove_duplicate=False))
     loaded_keys: set[str] = set()
     fp8_dequant_count = 0
 
@@ -648,8 +648,8 @@ def load_spark_native_safetensors(
     """Load standard BF16 `model.safetensors` or channelwise `F8_E4M3` (+ optional `q4g128` sub-LSB residual) `model.safetensors`."""
     sf_path = Path(path)
     aux_suffixes = ('_scale', '_res_q4', '_res_scale', '.input_scale')
-    param_map = dict(model.named_parameters())
-    buf_map = dict(model.named_buffers())
+    param_map = dict(model.named_parameters(remove_duplicate=False))
+    buf_map = dict(model.named_buffers(remove_duplicate=False))
     try:
         from safetensors import safe_open
         from safetensors.torch import load_model
