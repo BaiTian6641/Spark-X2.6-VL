@@ -838,7 +838,15 @@ class SparkNative(nn.Module):
             from transformers import AutoImageProcessor, AutoTokenizer, Siglip2VisionConfig, Siglip2VisionModel
             from .intel_vision_coproc import is_cradiov4_dir, load_cradiov4_vision_model
 
-            self.spark=load_spark_backbone(paths['spark'],spark_dtype=spark_dtype,pretrained=pretrained)
+            has_init_release = False
+            if pretrained and policy.get('init_from_release_dir'):
+                _init_d = Path(str(policy['init_from_release_dir'])).expanduser()
+                if not _init_d.is_absolute():
+                    _init_d = (HERE.parents[1] / _init_d).resolve()
+                has_init_release = (_init_d / 'model.safetensors').is_file()
+            spark_pretrained = bool(pretrained and not has_init_release)
+
+            self.spark=load_spark_backbone(paths['spark'],spark_dtype=spark_dtype,pretrained=spark_pretrained)
             install_spark_sdpa(self.spark)
             try:
                 self.tokenizer=AutoTokenizer.from_pretrained(paths['spark'],trust_remote_code=True,local_files_only=True,fix_mistral_regex=True)
@@ -850,16 +858,22 @@ class SparkNative(nn.Module):
 
             if is_cradiov4_dir(paths['vision']):
                 self.vision_backbone_type = 'c_radio_v4'
+                vis_pretrained = bool(
+                    pretrained and (not has_init_release or policy.get('allow_warmstart_vision_swap', True))
+                )
                 self.vision = load_cradiov4_vision_model(
                     paths['vision'],
                     dtype=vision_dtype,
-                    pretrained=pretrained,
+                    pretrained=vis_pretrained,
                     vitdet_window_size=self._radio_vitdet_window_size,
                 )
                 self.image_processor = None
             else:
                 self.vision_backbone_type = 'siglip2_naflex'
-                self.vision=(Siglip2VisionModel.from_pretrained(paths['vision'],local_files_only=True,dtype=vision_dtype) if pretrained else Siglip2VisionModel(Siglip2VisionConfig.from_pretrained(paths['vision'],local_files_only=True)).to(dtype=vision_dtype))
+                vis_pretrained = bool(
+                    pretrained and (not has_init_release or policy.get('allow_warmstart_vision_swap', False))
+                )
+                self.vision=(Siglip2VisionModel.from_pretrained(paths['vision'],local_files_only=True,dtype=vision_dtype) if vis_pretrained else Siglip2VisionModel(Siglip2VisionConfig.from_pretrained(paths['vision'],local_files_only=True)).to(dtype=vision_dtype))
                 if hasattr(self.vision.vision_model,'head'): del self.vision.vision_model.head
                 self.vision.vision_model.use_head=False
                 self.image_processor=AutoImageProcessor.from_pretrained(paths['vision'],local_files_only=True)
