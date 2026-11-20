@@ -937,7 +937,7 @@ def build_nemotron_v3_spatial_records(
                     token=hf_token,
                 )
             )
-            aok_by_img: dict[str, tuple[str, str]] = {}
+            aok_by_q: dict[str, tuple[str, str]] = {}
             with aok_jsonl.open("r", encoding="utf-8") as fh:
                 for line in fh:
                     if not line.strip():
@@ -945,12 +945,11 @@ def build_nemotron_v3_spatial_records(
                     rec = _extract_qa_from_nemotron_row(json.loads(line))
                     if rec is None:
                         continue
-                    img_ref, pr, ans = rec
-                    # Extract COCO numeric image id from e.g. `COCO_train2014_000000123456.jpg` or `000000123456.jpg`
-                    nums = re.findall(r"\d+", Path(img_ref).stem)
-                    if nums:
-                        key = str(int(nums[-1]))
-                        aok_by_img.setdefault(key, (pr, ans))
+                    _img_ref, pr, ans = rec
+                    first_line = next((ln.strip() for ln in pr.splitlines() if ln.strip()), "")
+                    q_key = re.sub(r"\s+", " ", first_line).lower()
+                    if q_key:
+                        aok_by_q.setdefault(q_key, (pr, ans))
 
             api = HfApi(token=hf_token)
             files = [f for f in api.list_repo_files("HuggingFaceM4/A-OKVQA", repo_type="dataset") if "train" in f and f.endswith(".parquet")]
@@ -959,14 +958,15 @@ def build_nemotron_v3_spatial_records(
                 if added_aok >= max_aokvqa:
                     break
                 lp = Path(hf_hub_download("HuggingFaceM4/A-OKVQA", pf, repo_type="dataset", token=hf_token))
-                tbl = pq.read_table(lp, columns=["image", "image_id"])
+                tbl = pq.read_table(lp, columns=["image", "question_id", "question"])
                 for r_i in range(tbl.num_rows):
                     if added_aok >= max_aokvqa:
                         break
-                    img_id = str(int(tbl["image_id"][r_i].as_py()))
-                    hit = aok_by_img.pop(img_id, None)
+                    q_txt = re.sub(r"\s+", " ", str(tbl["question"][r_i].as_py() or "").strip()).lower()
+                    hit = aok_by_q.pop(q_txt, None)
                     if hit is None:
                         continue
+                    qid = str(tbl["question_id"][r_i].as_py())
                     raw_img = tbl["image"][r_i].as_py()
                     raw_bytes = raw_img.get("bytes") if isinstance(raw_img, dict) else None
                     if not raw_bytes:
@@ -976,10 +976,10 @@ def build_nemotron_v3_spatial_records(
                         continue
                     jpg_b, _, _ = norm
                     pr, ans = hit
-                    mem = f"nemotron_v3/aokvqa/aok_{img_id}.jpg"
+                    mem = f"nemotron_v3/aokvqa/aok_{qid}.jpg"
                     row = {
-                        "id": f"nemotron_v3_aok_{img_id}",
-                        "source_group": f"nemotron_v3_aok_{int(img_id) % 64:02d}",
+                        "id": f"nemotron_v3_aok_{qid}",
+                        "source_group": f"nemotron_v3_aok_{abs(hash(qid)) % 64:02d}",
                         "language": "en",
                         "task": "nemotron_v3_aokvqa_spatial_reasoning",
                         "visual_kind": "independent_image",
@@ -1034,7 +1034,7 @@ def build_nemotron_v3_spatial_records(
             gqa_files = [
                 f
                 for f in api.list_repo_files("lmms-lab/GQA", repo_type="dataset")
-                if "images" in f and f.endswith(".parquet")
+                if f.startswith("train_all_images/") and f.endswith(".parquet")
             ]
             added_gqa = 0
             for pf in sorted(gqa_files)[:6]:
