@@ -207,6 +207,8 @@ def is_high_precision_small_or_sensitive_param(
         "bias",
         "gate_attn",
         "gate_ffn",
+        "early_mid_gate",
+        "layer_norms",
         "attn_output_gate",
         "output_gate",
         "residual_gate",

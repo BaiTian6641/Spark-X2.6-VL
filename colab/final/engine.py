@@ -100,9 +100,11 @@ def optimizer_for(model,config,alignment=False):
         for group,name,p in model.named_groups():
             if not p.requires_grad or id(p) in seen: continue
             seen.add(id(p))
-            buckets[_lr_for_group_and_name(group,name,config)].append(p)
+            no_decay=(p.ndim<2) or name.endswith('.bias') or any(k in name.lower() for k in ('norm','gate_attn','gate_ffn','early_mid_gate'))
+            wd=0.0 if no_decay else float(config['weight_decay'])
+            buckets[(_lr_for_group_and_name(group,name,config), wd)].append(p)
         optimizer=torch.optim.AdamW(
-            [{'params':v,'lr':lr,'weight_decay':config['weight_decay']} for lr,v in buckets.items()],
+            [{'params':v,'lr':lr,'weight_decay':wd} for (lr,wd),v in buckets.items()],
             betas=(.9,.95),
             eps=1e-8,
             foreach=False,
@@ -113,9 +115,11 @@ def optimizer_for(model,config,alignment=False):
         for group,name,p in model.named_groups():
             if not p.requires_grad or id(p) in seen: continue
             seen.add(id(p))
-            buckets[_lr_for_group_and_name(group,name,config)].append(p)
+            no_decay=(p.ndim<2) or name.endswith('.bias') or any(k in name.lower() for k in ('norm','gate_attn','gate_ffn','early_mid_gate'))
+            wd=0.0 if no_decay else float(config['weight_decay'])
+            buckets[(_lr_for_group_and_name(group,name,config), wd)].append(p)
         optimizer=bnb.optim.AdamW8bit(
-            [{'params':v,'lr':lr,'weight_decay':config['weight_decay']} for lr,v in buckets.items()],
+            [{'params':v,'lr':lr,'weight_decay':wd} for (lr,wd),v in buckets.items()],
             betas=(.9,.95),
             eps=1e-8,
         )

@@ -84,6 +84,7 @@ def export_and_upload(campaign,config):
     inference_policy={k:v for k,v in config.items() if k not in ('drive_project_folder','observed_compute_balance','observed_cu_per_hour','instructor_route_eligibility_receipt')}
     # Portable default: standalone exported model runs natively on single CUDA/CPU unless caller opts into OpenVINO/XPU.
     inference_policy['intel_arc_vision_offload']=False
+    inference_policy['intel_arc_openvino_eval']=False
     write(out/'config.json',inference_policy)
     summary={'training_complete':True,'full_parameter_stages':state['completed_stages'],'rsi_rounds':state['rsi_rounds'],'human_audio_review':state.get('human_audio_review'),'broad_capability_passed':False,'evaluations':list(state.get('evaluations',{})),'frozen_infrastructure':['Qwen speech tokenizer/codec','Stable Audio Oobleck autoencoder'],'source_binding':campaign.bound}
     write(out/'evaluation-summary.json',summary)
@@ -102,7 +103,11 @@ def export_and_upload(campaign,config):
     architecture={
         'kind':'SparkNativeLoop48En1BVL' if config.get('enable_loop_engram') else 'SparkNative',
         'inference_entrypoint':'runtime/colab/final/inference.py',
-        'vision':'SigLIP2 So400m NaFlex + adaptive resolution-guarded 0/2/4 tiles + 2x2 spatial downshuffle + Visual Primitives (<point>/<box>)',
+        'vision':(
+            'Unified Super-Encoder: NVIDIA C-RADIOv4-H (32L ViT-H/16, 651.6M, SigLIP2-g+DINOv3-7B+SAM3) + Multi-Layer RMSNorm(L24)||RMSNorm(L32) 2x2 Pixel-Shuffle SwiGLU DeepStack + Adaptive Native-Aspect 256-768px (High-Res Tier up to 1152px)'
+            if (out/'reload-assets'/'vision'/'hf_model.py').is_file()
+            else 'SigLIP2 So400m NaFlex + adaptive resolution-guarded 0/2/4 tiles + 2x2 spatial downshuffle + Visual Primitives (<point>/<box>)'
+        ),
         'recurrent_loop':(
             {
                 'enabled':True,
@@ -125,7 +130,7 @@ def export_and_upload(campaign,config):
     write(out/'multimodal_architecture.json',architecture)
     # Scan all publishable text for the exact in-memory credentials, without
     # printing either value. Binary weights are produced only by safetensors.
-    forbidden=('optimizer.pt','scheduler.pt','rng.pt','tier1b_optim.pt','LEDGER.json','STATE.json','.ipynb')
+    forbidden=('optimizer.pt','scheduler.pt','rng.pt','tier1b_optim.pt','intel_vision_optim.pt','LEDGER.json','STATE.json','.ipynb')
     for path in out.rglob('*'):
         if not path.is_file(): continue
         if any(v in path.name for v in forbidden): raise ValueError('Private training artifact in final export')

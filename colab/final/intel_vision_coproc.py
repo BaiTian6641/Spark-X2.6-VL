@@ -49,18 +49,21 @@ import torch.nn as nn
 DEFAULT_RUNTIME_PREFIX = Path("/home/baitian6641/.local/intel-b50-runtime")
 DEFAULT_XPU_PYTHON = Path("/home/baitian6641/Spark-X2.6-VL/.venv-xpu/bin/python")
 
-# Persistent 96 MB Dual-Registered Zero-Copy Shared Memory Arena Layout:
-# [0 .. 32 MB):      Forward Input Staging (2 x 16 MB ping-pong slots: 0=main, 1=prefetch)
-# [32 .. 64 MB):     Forward Output Staging (2 x 16 MB ping-pong slots: 0=main, 1=prefetch)
-# [64 .. 96 MB):     Async Backward Gradient Ring (8 x 4 MB slots)
-ARENA_TOTAL_BYTES = 96 * 1024 * 1024
-FWD_IN_SLOT_BYTES = 16 * 1024 * 1024
-FWD_OUT_SLOT_BYTES = 16 * 1024 * 1024
+# Persistent 240 MB Dual-Registered Zero-Copy Shared Memory Arena Layout:
+# [0 .. 48 MB):      Forward Input Staging (2 x 24 MB ping-pong slots: 0=main, 1=prefetch)
+# [48 .. 112 MB):    Forward Output Staging (2 x 32 MB ping-pong slots; fits 1152x1152 C-RADIOv4-H L22+L32 = 26.54 MB!)
+# [112 .. 240 MB):   Async Backward Gradient Ring (4 x 32 MB slots; fits 1152x1152 C-RADIOv4-H L22+L32 BF16!)
+ARENA_TOTAL_BYTES = 240 * 1024 * 1024
+FWD_IN_SLOT_BYTES = 24 * 1024 * 1024
+FWD_OUT_SLOT_BYTES = 32 * 1024 * 1024
 FWD_IN_BASE = 0
-FWD_OUT_BASE = 32 * 1024 * 1024
-GRAD_RING_BASE = 64 * 1024 * 1024
-GRAD_SLOT_BYTES = 4 * 1024 * 1024
-GRAD_RING_SLOTS = 8
+FWD_OUT_BASE = 48 * 1024 * 1024
+GRAD_RING_BASE = 112 * 1024 * 1024
+GRAD_SLOT_BYTES = 32 * 1024 * 1024
+GRAD_RING_SLOTS = 4
+
+VISION_OPTIMIZER_MODES = ("adamw", "muon8bit", "apollo8bit")
+DEFAULT_RADIO_LAYER_INDICES = (23, 31)  # 0-based L24 + L32 (exact ViTDet global-attention layers 7, 15, 23, 31!)
 
 _DTYPE_TO_CODE: dict[torch.dtype, str] = {
     torch.float32: "f32",
@@ -68,10 +71,476 @@ _DTYPE_TO_CODE: dict[torch.dtype, str] = {
     torch.float16: "f16",
     torch.int64: "i64",
     torch.int32: "i32",
+    torch.int8: "i8",
     torch.uint8: "u8",
     torch.bool: "bool",
 }
 _CODE_TO_DTYPE: dict[str, torch.dtype] = {v: k for k, v in _DTYPE_TO_CODE.items()}
+
+
+def quantize_int8_blockwise(tensor: torch.Tensor, *, group_size: int = 128) -> dict[str, Any]:
+    """Symmetric per-block INT8 quantization (`1.03 B/elem`), pure PyTorch (XPU/CUDA/CPU compatible)."""
+    x = tensor.detach().float()
+    orig_shape = tuple(x.shape)
+    flat = x.reshape(-1)
+    numel = int(flat.numel())
+    pad = (-numel) % group_size
+    if pad:
+        flat = torch.nn.functional.pad(flat, (0, pad))
+    groups = flat.reshape(-1, group_size)
+    amax = groups.abs().amax(dim=-1, keepdim=True)
+    scale = (amax / 127.0).clamp_min(1e-12)
+    q = torch.clamp(torch.round(groups / scale), -127.0, 127.0).to(torch.int8)
+    return {
+        "q": q,
+        "scale": scale.squeeze(-1).contiguous(),
+        "shape": orig_shape,
+        "numel": numel,
+        "group_size": int(group_size),
+    }
+
+
+def dequantize_int8_blockwise(qobj: dict[str, Any], *, device: torch.device | None = None) -> torch.Tensor:
+    """Restore FP32 tensor from `quantize_int8_blockwise`."""
+    q = qobj["q"]
+    scale = qobj["scale"]
+    if device is not None and q.device != device:
+        q = q.to(device)
+        scale = scale.to(device)
+    restored = (q.float() * scale.float().unsqueeze(-1)).reshape(-1)[: int(qobj["numel"])]
+    return restored.reshape(qobj["shape"])
+
+
+def int8_blockwise_nbytes(qobj: dict[str, Any]) -> int:
+    return int(qobj["q"].numel() * qobj["q"].element_size() + qobj["scale"].numel() * qobj["scale"].element_size())
+
+
+def stochastic_round_fp32_to_bf16_xpu(fp32_tensor: torch.Tensor, generator: torch.Generator | None = None) -> torch.Tensor:
+    """Unbiased IEEE-754 float32 -> bfloat16 stochastic rounding working across XPU, CUDA, and CPU."""
+    x = fp32_tensor.float() if fp32_tensor.dtype != torch.float32 else fp32_tensor
+    raw = x.contiguous().view(torch.int32)
+    sign = raw & -0x80000000
+    abs_bits = raw & 0x7FFFFFFF
+    finite_mask = abs_bits < 0x7F800000
+    try:
+        noise = torch.randint(0, 1 << 16, size=raw.shape, generator=generator, device=raw.device, dtype=torch.int32)
+    except Exception:
+        noise = torch.randint(0, 1 << 16, size=raw.shape, device=raw.device, dtype=torch.int32)
+    rounded_abs = torch.where(finite_mask, (abs_bits + noise) & ~0xFFFF, abs_bits)
+    return (sign | rounded_abs).view(torch.float32).to(torch.bfloat16)
+
+
+def newton_schulz5_orthogonalize(grad_2d: torch.Tensor, *, steps: int = 5, eps: float = 1e-7) -> torch.Tensor:
+    """Keller Jordan / Moonlight quintic Newton-Schulz-5 orthogonalization (`X -> U V^T`).
+
+    Runs in `bfloat16` on XPU/CUDA (utilizing Intel Xe2 XMX & NVIDIA Tensor Cores) and `float32` on CPU.
+    Always transposes so the Gram matrix `A = X @ X^T` has shape `[min(m, n), min(m, n)]`.
+    """
+    if grad_2d.ndim != 2:
+        raise ValueError(f"Expected 2D matrix for Newton-Schulz, got shape {tuple(grad_2d.shape)}")
+    compute_dtype = torch.bfloat16 if grad_2d.device.type in ("xpu", "cuda") else torch.float32
+    x = grad_2d.to(dtype=compute_dtype)
+    transposed = x.shape[0] > x.shape[1]
+    if transposed:
+        x = x.T.contiguous()
+    norm = x.float().norm().clamp_min(eps)
+    x = (x.float() / norm).to(dtype=compute_dtype)
+    a, b, c = 3.4445, -4.7750, 2.0315
+    for _ in range(int(steps)):
+        a_mat = x @ x.T
+        b_mat = b * a_mat + c * (a_mat @ a_mat)
+        x = a * x + b_mat @ x
+    if transposed:
+        x = x.T.contiguous()
+    return x.float()
+
+
+def is_muon_or_apollo_matrix_param(name: str, param: nn.Parameter, *, min_dim: int = 128) -> bool:
+    """Return True for large 2D attention/MLP projection weights eligible for 8-bit Muon or 8-bit APOLLO."""
+    if param.ndim != 2 or min(param.shape) < int(min_dim):
+        return False
+    low = name.lower()
+    if any(tok in low for tok in ("norm", "bias", "embed", "position_embedding", "patch_embedding", "gate_attn", "gate_ffn")):
+        return False
+    return True
+
+
+def _deterministic_proj_matrix(
+    rank: int,
+    proj_dim: int,
+    *,
+    seed: int,
+    slot: int,
+    refresh_epoch: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Deterministic `rank x proj_dim` Gaussian projection matrix (`0` persistent GPU memory)."""
+    gen = torch.Generator(device="cpu")
+    mixed = (
+        (int(seed) * 0x9E3779B97F4A7C15)
+        ^ (int(slot + 1) * 0xBF58476D1CE4E5B9)
+        ^ (int(refresh_epoch) * 0x94D049BB133111EB)
+    ) & ((1 << 63) - 1)
+    gen.manual_seed(mixed)
+    scale = 1.0 / math.sqrt(max(1, int(rank)))
+    mat = torch.randn((int(rank), int(proj_dim)), generator=gen, dtype=torch.float32) * scale
+    return mat.to(device=device, dtype=torch.float32)
+
+
+class XpuVisionOptimizerEngine:
+    """Memory-efficient vision optimizer engine supporting `muon8bit`, `apollo8bit`, and `adamw` on XPU/CUDA/CPU.
+
+    Designed to train BOTH `27L SigLIP2-So400M-NaFlex` (`412.6M`) AND `40L SigLIP2-Giant-opt-16-384` (`1.133B`)
+    = `1.546B` total vision parameters simultaneously inside `16 GB` Intel Arc Pro B50 GDDR6:
+    - `muon8bit`: Blockwise `int8` Nesterov momentum (`1.03 B/param`) + BF16 Newton-Schulz-5 orthogonalization
+      + Moonlight RMS scaling (`0.2 * sqrt(max(m, n))`) + unbiased stochastic-rounded BF16 weights (`~1.7 GB` state!).
+    - `apollo8bit`: Deterministic rank-64 subspace projection + blockwise `int8` projected Adam moments
+      + channelwise scaling + unbiased stochastic-rounded BF16 weights (`~0.25 GB` state!).
+    - 1D norms, biases, and patch/position embeddings (`< 1%` of params) always use exact FP32-master AdamW (`wd=0`).
+    """
+
+    def __init__(
+        self,
+        *,
+        mode: str = "muon8bit",
+        device: torch.device,
+        weight_decay: float = 0.01,
+        muon_momentum: float = 0.95,
+        muon_ns_steps: int = 5,
+        apollo_rank: int = 64,
+        apollo_proj_gap: int = 200,
+        group_size: int = 128,
+        seed: int = 20261120,
+    ) -> None:
+        if mode not in VISION_OPTIMIZER_MODES:
+            raise ValueError(f"Unsupported vision optimizer mode {mode!r}; expected one of {VISION_OPTIMIZER_MODES}")
+        self.mode = mode
+        self.device = device
+        self.weight_decay = float(weight_decay)
+        self.muon_momentum = float(muon_momentum)
+        self.muon_ns_steps = int(muon_ns_steps)
+        self.apollo_rank = int(apollo_rank)
+        self.apollo_proj_gap = int(apollo_proj_gap)
+        self.group_size = int(group_size)
+        self.seed = int(seed)
+        self.beta1 = 0.9
+        self.beta2 = 0.95
+        self.eps = 1e-8
+        self.grad_accums: dict[str, torch.Tensor] = {}
+        self.optim_state: dict[str, dict[str, Any]] = {}
+        self._param_slots: dict[str, int] = {}
+        self._has_grads: bool = False
+        try:
+            self._sr_gen = torch.Generator(device=device)
+            self._sr_gen.manual_seed(self.seed)
+        except Exception:
+            self._sr_gen = None
+
+    def sync_trainable_params(self, named_params: list[tuple[str, nn.Parameter]]) -> int:
+        trainable_map = {n: p for n, p in named_params if p.requires_grad}
+        for stale in list(self.grad_accums.keys()):
+            if stale not in trainable_map:
+                del self.grad_accums[stale]
+        for stale in list(self.optim_state.keys()):
+            if stale not in trainable_map:
+                del self.optim_state[stale]
+        for n, p in trainable_map.items():
+            if n not in self._param_slots:
+                self._param_slots[n] = len(self._param_slots)
+            # Use BF16 grad accumulators for large 2D matrices in 8-bit modes (saves 3.1 GB on 1.55B Dual-Tower!)
+            use_bf16_accum = self.mode in ("muon8bit", "apollo8bit") and is_muon_or_apollo_matrix_param(n, p)
+            g_dtype = torch.bfloat16 if (use_bf16_accum and p.dtype == torch.bfloat16) else torch.float32
+            if n not in self.grad_accums or self.grad_accums[n].dtype != g_dtype:
+                self.grad_accums[n] = torch.zeros_like(p, dtype=g_dtype, device=self.device)
+            else:
+                self.grad_accums[n].zero_()
+        self._has_grads = False
+        return sum(int(p.numel()) for p in trainable_map.values())
+
+    def sync_master_from_param(self, name: str, cpu_t: torch.Tensor) -> None:
+        st = self.optim_state.get(name)
+        if st is not None and "master_weight" in st:
+            st["master_weight"].copy_(cpu_t.to(device=self.device, dtype=torch.float32))
+
+    def accumulate_grads(self, named_params: list[tuple[str, nn.Parameter]], *, mb_weight: float = 1.0) -> None:
+        with torch.no_grad():
+            for n, p in named_params:
+                if p.requires_grad and p.grad is not None and n in self.grad_accums:
+                    buf = self.grad_accums[n]
+                    if buf.dtype == torch.float32:
+                        buf.add_(p.grad.detach().float(), alpha=float(mb_weight))
+                    else:
+                        updated = buf.float().add_(p.grad.detach().float(), alpha=float(mb_weight))
+                        buf.copy_(updated.to(dtype=buf.dtype))
+                    p.grad = None
+        self._has_grads = True
+
+    def zero_grad(self) -> None:
+        for g in self.grad_accums.values():
+            g.zero_()
+        self._has_grads = False
+
+    def optimizer_state_bytes(self) -> int:
+        total = 0
+        for st in self.optim_state.values():
+            for v in st.values():
+                if isinstance(v, torch.Tensor):
+                    total += int(v.numel() * v.element_size())
+                elif isinstance(v, dict) and "q" in v and "scale" in v:
+                    total += int8_blockwise_nbytes(v)
+        return total
+
+    def grad_accum_bytes(self) -> int:
+        return sum(int(g.numel() * g.element_size()) for g in self.grad_accums.values())
+
+    def step(
+        self,
+        named_params: list[tuple[str, nn.Parameter]],
+        *,
+        lr: float,
+        max_grad_norm: float = 1.0,
+        post_scale: float = 1.0,
+        detail_lr_mult: float = 1.0,
+    ) -> dict[str, Any]:
+        if not self._has_grads or not self.grad_accums:
+            return {
+                "applied": False,
+                "finite": True,
+                "vision_grad_norm": 0.0,
+                "global_grad_norm": 0.0,
+                "detail_grad_norm": 0.0,
+                "optimizer_mode": self.mode,
+                "optimizer_state_bytes": self.optimizer_state_bytes(),
+                "grad_accum_bytes": self.grad_accum_bytes(),
+            }
+        t0 = time.monotonic()
+        with torch.no_grad():
+            total_sq = torch.zeros((), device=self.device, dtype=torch.float32)
+            global_sq = torch.zeros((), device=self.device, dtype=torch.float32)
+            detail_sq = torch.zeros((), device=self.device, dtype=torch.float32)
+            for n, g in self.grad_accums.items():
+                gf = g.float()
+                if post_scale != 1.0:
+                    gf.mul_(float(post_scale))
+                    if g.dtype == torch.float32:
+                        g.mul_(float(post_scale))
+                    else:
+                        g.copy_(gf.to(dtype=g.dtype))
+                sq = gf.square().sum()
+                total_sq = total_sq + sq
+                if n.startswith("detail."):
+                    detail_sq = detail_sq + sq
+                else:
+                    global_sq = global_sq + sq
+            gnorm = float(total_sq.sqrt().item())
+            gnorm_g = float(global_sq.sqrt().item())
+            gnorm_d = float(detail_sq.sqrt().item())
+            if not (gnorm >= 0.0 and gnorm < float("inf")):
+                self.zero_grad()
+                return {
+                    "applied": False,
+                    "finite": False,
+                    "vision_grad_norm": float("nan"),
+                    "global_grad_norm": float("nan"),
+                    "detail_grad_norm": float("nan"),
+                    "optimizer_mode": self.mode,
+                    "optimizer_state_bytes": self.optimizer_state_bytes(),
+                    "grad_accum_bytes": self.grad_accum_bytes(),
+                }
+
+            clip_coef = min(1.0, max_grad_norm / (gnorm + 1e-12)) if max_grad_norm > 0.0 else 1.0
+            muon_count = 0
+            apollo_count = 0
+            adamw_count = 0
+
+            for n, p in named_params:
+                if not p.requires_grad or n not in self.grad_accums:
+                    continue
+                eff_lr = float(lr) * (float(detail_lr_mult) if n.startswith("detail.") else 1.0)
+                g_buf = self.grad_accums[n]
+                g = g_buf.float()
+                if clip_coef < 1.0:
+                    g.mul_(clip_coef)
+
+                is_mat = is_muon_or_apollo_matrix_param(n, p)
+                if self.mode == "muon8bit" and is_mat:
+                    muon_count += 1
+                    st = self.optim_state.get(n)
+                    if st is None:
+                        buf_m = g.clone()
+                        st = {"kind": "muon8bit", "step": 1}
+                        self.optim_state[n] = st
+                    else:
+                        st["step"] += 1
+                        buf_m = dequantize_int8_blockwise(st["m_q"], device=self.device)
+                        buf_m.mul_(self.muon_momentum).add_(g)
+                    # Nesterov lookahead momentum before quantizing B_t back to int8
+                    u_in = g.add(buf_m, alpha=self.muon_momentum)
+                    st["m_q"] = quantize_int8_blockwise(buf_m, group_size=self.group_size)
+                    del buf_m
+                    ortho = newton_schulz5_orthogonalize(u_in, steps=self.muon_ns_steps)
+                    del u_in
+                    # Moonlight RMS-matched scaling: match AdamW's ~0.2 update RMS regardless of matrix aspect ratio!
+                    rms_scale = 0.2 * math.sqrt(float(max(p.shape[0], p.shape[1])))
+                    w_fp32 = p.detach().float()
+                    if self.weight_decay != 0.0:
+                        w_fp32.mul_(1.0 - eff_lr * self.weight_decay)
+                    w_fp32.add_(ortho, alpha=-eff_lr * rms_scale)
+                    del ortho
+                    if p.dtype == torch.bfloat16:
+                        p.data.copy_(stochastic_round_fp32_to_bf16_xpu(w_fp32, self._sr_gen))
+                    else:
+                        p.data.copy_(w_fp32.to(dtype=p.dtype))
+                    del w_fp32
+                elif self.mode == "apollo8bit" and is_mat:
+                    apollo_count += 1
+                    st = self.optim_state.get(n)
+                    if st is None:
+                        st = {"kind": "apollo8bit", "step": 0}
+                        self.optim_state[n] = st
+                    st["step"] += 1
+                    t = int(st["step"])
+                    rows, cols = int(p.shape[0]), int(p.shape[1])
+                    proj_left = rows <= cols
+                    proj_dim = rows if proj_left else cols
+                    rank = min(self.apollo_rank, proj_dim)
+                    refresh_epoch = (t - 1) // max(1, self.apollo_proj_gap)
+                    P = _deterministic_proj_matrix(
+                        rank,
+                        proj_dim,
+                        seed=self.seed,
+                        slot=self._param_slots[n],
+                        refresh_epoch=refresh_epoch,
+                        device=self.device,
+                    )
+                    # Project gradient into compact rank subspace: R = P @ G (if rows<=cols) or G @ P^T (if cols<rows)
+                    r_grad = (P @ g) if proj_left else (g @ P.T)
+                    if "m_q" not in st:
+                        m_r = torch.zeros_like(r_grad)
+                        v_r = torch.zeros_like(r_grad)
+                    else:
+                        m_r = dequantize_int8_blockwise(st["m_q"], device=self.device)
+                        v_r = dequantize_int8_blockwise(st["v_q"], device=self.device).clamp_min(0.0)
+                    m_r.mul_(self.beta1).add_(r_grad, alpha=1.0 - self.beta1)
+                    v_r.mul_(self.beta2).addcmul_(r_grad, r_grad, value=1.0 - self.beta2)
+                    bc1 = 1.0 - self.beta1**t
+                    bc2 = 1.0 - self.beta2**t
+                    u_r = (m_r / bc1) / ((v_r.sqrt() / math.sqrt(bc2)) + self.eps)
+                    st["m_q"] = quantize_int8_blockwise(m_r, group_size=self.group_size)
+                    st["v_q"] = quantize_int8_blockwise(v_r, group_size=self.group_size)
+                    del m_r, v_r, P
+                    # Channelwise APOLLO scaling applied directly to full gradient g
+                    dim_red = 0 if proj_left else 1
+                    u_norm = u_r.norm(dim=dim_red, keepdim=True)
+                    r_norm = r_grad.norm(dim=dim_red, keepdim=True).clamp_min(1e-8)
+                    ch_scale = (u_norm / r_norm).clamp(0.0, 1.0)
+                    scaled_g = g * ch_scale
+                    del u_r, r_grad, u_norm, r_norm, ch_scale
+                    w_fp32 = p.detach().float()
+                    if self.weight_decay != 0.0:
+                        w_fp32.mul_(1.0 - eff_lr * self.weight_decay)
+                    w_fp32.add_(scaled_g, alpha=-eff_lr)
+                    del scaled_g
+                    if p.dtype == torch.bfloat16:
+                        p.data.copy_(stochastic_round_fp32_to_bf16_xpu(w_fp32, self._sr_gen))
+                    else:
+                        p.data.copy_(w_fp32.to(dtype=p.dtype))
+                    del w_fp32
+                else:
+                    adamw_count += 1
+                    st = self.optim_state.get(n)
+                    if st is None:
+                        st = {
+                            "kind": "adamw",
+                            "step": 0,
+                            "exp_avg": torch.zeros_like(p, dtype=torch.float32, device=self.device),
+                            "exp_avg_sq": torch.zeros_like(p, dtype=torch.float32, device=self.device),
+                            "master_weight": p.detach().to(device=self.device, dtype=torch.float32).clone(),
+                        }
+                        self.optim_state[n] = st
+                    st["step"] += 1
+                    t = int(st["step"])
+                    exp_avg = st["exp_avg"]
+                    exp_avg_sq = st["exp_avg_sq"]
+                    master = st["master_weight"]
+                    exp_avg.mul_(self.beta1).add_(g, alpha=1.0 - self.beta1)
+                    exp_avg_sq.mul_(self.beta2).addcmul_(g, g, value=1.0 - self.beta2)
+                    bc1 = 1.0 - self.beta1**t
+                    bc2 = 1.0 - self.beta2**t
+                    step_sz = eff_lr / bc1
+                    denom_t = (exp_avg_sq.sqrt() / math.sqrt(bc2)).add_(self.eps)
+                    no_decay = p.ndim < 2 or n.endswith(".bias") or any(k in n.lower() for k in ("norm", "embed", "gate"))
+                    wd = 0.0 if no_decay else self.weight_decay
+                    if wd != 0.0:
+                        master.mul_(1.0 - eff_lr * wd)
+                    master.addcdiv_(exp_avg, denom_t, value=-step_sz)
+                    p.data.copy_(master.to(dtype=p.dtype))
+
+                g_buf.zero_()
+                del g
+
+            self._has_grads = False
+        return {
+            "applied": True,
+            "finite": True,
+            "vision_grad_norm": gnorm,
+            "global_grad_norm": gnorm_g,
+            "detail_grad_norm": gnorm_d,
+            "clip_coef": clip_coef,
+            "optimizer_mode": self.mode,
+            "muon_tensors": muon_count,
+            "apollo_tensors": apollo_count,
+            "adamw_tensors": adamw_count,
+            "optimizer_state_bytes": self.optimizer_state_bytes(),
+            "grad_accum_bytes": self.grad_accum_bytes(),
+            "step_ms": round((time.monotonic() - t0) * 1000.0, 2),
+        }
+
+    def state_dict_cpu(self) -> dict[str, Any]:
+        out: dict[str, Any] = {"mode": self.mode, "states": {}}
+        for n, st in self.optim_state.items():
+            ser: dict[str, Any] = {"kind": st.get("kind", "adamw"), "step": int(st["step"])}
+            for k, v in st.items():
+                if k in ("kind", "step"):
+                    continue
+                if isinstance(v, torch.Tensor):
+                    ser[k] = v.detach().cpu()
+                elif isinstance(v, dict) and "q" in v:
+                    ser[k] = {
+                        "q": v["q"].detach().cpu(),
+                        "scale": v["scale"].detach().cpu(),
+                        "shape": list(v["shape"]),
+                        "numel": int(v["numel"]),
+                        "group_size": int(v["group_size"]),
+                    }
+            out["states"][n] = ser
+        return out
+
+    def load_state_dict_cpu(self, raw: dict[str, Any]) -> None:
+        self.optim_state.clear()
+        if not isinstance(raw, dict):
+            return
+        states = raw.get("states", raw)
+        if not isinstance(states, dict):
+            return
+        for n, st in states.items():
+            if not isinstance(st, dict) or "step" not in st:
+                continue
+            dst: dict[str, Any] = {"kind": st.get("kind", "adamw"), "step": int(st["step"])}
+            for k, v in st.items():
+                if k in ("kind", "step"):
+                    continue
+                if isinstance(v, torch.Tensor):
+                    dst[k] = v.to(device=self.device, dtype=torch.float32)
+                elif isinstance(v, dict) and "q" in v:
+                    dst[k] = {
+                        "q": v["q"].to(device=self.device, dtype=torch.int8),
+                        "scale": v["scale"].to(device=self.device, dtype=torch.float32),
+                        "shape": tuple(v["shape"]),
+                        "numel": int(v["numel"]),
+                        "group_size": int(v["group_size"]),
+                    }
+            self.optim_state[n] = dst
 
 
 def intel_arc_runtime_env(
@@ -426,21 +895,77 @@ class _IntelXpuVisionAutogradFn(torch.autograd.Function):
         return None, None, None, None, None, None, None, None
 
 
+class _IntelXpuDetailVisionAutogradFn(torch.autograd.Function):
+    """Differentiable cross-GPU autograd bridge for the fixed-grid Detail Vision Tower (`SigLIP2-Giant-opt-16-384`)."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        grad_trigger: torch.Tensor,
+        bridge: "IntelArcXpuVisionBridge",
+        pixel_values: torch.Tensor,
+        interpolate_pos_encoding: bool,
+        out_device_str: str,
+        out_dtype: torch.dtype,
+        prefetched_result: tuple[int, Any] | None = None,
+    ) -> torch.Tensor:
+        if prefetched_result is not None:
+            slot_id, feat_out = prefetched_result
+            ctx.bridge = bridge
+            ctx.slot_id = slot_id
+            return feat_out.to(device=out_device_str, dtype=out_dtype, non_blocking=True)
+        slot_id, feat_out = bridge._rpc_forward_detail_train(
+            pixel_values=pixel_values,
+            interpolate_pos_encoding=bool(interpolate_pos_encoding),
+            out_device=out_device_str,
+            out_dtype=out_dtype,
+        )
+        ctx.bridge = bridge
+        ctx.slot_id = slot_id
+        return feat_out
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        bridge: IntelArcXpuVisionBridge = ctx.bridge
+        slot_id: int = ctx.slot_id
+        if grad_output is not None and bridge is not None:
+            mb_weight = float(getattr(bridge, "active_microbatch_weight", 1.0))
+            bridge._rpc_backward_async(slot_id=slot_id, grad_output=grad_output, mb_weight=mb_weight)
+        return None, None, None, None, None, None, None
+
+
 class IntelArcXpuVisionBridge:
-    """Client managing the persistent Intel Arc Pro B50 (`xpu:0`) vision co-processor daemon."""
+    """Client managing the persistent Intel Arc Pro B50 (`xpu:0`) single- or dual-tower vision co-processor daemon."""
 
     def __init__(
         self,
         vision_model_path: str | Path,
         *,
+        detail_vision_model_path: str | Path | None = None,
+        vision_optimizer: str = "adamw",
+        vitdet_window_size: int | None = None,
+        radio_layer_indices: tuple[int, ...] = DEFAULT_RADIO_LAYER_INDICES,
         xpu_python: str | Path | None = None,
         device_spec: str = "xpu:0",
         vision_dtype: str = "bfloat16",
         weight_decay: float = 0.01,
         grad_checkpoint_token_threshold: int = 3072,
-        startup_timeout_s: float = 120.0,
+        startup_timeout_s: float = 180.0,
     ) -> None:
         self.vision_model_path = Path(vision_model_path).resolve()
+        self.is_cradiov4 = is_cradiov4_dir(self.vision_model_path)
+        self.vitdet_window_size = int(vitdet_window_size) if vitdet_window_size is not None else None
+        self.radio_layer_indices = tuple(int(i) for i in radio_layer_indices)
+        self.detail_vision_model_path = (
+            Path(detail_vision_model_path).resolve() if detail_vision_model_path is not None else None
+        )
+        eff_opt = str(
+            vision_optimizer
+            or ("muon8bit" if (self.is_cradiov4 or self.detail_vision_model_path is not None) else "adamw")
+        )
+        if eff_opt not in VISION_OPTIMIZER_MODES:
+            raise ValueError(f"Unsupported vision_optimizer {eff_opt!r}; expected one of {VISION_OPTIMIZER_MODES}")
+        self.vision_optimizer = eff_opt
         cand_py = Path(xpu_python or os.environ.get("SPARK_XPU_PYTHON") or DEFAULT_XPU_PYTHON)
         if not cand_py.is_file():
             cand_py = Path(sys.executable)
@@ -453,8 +978,11 @@ class IntelArcXpuVisionBridge:
         self.grad_checkpoint_token_threshold = int(grad_checkpoint_token_threshold)
         self.active_microbatch_weight: float = 1.0
         self._dirty_on_xpu: bool = False
+        self._detail_dirty_on_xpu: bool = False
         self._trainable: bool = False
+        self._detail_trainable: bool = False
         self._unfreeze_last_n_layers: int = 0
+        self._detail_unfreeze_last_n_layers: int = 0
         self._last_step_stats: dict[str, Any] = {}
         self._sock_lock = threading.Lock()
         self._cuda_dma_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
@@ -504,7 +1032,15 @@ class IntelArcXpuVisionBridge:
             str(self.weight_decay),
             "--grad-ckpt-tokens",
             str(self.grad_checkpoint_token_threshold),
+            "--vision-optimizer",
+            str(self.vision_optimizer),
         ]
+        if self.detail_vision_model_path is not None:
+            cmd.extend(["--vision-detail-path", str(self.detail_vision_model_path)])
+        if self.vitdet_window_size is not None:
+            cmd.extend(["--vitdet-window-size", str(self.vitdet_window_size)])
+        if self.is_cradiov4:
+            cmd.extend(["--radio-layer-indices", ",".join(str(i) for i in self.radio_layer_indices)])
         self.log_path = self.ipc_dir / "daemon.log"
         self._log_fh = self.log_path.open("w", encoding="utf-8")
         self._proc = subprocess.Popen(
@@ -552,16 +1088,23 @@ class IntelArcXpuVisionBridge:
             raise RuntimeError(f"Intel Arc XPU vision daemon error: {resp.get('error', 'unknown')}")
         return resp
 
-    def sync_from_host(self, vision_module: nn.Module) -> None:
+    def sync_from_host(self, vision_module: nn.Module, *, tower: str = "global") -> None:
         state = {k: v.detach().cpu() for k, v in vision_module.state_dict().items()}
         _write_tensor_pack(self.req_pack, state)
-        self._rpc({"cmd": "SYNC_FROM_HOST", "pack": str(self.req_pack)})
-        self._dirty_on_xpu = False
+        self._rpc({"cmd": "SYNC_FROM_HOST", "pack": str(self.req_pack), "tower": str(tower)})
+        if tower == "detail":
+            self._detail_dirty_on_xpu = False
+        else:
+            self._dirty_on_xpu = False
 
-    def sync_to_host(self, vision_module: nn.Module, *, force: bool = False) -> bool:
-        if not force and not self._dirty_on_xpu:
+    def sync_detail_from_host(self, detail_vision_module: nn.Module) -> None:
+        self.sync_from_host(detail_vision_module, tower="detail")
+
+    def sync_to_host(self, vision_module: nn.Module, *, force: bool = False, tower: str = "global") -> bool:
+        is_dirty = self._detail_dirty_on_xpu if tower == "detail" else self._dirty_on_xpu
+        if not force and not is_dirty:
             return False
-        self._rpc({"cmd": "SYNC_TO_HOST", "pack": str(self.resp_pack)})
+        self._rpc({"cmd": "SYNC_TO_HOST", "pack": str(self.resp_pack), "tower": str(tower)})
         tensors = _read_tensor_pack(self.resp_pack, device="cpu")
         with torch.no_grad():
             param_map = dict(vision_module.named_parameters())
@@ -572,23 +1115,56 @@ class IntelArcXpuVisionBridge:
                     target = buf_map.get(name)
                 if target is not None:
                     target.data.copy_(cpu_t.to(device=target.device, dtype=target.dtype))
-        self._dirty_on_xpu = False
+        if tower == "detail":
+            self._detail_dirty_on_xpu = False
+        else:
+            self._dirty_on_xpu = False
         return True
 
-    def configure_trainability(self, *, trainable: bool, unfreeze_last_n_layers: int = 27) -> dict[str, Any]:
+    def sync_detail_to_host(self, detail_vision_module: nn.Module, *, force: bool = False) -> bool:
+        return self.sync_to_host(detail_vision_module, force=force, tower="detail")
+
+    def has_detail_tower(self) -> bool:
+        return self.detail_vision_model_path is not None
+
+    def configure_trainability(
+        self,
+        *,
+        trainable: bool,
+        unfreeze_last_n_layers: int = 27,
+        detail_trainable: bool | None = None,
+        detail_unfreeze_last_n_layers: int | None = None,
+    ) -> dict[str, Any]:
         self._trainable = bool(trainable)
         self._unfreeze_last_n_layers = int(unfreeze_last_n_layers) if trainable else 0
+        if self.detail_vision_model_path is not None:
+            det_tr = bool(trainable if detail_trainable is None else detail_trainable)
+            det_n = (
+                int(detail_unfreeze_last_n_layers)
+                if detail_unfreeze_last_n_layers is not None
+                else (40 if det_tr else 0)
+            )
+            self._detail_trainable = det_tr and det_n > 0
+            self._detail_unfreeze_last_n_layers = det_n if self._detail_trainable else 0
+        else:
+            self._detail_trainable = False
+            self._detail_unfreeze_last_n_layers = 0
         resp = self._rpc(
             {
                 "cmd": "SET_TRAINABLE",
                 "trainable": self._trainable,
                 "unfreeze_last_n_layers": self._unfreeze_last_n_layers,
+                "detail_trainable": self._detail_trainable,
+                "detail_unfreeze_last_n_layers": self._detail_unfreeze_last_n_layers,
             }
         )
         self.device_info.update(
             trainable_parameters=resp.get("trainable_parameters", 0),
             total_parameters=resp.get("total_parameters", 0),
             unfrozen_layers=resp.get("unfrozen_layers", 0),
+            detail_trainable_parameters=resp.get("detail_trainable_parameters", 0),
+            detail_total_parameters=resp.get("detail_total_parameters", 0),
+            detail_unfrozen_layers=resp.get("detail_unfrozen_layers", 0),
         )
         return resp
 
@@ -596,8 +1172,8 @@ class IntelArcXpuVisionBridge:
         self,
         *,
         pixel_values: torch.Tensor,
-        pixel_attention_mask: torch.Tensor,
-        spatial_shapes: torch.Tensor,
+        pixel_attention_mask: torch.Tensor | None = None,
+        spatial_shapes: torch.Tensor | None = None,
         out_device: str | torch.device = "cpu",
         out_dtype: torch.dtype = torch.bfloat16,
         ping_slot: int = 0,
@@ -609,15 +1185,12 @@ class IntelArcXpuVisionBridge:
             slot_id = self._slot_counter
             in_off = FWD_IN_BASE + (ping_slot % 2) * FWD_IN_SLOT_BYTES
             out_off = FWD_OUT_BASE + (ping_slot % 2) * FWD_OUT_SLOT_BYTES
-            w_info = self.arena.write_tensors(
-                in_off,
-                FWD_IN_SLOT_BYTES,
-                {
-                    "pixel_values": pixel_values,
-                    "pixel_attention_mask": pixel_attention_mask,
-                    "spatial_shapes": spatial_shapes,
-                },
-            )
+            payload_tensors: dict[str, torch.Tensor] = {"pixel_values": pixel_values}
+            if pixel_attention_mask is not None:
+                payload_tensors["pixel_attention_mask"] = pixel_attention_mask
+            if spatial_shapes is not None:
+                payload_tensors["spatial_shapes"] = spatial_shapes
+            w_info = self.arena.write_tensors(in_off, FWD_IN_SLOT_BYTES, payload_tensors)
             if not w_info.get("overflow", False):
                 _send_msg(
                     self._sock,
@@ -640,15 +1213,8 @@ class IntelArcXpuVisionBridge:
                         cuda_stream=self._cuda_dma_stream,
                     )["last_hidden_state"]
                     return slot_id, out
-            # Fallback for jumbo >16MB input payloads
-            _write_tensor_pack(
-                self.req_pack,
-                {
-                    "pixel_values": pixel_values,
-                    "pixel_attention_mask": pixel_attention_mask,
-                    "spatial_shapes": spatial_shapes,
-                },
-            )
+            # Fallback for jumbo >32MB payloads
+            _write_tensor_pack(self.req_pack, payload_tensors)
             _send_msg(
                 self._sock,
                 {
@@ -672,11 +1238,11 @@ class IntelArcXpuVisionBridge:
         *,
         out_dtype: torch.dtype = torch.bfloat16,
     ) -> tuple[int, torch.Tensor]:
-        """Run 27-layer Arc B50 ViT forward on `ping_slot=1` from a background prefetch thread."""
+        """Run Arc B50 ViT (`SigLIP2` or `C-RADIOv4-H`) forward on `ping_slot=1` from a background prefetch thread."""
         return self._rpc_forward_train(
             pixel_values=batch["pixel_values"],
-            pixel_attention_mask=batch["pixel_attention_mask"],
-            spatial_shapes=batch["spatial_shapes"],
+            pixel_attention_mask=batch.get("pixel_attention_mask"),
+            spatial_shapes=batch.get("spatial_shapes"),
             out_device="cpu",
             out_dtype=out_dtype,
             ping_slot=1,
@@ -737,8 +1303,8 @@ class IntelArcXpuVisionBridge:
         prefetched_result: tuple[int, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         pv = batch["pixel_values"]
-        pam = batch["pixel_attention_mask"]
-        ss = batch["spatial_shapes"]
+        pam = batch.get("pixel_attention_mask")
+        ss = batch.get("spatial_shapes")
         if training_mode and self._trainable and torch.is_grad_enabled():
             trigger = torch.zeros(1, device=out_device, dtype=torch.float32, requires_grad=True)
             return _IntelXpuVisionAutogradFn.apply(
@@ -751,14 +1317,15 @@ class IntelArcXpuVisionBridge:
                 out_dtype,
                 prefetched_result,
             )
+        payload_tensors: dict[str, torch.Tensor] = {"pixel_values": pv}
+        if pam is not None:
+            payload_tensors["pixel_attention_mask"] = pam
+        if ss is not None:
+            payload_tensors["spatial_shapes"] = ss
         with self._sock_lock:
             if self._sock is None:
                 raise RuntimeError("Intel Arc XPU vision bridge is closed")
-            w_info = self.arena.write_tensors(
-                FWD_IN_BASE,
-                FWD_IN_SLOT_BYTES,
-                {"pixel_values": pv, "pixel_attention_mask": pam, "spatial_shapes": ss},
-            )
+            w_info = self.arena.write_tensors(FWD_IN_BASE, FWD_IN_SLOT_BYTES, payload_tensors)
             if not w_info.get("overflow", False):
                 _send_msg(
                     self._sock,
@@ -779,13 +1346,151 @@ class IntelArcXpuVisionBridge:
                         dtype_override=out_dtype,
                         cuda_stream=self._cuda_dma_stream,
                     )["last_hidden_state"]
-            _write_tensor_pack(
-                self.req_pack,
-                {"pixel_values": pv, "pixel_attention_mask": pam, "spatial_shapes": ss},
-            )
+            _write_tensor_pack(self.req_pack, payload_tensors)
             _send_msg(
                 self._sock,
                 {"cmd": "FORWARD_EVAL", "req_pack": str(self.req_pack), "resp_pack": str(self.resp_pack)},
+            )
+            resp = _recv_msg(self._sock)
+            if not resp.get("ok", False):
+                raise RuntimeError(f"Intel Arc XPU vision daemon error: {resp.get('error', 'unknown')}")
+            out = _read_tensor_pack(self.resp_pack, device="cpu")["last_hidden_state"]
+            return out.to(device=out_device, dtype=out_dtype)
+
+    def _rpc_forward_detail_train(
+        self,
+        *,
+        pixel_values: torch.Tensor,
+        interpolate_pos_encoding: bool = True,
+        out_device: str | torch.device = "cpu",
+        out_dtype: torch.dtype = torch.bfloat16,
+        ping_slot: int = 0,
+    ) -> tuple[int, torch.Tensor]:
+        with self._sock_lock:
+            if self._sock is None:
+                raise RuntimeError("Intel Arc XPU vision bridge is closed")
+            self._slot_counter = (self._slot_counter + 1) & 0x3FFFFFFF
+            slot_id = self._slot_counter
+            in_off = FWD_IN_BASE + (ping_slot % 2) * FWD_IN_SLOT_BYTES
+            out_off = FWD_OUT_BASE + (ping_slot % 2) * FWD_OUT_SLOT_BYTES
+            w_info = self.arena.write_tensors(in_off, FWD_IN_SLOT_BYTES, {"pixel_values": pixel_values})
+            if not w_info.get("overflow", False):
+                _send_msg(
+                    self._sock,
+                    {
+                        "cmd": "FORWARD_TRAIN_SHM",
+                        "tower": "detail",
+                        "slot_id": slot_id,
+                        "interpolate_pos_encoding": bool(interpolate_pos_encoding),
+                        "in_meta": w_info["tensors"],
+                        "out_offset": out_off,
+                        "out_cap": FWD_OUT_SLOT_BYTES,
+                    },
+                )
+                resp = _recv_msg(self._sock)
+                if not resp.get("ok", False):
+                    raise RuntimeError(f"Intel Arc XPU vision daemon error: {resp.get('error', 'unknown')}")
+                if not resp.get("overflow", False):
+                    out = self.arena.read_tensors(
+                        resp["out_meta"],
+                        device=out_device,
+                        dtype_override=out_dtype,
+                        cuda_stream=self._cuda_dma_stream,
+                    )["last_hidden_state"]
+                    return slot_id, out
+            _write_tensor_pack(self.req_pack, {"pixel_values": pixel_values})
+            _send_msg(
+                self._sock,
+                {
+                    "cmd": "FORWARD_TRAIN",
+                    "tower": "detail",
+                    "slot_id": slot_id,
+                    "interpolate_pos_encoding": bool(interpolate_pos_encoding),
+                    "req_pack": str(self.req_pack),
+                    "resp_pack": str(self.resp_pack),
+                },
+            )
+            resp = _recv_msg(self._sock)
+            if not resp.get("ok", False):
+                raise RuntimeError(f"Intel Arc XPU vision daemon error: {resp.get('error', 'unknown')}")
+            out = _read_tensor_pack(self.resp_pack, device="cpu")["last_hidden_state"].to(
+                device=out_device, dtype=out_dtype
+            )
+            return slot_id, out
+
+    def prefetch_forward_detail_train(
+        self,
+        pixel_values: torch.Tensor,
+        *,
+        interpolate_pos_encoding: bool = True,
+        out_dtype: torch.dtype = torch.bfloat16,
+    ) -> tuple[int, torch.Tensor]:
+        """Run 40-layer Giant-384 detail forward on `ping_slot=1` concurrently from background thread."""
+        return self._rpc_forward_detail_train(
+            pixel_values=pixel_values,
+            interpolate_pos_encoding=bool(interpolate_pos_encoding),
+            out_device="cpu",
+            out_dtype=out_dtype,
+            ping_slot=1,
+        )
+
+    def forward_detail(
+        self,
+        pixel_values: torch.Tensor,
+        *,
+        training_mode: bool,
+        out_device: str | torch.device,
+        out_dtype: torch.dtype,
+        interpolate_pos_encoding: bool = True,
+        prefetched_result: tuple[int, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        if training_mode and self._detail_trainable and torch.is_grad_enabled():
+            trigger = torch.zeros(1, device=out_device, dtype=torch.float32, requires_grad=True)
+            return _IntelXpuDetailVisionAutogradFn.apply(
+                trigger,
+                self,
+                pixel_values,
+                bool(interpolate_pos_encoding),
+                str(out_device),
+                out_dtype,
+                prefetched_result,
+            )
+        with self._sock_lock:
+            if self._sock is None:
+                raise RuntimeError("Intel Arc XPU vision bridge is closed")
+            w_info = self.arena.write_tensors(FWD_IN_BASE, FWD_IN_SLOT_BYTES, {"pixel_values": pixel_values})
+            if not w_info.get("overflow", False):
+                _send_msg(
+                    self._sock,
+                    {
+                        "cmd": "FORWARD_EVAL_SHM",
+                        "tower": "detail",
+                        "interpolate_pos_encoding": bool(interpolate_pos_encoding),
+                        "in_meta": w_info["tensors"],
+                        "out_offset": FWD_OUT_BASE,
+                        "out_cap": FWD_OUT_SLOT_BYTES,
+                    },
+                )
+                resp = _recv_msg(self._sock)
+                if not resp.get("ok", False):
+                    raise RuntimeError(f"Intel Arc XPU vision daemon error: {resp.get('error', 'unknown')}")
+                if not resp.get("overflow", False):
+                    return self.arena.read_tensors(
+                        resp["out_meta"],
+                        device=out_device,
+                        dtype_override=out_dtype,
+                        cuda_stream=self._cuda_dma_stream,
+                    )["last_hidden_state"]
+            _write_tensor_pack(self.req_pack, {"pixel_values": pixel_values})
+            _send_msg(
+                self._sock,
+                {
+                    "cmd": "FORWARD_EVAL",
+                    "tower": "detail",
+                    "interpolate_pos_encoding": bool(interpolate_pos_encoding),
+                    "req_pack": str(self.req_pack),
+                    "resp_pack": str(self.resp_pack),
+                },
             )
             resp = _recv_msg(self._sock)
             if not resp.get("ok", False):
@@ -803,8 +1508,9 @@ class IntelArcXpuVisionBridge:
         lr: float,
         max_grad_norm: float = 1.0,
         post_scale: float = 1.0,
+        detail_lr_mult: float = 1.0,
     ) -> dict[str, Any]:
-        if not self._trainable:
+        if not self._trainable and not self._detail_trainable:
             return {"applied": False, "finite": True, "vision_grad_norm": 0.0}
         resp = self._rpc(
             {
@@ -812,10 +1518,14 @@ class IntelArcXpuVisionBridge:
                 "lr": float(lr),
                 "max_grad_norm": float(max_grad_norm),
                 "post_scale": float(post_scale),
+                "detail_lr_mult": float(detail_lr_mult),
             }
         )
         if resp.get("applied", False):
-            self._dirty_on_xpu = True
+            if self._trainable:
+                self._dirty_on_xpu = True
+            if self._detail_trainable:
+                self._detail_dirty_on_xpu = True
         self._last_step_stats = resp
         return resp
 
@@ -834,9 +1544,14 @@ class IntelArcXpuVisionBridge:
     def telemetry(self) -> dict[str, Any]:
         return {
             **self.device_info,
+            "vision_optimizer": self.vision_optimizer,
+            "has_detail_tower": self.has_detail_tower(),
             "trainable_active": self._trainable,
+            "detail_trainable_active": self._detail_trainable,
             "unfreeze_last_n_layers": self._unfreeze_last_n_layers,
+            "detail_unfreeze_last_n_layers": self._detail_unfreeze_last_n_layers,
             "dirty_on_xpu": self._dirty_on_xpu,
+            "detail_dirty_on_xpu": self._detail_dirty_on_xpu,
             "last_step": self._last_step_stats,
         }
 
@@ -978,9 +1693,155 @@ class OpenVinoArcVisionRunner:
         return torch.from_numpy(raw_out).to(device=out_device, dtype=out_dtype)
 
 
-def _run_xpu_daemon(args: argparse.Namespace) -> None:
-    from transformers import Siglip2VisionConfig, Siglip2VisionModel
+def is_cradiov4_dir(path: str | Path | None) -> bool:
+    """Detect whether a local vision component directory holds an NVIDIA `C-RADIOv4` (`RADIOModel`) backbone."""
+    if path is None:
+        return False
+    cfg_path = Path(path) / "config.json"
+    if not cfg_path.is_file():
+        return False
+    try:
+        raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    archs = [str(a) for a in (raw.get("architectures") or ())]
+    ver = str(raw.get("version") or "").lower()
+    return ("RADIOModel" in archs) or ("radio" in ver)
 
+
+def load_cradiov4_vision_model(
+    model_dir: str | Path,
+    *,
+    dtype: torch.dtype = torch.bfloat16,
+    pretrained: bool = True,
+    vitdet_window_size: int | None = None,
+) -> nn.Module:
+    """Offline, hyphen-safe loader for NVIDIA `C-RADIOv4-H` / `C-RADIOv4-SO400M` without relying on `~/.cache/huggingface/modules`."""
+    import importlib.util
+    import types
+
+    d = Path(model_dir).resolve()
+    pkg_name = f"_spark_cradiov4_local_{abs(hash(str(d))) & 0xFFFFFFFF:08x}"
+    hf_mod_name = f"{pkg_name}.hf_model"
+    mod = sys.modules.get(hf_mod_name)
+    if mod is None:
+        if pkg_name not in sys.modules:
+            pkg = types.ModuleType(pkg_name)
+            pkg.__path__ = [str(d)]
+            pkg.__package__ = pkg_name
+            sys.modules[pkg_name] = pkg
+        spec = importlib.util.spec_from_file_location(hf_mod_name, str(d / "hf_model.py"))
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"Cannot load C-RADIOv4 hf_model.py from {d}")
+        mod = importlib.util.module_from_spec(spec)
+        mod.__package__ = pkg_name
+        sys.modules[hf_mod_name] = mod
+        spec.loader.exec_module(mod)
+
+    cfg = mod.RADIOConfig.from_pretrained(str(d), local_files_only=True)
+    if vitdet_window_size is not None:
+        cfg.vitdet_window_size = int(vitdet_window_size)
+    if pretrained:
+        vision = mod.RADIOModel.from_pretrained(str(d), config=cfg, local_files_only=True)
+    else:
+        vision = mod.RADIOModel(cfg)
+    vision = vision.to(dtype=dtype)
+    if hasattr(vision, "radio_model") and hasattr(vision.radio_model, "input_conditioner"):
+        vision.radio_model.input_conditioner.dtype = dtype
+        vision.radio_model.input_conditioner.to(dtype=dtype)
+    return vision
+
+
+def is_cradiov4_module(mod: nn.Module | None) -> bool:
+    return bool(mod is not None and hasattr(mod, "radio_model") and hasattr(mod.radio_model, "forward_intermediates"))
+
+
+def cradiov4_forward_multilayer(
+    mod: nn.Module,
+    pixel_values: torch.Tensor,
+    *,
+    indices: tuple[int, ...] = DEFAULT_RADIO_LAYER_INDICES,
+) -> torch.Tensor:
+    """Run `C-RADIOv4` multi-layer `forward_intermediates` and stack `(B, K, N, D)` spatial patch tensors.
+
+    Clamps requested 0-based block indices cleanly to `[0, num_blocks - 1]` so both 32-layer `-H` (`L22+L32`)
+    and 27-layer `-SO400M` / tiny test stubs work identically.
+    """
+    inner = getattr(mod.radio_model, "model", None)
+    blocks = getattr(inner, "blocks", None)
+    n_blk = len(blocks) if blocks is not None else 32
+    eff_indices = [max(0, min(n_blk - 1, int(i))) for i in indices]
+    # Keep input_conditioner aligned with current runtime tensor dtype & device
+    cond = getattr(mod.radio_model, "input_conditioner", None)
+    if cond is not None:
+        if getattr(cond, "dtype", None) != pixel_values.dtype:
+            cond.dtype = pixel_values.dtype
+        if hasattr(cond, "norm_mean") and cond.norm_mean.device != pixel_values.device:
+            cond.to(device=pixel_values.device, dtype=pixel_values.dtype)
+        elif hasattr(cond, "norm_mean") and cond.norm_mean.dtype != pixel_values.dtype:
+            cond.to(dtype=pixel_values.dtype)
+    inter = mod.radio_model.forward_intermediates(
+        pixel_values,
+        indices=eff_indices,
+        output_fmt="NLC",
+        norm=False,
+        intermediates_only=True,
+    )
+    final_norm = getattr(inner, "norm", None)
+    feat_norm = getattr(mod.radio_model, "feature_normalizer", None)
+    feats: list[torch.Tensor] = []
+    for idx_val, item in zip(eff_indices, inter):
+        t = item.features if hasattr(item, "features") else item
+        # Apply C-RADIOv4's final norm + feature_normalizer ONLY to the final layer (bitwise-identical to `model(x)[1]`);
+        # intermediate layers (e.g. L24) stay cleanly unnormalized so each tap gets its own independent RMSNorm!
+        if idx_val == (n_blk - 1):
+            if final_norm is not None:
+                t = final_norm(t)
+            if feat_norm is not None:
+                t = feat_norm(t)
+        feats.append(t)
+    return torch.stack(feats, dim=1)
+
+
+def _load_vision_backbone_from_dir(
+    path: str | Path,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    vitdet_window_size: int | None = None,
+) -> nn.Module:
+    """Instantiate empty `C-RADIOv4`, `Siglip2VisionModel`, or `SiglipVisionModel` (weights arrive via SYNC_FROM_HOST)."""
+    p = Path(path)
+    if is_cradiov4_dir(p):
+        mod = load_cradiov4_vision_model(
+            p,
+            dtype=dtype,
+            pretrained=False,
+            vitdet_window_size=vitdet_window_size,
+        ).to(device=device)
+        mod.eval()
+        return mod
+
+    from transformers import Siglip2VisionConfig, Siglip2VisionModel, SiglipVisionConfig, SiglipVisionModel
+
+    raw_cfg = json.loads((p / "config.json").read_text(encoding="utf-8"))
+    v_sub = raw_cfg.get("vision_config") or raw_cfg
+    mtype = str(v_sub.get("model_type") or raw_cfg.get("model_type") or "").lower()
+    if "siglip2" in mtype:
+        vis_cfg = Siglip2VisionConfig.from_pretrained(str(p), local_files_only=True)
+        mod = Siglip2VisionModel(vis_cfg).to(device=device, dtype=dtype)
+    else:
+        vis_cfg = SiglipVisionConfig.from_pretrained(str(p), local_files_only=True)
+        mod = SiglipVisionModel(vis_cfg).to(device=device, dtype=dtype)
+    if hasattr(getattr(mod, "vision_model", None), "head"):
+        del mod.vision_model.head
+    if hasattr(mod, "vision_model"):
+        mod.vision_model.use_head = False
+    mod.eval()
+    return mod
+
+
+def _run_xpu_daemon(args: argparse.Namespace) -> None:
     req_dev = str(args.device)
     if req_dev.startswith("xpu") and hasattr(torch, "xpu") and torch.xpu.is_available():
         device = torch.device(req_dev)
@@ -1012,27 +1873,50 @@ def _run_xpu_daemon(args: argparse.Namespace) -> None:
     if dev_type == "cpu" and vis_dtype == torch.float16:
         vis_dtype = torch.float32
 
-    vis_cfg = Siglip2VisionConfig.from_pretrained(args.vision_path, local_files_only=True)
-    vision = Siglip2VisionModel(vis_cfg).to(device=device, dtype=vis_dtype)
-    if hasattr(getattr(vision, "vision_model", None), "head"):
-        del vision.vision_model.head
-    if hasattr(vision, "vision_model"):
-        vision.vision_model.use_head = False
-    vision.eval()
+    vitdet_ws = getattr(args, "vitdet_window_size", None)
+    raw_idx = str(getattr(args, "radio_layer_indices", "23,31") or "23,31")
+    radio_layer_indices = tuple(int(x.strip()) for x in raw_idx.split(",") if x.strip()) or DEFAULT_RADIO_LAYER_INDICES
+    vision = _load_vision_backbone_from_dir(
+        args.vision_path,
+        device=device,
+        dtype=vis_dtype,
+        vitdet_window_size=vitdet_ws,
+    )
+    vision_is_radio = is_cradiov4_module(vision)
+    vision_detail: nn.Module | None = None
+    if getattr(args, "vision_detail_path", None):
+        vision_detail = _load_vision_backbone_from_dir(args.vision_detail_path, device=device, dtype=vis_dtype)
 
     total_params = sum(p.numel() for p in vision.parameters())
+    detail_total_params = sum(p.numel() for p in vision_detail.parameters()) if vision_detail is not None else 0
     trainable_params = 0
+    detail_trainable_params = 0
     unfrozen_layers = 0
+    detail_unfrozen_layers = 0
     grad_ckpt_tokens = int(args.grad_ckpt_tokens)
     weight_decay = float(args.weight_decay)
-    beta1, beta2, eps = 0.9, 0.95, 1e-8
 
-    grad_accums: dict[str, torch.Tensor] = {}
-    optim_state: dict[str, dict[str, Any]] = {}
-    # Slot holds either `("live", out_tensor)` (fast 1-pass graph!) or `("recompute", pv, pam, ss, rng_st)`.
+    opt_mode = str(getattr(args, "vision_optimizer", "adamw"))
+    opt_engine = XpuVisionOptimizerEngine(
+        mode=opt_mode,
+        device=device,
+        weight_decay=weight_decay,
+    )
+
+    # Slot holds either `("live", tower, out_tensor)` or `("recompute", tower, inputs_tuple, rng_st)`.
     saved_slots: dict[int, tuple[Any, ...]] = {}
     pending_async_error: str | None = None
-    has_accumulated_grads: bool = False
+
+    def _all_named_params() -> list[tuple[str, nn.Parameter]]:
+        out = [(f"global.{n}", p) for n, p in vision.named_parameters()]
+        if vision_detail is not None:
+            out.extend((f"detail.{n}", p) for n, p in vision_detail.named_parameters())
+        return out
+
+    def _tower_named_params(tower: str) -> list[tuple[str, nn.Parameter]]:
+        if tower == "detail":
+            return [(f"detail.{n}", p) for n, p in vision_detail.named_parameters()] if vision_detail is not None else []
+        return [(f"global.{n}", p) for n, p in vision.named_parameters()]
 
     def _get_rng():
         if dev_type == "xpu":
@@ -1071,18 +1955,40 @@ def _run_xpu_daemon(args: argparse.Namespace) -> None:
             else torch.autocast("cpu", dtype=torch.bfloat16, enabled=False)
         )
 
-    def _configure_trainable(enable: bool, last_n: int) -> dict[str, Any]:
-        nonlocal trainable_params, unfrozen_layers, has_accumulated_grads
-        saved_slots.clear()
-        has_accumulated_grads = False
-        vision.requires_grad_(False)
-        vmod = getattr(vision, "vision_model", vision)
+    def _set_mod_trainable(mod: nn.Module, enable: bool, last_n: int) -> tuple[int, int]:
+        mod.requires_grad_(False)
+        if is_cradiov4_module(mod):
+            inner = mod.radio_model.model
+            blocks = getattr(inner, "blocks", None)
+            n_total_layers = len(blocks) if blocks is not None else 0
+            if enable and last_n > 0:
+                if last_n >= n_total_layers:
+                    mod.requires_grad_(True)
+                    unf = n_total_layers
+                else:
+                    if blocks is not None:
+                        for blk in blocks[-int(last_n) :]:
+                            blk.requires_grad_(True)
+                    if getattr(inner, "norm", None) is not None:
+                        inner.norm.requires_grad_(True)
+                    f_norm = getattr(mod.radio_model, "feature_normalizer", None)
+                    if f_norm is not None:
+                        f_norm.requires_grad_(True)
+                    unf = int(last_n)
+                mod.train()
+            else:
+                unf = 0
+                mod.eval()
+            tr = sum(p.numel() for p in mod.parameters() if p.requires_grad)
+            return tr, unf
+
+        vmod = getattr(mod, "vision_model", mod)
         enc_layers = getattr(getattr(vmod, "encoder", None), "layers", None)
         n_total_layers = len(enc_layers) if enc_layers is not None else 0
         if enable and last_n > 0:
             if last_n >= n_total_layers:
-                vision.requires_grad_(True)
-                unfrozen_layers = n_total_layers
+                mod.requires_grad_(True)
+                unf = n_total_layers
             else:
                 if enc_layers is not None:
                     for lyr in enc_layers[-int(last_n) :]:
@@ -1090,27 +1996,41 @@ def _run_xpu_daemon(args: argparse.Namespace) -> None:
                 post_ln = getattr(vmod, "post_layernorm", None)
                 if post_ln is not None:
                     post_ln.requires_grad_(True)
-                unfrozen_layers = int(last_n)
-            vision.train()
+                unf = int(last_n)
+            mod.train()
         else:
-            unfrozen_layers = 0
-            vision.eval()
+            unf = 0
+            mod.eval()
+        tr = sum(p.numel() for p in mod.parameters() if p.requires_grad)
+        return tr, unf
 
-        trainable_names = {n for n, p in vision.named_parameters() if p.requires_grad}
-        for stale in list(grad_accums.keys()):
-            if stale not in trainable_names:
-                del grad_accums[stale]
-        for n, p in vision.named_parameters():
-            if p.requires_grad and n not in grad_accums:
-                grad_accums[n] = torch.zeros_like(p, dtype=torch.float32, device=device)
-            elif n in grad_accums:
-                grad_accums[n].zero_()
-        trainable_params = sum(p.numel() for p in vision.parameters() if p.requires_grad)
+    def _configure_trainable(
+        enable: bool,
+        last_n: int,
+        detail_enable: bool = False,
+        detail_last_n: int = 0,
+    ) -> dict[str, Any]:
+        nonlocal trainable_params, unfrozen_layers, detail_trainable_params, detail_unfrozen_layers
+        saved_slots.clear()
+        trainable_params, unfrozen_layers = _set_mod_trainable(vision, enable, last_n)
+        if vision_detail is not None:
+            detail_trainable_params, detail_unfrozen_layers = _set_mod_trainable(
+                vision_detail, detail_enable, detail_last_n
+            )
+        else:
+            detail_trainable_params, detail_unfrozen_layers = 0, 0
+        opt_engine.sync_trainable_params(_all_named_params())
+        _empty_dev_cache()
         return {
             "ok": True,
             "total_parameters": total_params,
             "trainable_parameters": trainable_params,
             "unfrozen_layers": unfrozen_layers,
+            "detail_total_parameters": detail_total_params,
+            "detail_trainable_parameters": detail_trainable_params,
+            "detail_unfrozen_layers": detail_unfrozen_layers,
+            "optimizer_mode": opt_engine.mode,
+            "grad_accum_bytes": opt_engine.grad_accum_bytes(),
         }
 
     def _empty_dev_cache() -> None:
@@ -1119,27 +2039,40 @@ def _run_xpu_daemon(args: argparse.Namespace) -> None:
         elif device.type == "cuda" and torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    def _exec_forward_train(pv: torch.Tensor, pam: torch.Tensor, ss: torch.Tensor, slot_id: int) -> torch.Tensor:
+    def _exec_forward_train(
+        pv: torch.Tensor,
+        pam: torch.Tensor | None,
+        ss: torch.Tensor | None,
+        slot_id: int,
+    ) -> torch.Tensor:
         live_count = sum(1 for s in saved_slots.values() if s[0] == "live")
-        cur_patches = int(pv.shape[0]) * int(pv.shape[1])
-        # Cap uncheckpointed live 27L autograd graphs on `16 GB` Arc Pro B50 to at most 1 slot (`<= 2048` patches = ~3.8 GiB);
-        # any overlapping prefetch or multiview/video extra frames store compact inputs on CPU (`0 GiB` XPU idle)
-        # and recompute with `gradient_checkpointing_enable` (`~0.35 GiB`), capping XPU peak at ~11.4 GiB / 15.92 GiB!
+        if vision_is_radio:
+            patch_sz = int(getattr(vision.radio_model, "patch_size", 16))
+            cur_patches = int(pv.shape[0]) * (int(pv.shape[-2]) // patch_sz) * (int(pv.shape[-1]) // patch_sz)
+            live_cap = min(grad_ckpt_tokens, 1600)
+        else:
+            cur_patches = int(pv.shape[0]) * int(pv.shape[1])
+            live_cap = min(grad_ckpt_tokens, 1024 if vision_detail is not None else 2048)
         can_keep_live = (
             trainable_params > 0
             and live_count == 0
             and len(saved_slots) == 0
-            and cur_patches <= min(grad_ckpt_tokens, 2048)
+            and cur_patches <= live_cap
         )
         if can_keep_live:
             try:
+                if vision_is_radio and hasattr(vision.radio_model.model, "set_grad_checkpointing"):
+                    vision.radio_model.model.set_grad_checkpointing(True)
                 with torch.enable_grad(), _amp_ctx():
-                    feat = vision(
-                        pixel_values=pv,
-                        pixel_attention_mask=pam,
-                        spatial_shapes=ss,
-                    ).last_hidden_state
-                saved_slots[slot_id] = ("live", feat)
+                    if vision_is_radio:
+                        feat = cradiov4_forward_multilayer(vision, pv, indices=radio_layer_indices)
+                    else:
+                        feat = vision(
+                            pixel_values=pv,
+                            pixel_attention_mask=pam,
+                            spatial_shapes=ss,
+                        ).last_hidden_state
+                saved_slots[slot_id] = ("live", "global", feat)
                 return feat.detach()
             except RuntimeError as exc:
                 if "out of memory" not in str(exc).lower():
@@ -1148,63 +2081,115 @@ def _run_xpu_daemon(args: argparse.Namespace) -> None:
                 _empty_dev_cache()
         rng_st = _get_rng()
         with torch.no_grad(), _amp_ctx():
-            feat = vision(
+            if vision_is_radio:
+                feat = cradiov4_forward_multilayer(vision, pv, indices=radio_layer_indices)
+            else:
+                feat = vision(
+                    pixel_values=pv,
+                    pixel_attention_mask=pam,
+                    spatial_shapes=ss,
+                ).last_hidden_state
+        if vision_is_radio:
+            saved_slots[slot_id] = ("recompute", "global_radio", (pv.detach().cpu(),), rng_st)
+        else:
+            saved_slots[slot_id] = (
+                "recompute",
+                "global",
+                (pv.detach().cpu(), pam.detach().cpu(), ss.detach().cpu()),
+                rng_st,
+            )
+        return feat
+
+    def _exec_forward_detail_train(
+        pv: torch.Tensor,
+        *,
+        interpolate_pos_encoding: bool,
+        slot_id: int,
+    ) -> torch.Tensor:
+        if vision_detail is None:
+            raise RuntimeError("Detail vision tower requested but daemon started without --vision-detail-path")
+        # 40-layer Giant-384 always uses CPU-staged recompute + gradient checkpointing (~0.6 GiB peak vs 8+ GiB live!)
+        rng_st = _get_rng()
+        with torch.no_grad(), _amp_ctx():
+            feat = vision_detail(
                 pixel_values=pv,
-                pixel_attention_mask=pam,
-                spatial_shapes=ss,
+                interpolate_pos_encoding=bool(interpolate_pos_encoding),
             ).last_hidden_state
         saved_slots[slot_id] = (
             "recompute",
-            pv.detach().cpu(),
-            pam.detach().cpu(),
-            ss.detach().cpu(),
+            "detail",
+            (pv.detach().cpu(), bool(interpolate_pos_encoding)),
             rng_st,
         )
         return feat
 
     def _exec_backward_slot(slot_id: int, grad_out: torch.Tensor, mb_weight: float) -> None:
-        nonlocal has_accumulated_grads
         slot = saved_slots.pop(slot_id, None)
-        if slot is None or trainable_params <= 0:
+        if slot is None:
             return
-        vision.zero_grad(set_to_none=True)
-        if slot[0] == "live":
-            live_out = slot[1]
+        kind = slot[0]
+        tower = slot[1]
+        is_detail = (tower == "detail")
+        mod = vision_detail if is_detail else vision
+        t_params = detail_trainable_params if is_detail else trainable_params
+        if mod is None or t_params <= 0:
+            return
+        mod.zero_grad(set_to_none=True)
+        if kind == "live":
+            live_out = slot[2]
             with torch.enable_grad():
                 loss_surrogate = (live_out.float() * grad_out.float()).sum()
             loss_surrogate.backward()
             del live_out, loss_surrogate
         else:
-            _, pv_cpu, pam_cpu, ss_cpu, rng_st = slot
-            pv_d = pv_cpu.to(device=device, dtype=vis_dtype)
-            pam_d = pam_cpu.to(device=device)
-            ss_d = ss_cpu.to(device=device)
-            del pv_cpu, pam_cpu, ss_cpu
-            has_ckpt = bool(getattr(vision, "supports_gradient_checkpointing", False))
-            if has_ckpt:
-                vision.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+            inputs_cpu, rng_st = slot[2], slot[3]
+            is_radio_slot = (tower == "global_radio") or is_cradiov4_module(mod)
+            has_ckpt = bool(getattr(mod, "supports_gradient_checkpointing", False)) and not is_radio_slot
+            if is_radio_slot and hasattr(mod.radio_model.model, "set_grad_checkpointing"):
+                mod.radio_model.model.set_grad_checkpointing(True)
+            elif has_ckpt:
+                mod.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
             try:
                 _set_rng(rng_st)
-                with torch.enable_grad(), _amp_ctx():
-                    out = vision(
-                        pixel_values=pv_d,
-                        pixel_attention_mask=pam_d,
-                        spatial_shapes=ss_d,
-                    ).last_hidden_state
-                    loss_surrogate = (out.float() * grad_out.float()).sum()
-                loss_surrogate.backward()
+                if is_radio_slot:
+                    (pv_cpu,) = inputs_cpu
+                    pv_d = pv_cpu.to(device=device, dtype=vis_dtype)
+                    del pv_cpu
+                    with torch.enable_grad(), _amp_ctx():
+                        out = cradiov4_forward_multilayer(mod, pv_d, indices=radio_layer_indices)
+                        loss_surrogate = (out.float() * grad_out.float()).sum()
+                    loss_surrogate.backward()
+                    del pv_d, out, loss_surrogate
+                elif is_detail:
+                    pv_cpu, interp = inputs_cpu
+                    pv_d = pv_cpu.to(device=device, dtype=vis_dtype)
+                    del pv_cpu
+                    with torch.enable_grad(), _amp_ctx():
+                        out = mod(pixel_values=pv_d, interpolate_pos_encoding=bool(interp)).last_hidden_state
+                        loss_surrogate = (out.float() * grad_out.float()).sum()
+                    loss_surrogate.backward()
+                    del pv_d, out, loss_surrogate
+                else:
+                    pv_cpu, pam_cpu, ss_cpu = inputs_cpu
+                    pv_d = pv_cpu.to(device=device, dtype=vis_dtype)
+                    pam_d = pam_cpu.to(device=device)
+                    ss_d = ss_cpu.to(device=device)
+                    del pv_cpu, pam_cpu, ss_cpu
+                    with torch.enable_grad(), _amp_ctx():
+                        out = mod(
+                            pixel_values=pv_d,
+                            pixel_attention_mask=pam_d,
+                            spatial_shapes=ss_d,
+                        ).last_hidden_state
+                        loss_surrogate = (out.float() * grad_out.float()).sum()
+                    loss_surrogate.backward()
+                    del pv_d, pam_d, ss_d, out, loss_surrogate
             finally:
-                if has_ckpt and hasattr(vision, "gradient_checkpointing_disable"):
-                    vision.gradient_checkpointing_disable()
-            del pv_d, pam_d, ss_d
-            if len(saved_slots) > 0:
+                if has_ckpt and hasattr(mod, "gradient_checkpointing_disable"):
+                    mod.gradient_checkpointing_disable()
+            if is_detail or is_radio_slot or len(saved_slots) > 0:
                 _empty_dev_cache()
-        with torch.no_grad():
-            for n, p in vision.named_parameters():
-                if p.requires_grad and p.grad is not None:
-                    grad_accums[n].add_(p.grad.detach().float(), alpha=mb_weight)
-                    p.grad = None
-        has_accumulated_grads = True
+        opt_engine.accumulate_grads(_tower_named_params("detail" if is_detail else "global"), mb_weight=mb_weight)
 
     sock_path = Path(args.socket)
     sock_path.unlink(missing_ok=True)
@@ -1266,42 +2251,66 @@ def _run_xpu_daemon(args: argparse.Namespace) -> None:
                             "total_memory_bytes": total_mem,
                             "total_parameters": total_params,
                             "trainable_parameters": trainable_params,
+                            "detail_total_parameters": detail_total_params,
+                            "detail_trainable_parameters": detail_trainable_params,
+                            "has_detail_tower": vision_detail is not None,
+                            "vision_optimizer": opt_engine.mode,
                             "torch_version": torch.__version__,
                             "xpu_ze_shm_pinned": arena.xpu_ze_registered,
                         },
                     )
                 elif cmd == "SYNC_FROM_HOST":
+                    tower = str(msg.get("tower", "global"))
+                    mod = vision_detail if tower == "detail" else vision
+                    if mod is None:
+                        raise RuntimeError(f"SYNC_FROM_HOST requested unavailable tower={tower!r}")
+                    prefix = f"{tower}."
                     tensors = _read_tensor_pack(Path(msg["pack"]), device="cpu")
                     with torch.no_grad():
-                        param_map = dict(vision.named_parameters())
-                        buf_map = dict(vision.named_buffers())
+                        param_map = dict(mod.named_parameters())
+                        buf_map = dict(mod.named_buffers())
                         for name, cpu_t in tensors.items():
                             target = param_map.get(name)
                             if target is None:
                                 target = buf_map.get(name)
                             if target is not None:
                                 target.data.copy_(cpu_t.to(device=device, dtype=target.dtype))
-                            if name in optim_state and "master_weight" in optim_state[name]:
-                                optim_state[name]["master_weight"].copy_(cpu_t.to(device=device, dtype=torch.float32))
+                            opt_engine.sync_master_from_param(prefix + name, cpu_t)
                     _sync_dev()
                     _send_msg(conn, {"ok": True})
                 elif cmd == "SYNC_TO_HOST":
+                    tower = str(msg.get("tower", "global"))
+                    mod = vision_detail if tower == "detail" else vision
+                    if mod is None:
+                        raise RuntimeError(f"SYNC_TO_HOST requested unavailable tower={tower!r}")
                     _sync_dev()
-                    state = {k: v.detach().cpu() for k, v in vision.state_dict().items()}
+                    state = {k: v.detach().cpu() for k, v in mod.state_dict().items()}
                     _write_tensor_pack(Path(msg["pack"]), state)
                     _send_msg(conn, {"ok": True})
                 elif cmd == "SET_TRAINABLE":
                     res = _configure_trainable(
                         bool(msg.get("trainable", False)),
                         int(msg.get("unfreeze_last_n_layers", 27)),
+                        bool(msg.get("detail_trainable", False)),
+                        int(msg.get("detail_unfreeze_last_n_layers", 0)),
                     )
                     _send_msg(conn, res)
                 elif cmd == "FORWARD_TRAIN_SHM":
+                    tower = str(msg.get("tower", "global"))
                     inp = arena.read_tensors(msg["in_meta"], device=device)
                     pv = inp["pixel_values"].to(device=device, dtype=vis_dtype)
-                    pam = inp["pixel_attention_mask"].to(device=device)
-                    ss = inp["spatial_shapes"].to(device=device)
-                    feat = _exec_forward_train(pv, pam, ss, int(msg["slot_id"]))
+                    if tower == "detail":
+                        feat = _exec_forward_detail_train(
+                            pv,
+                            interpolate_pos_encoding=bool(msg.get("interpolate_pos_encoding", True)),
+                            slot_id=int(msg["slot_id"]),
+                        )
+                    elif vision_is_radio:
+                        feat = _exec_forward_train(pv, None, None, int(msg["slot_id"]))
+                    else:
+                        pam = inp["pixel_attention_mask"].to(device=device)
+                        ss = inp["spatial_shapes"].to(device=device)
+                        feat = _exec_forward_train(pv, pam, ss, int(msg["slot_id"]))
                     w_out = arena.write_tensors(
                         int(msg["out_offset"]),
                         int(msg["out_cap"]),
@@ -1312,37 +2321,31 @@ def _run_xpu_daemon(args: argparse.Namespace) -> None:
                     else:
                         _send_msg(conn, {"ok": True, "overflow": False, "out_meta": w_out["tensors"]})
                 elif cmd == "FORWARD_EVAL_SHM":
+                    tower = str(msg.get("tower", "global"))
                     inp = arena.read_tensors(msg["in_meta"], device=device)
                     pv = inp["pixel_values"].to(device=device, dtype=vis_dtype)
-                    pam = inp["pixel_attention_mask"].to(device=device)
-                    ss = inp["spatial_shapes"].to(device=device)
-                    was_train = vision.training
-                    vision.eval()
-                    with torch.no_grad(), _amp_ctx():
-                        feat = vision(
-                            pixel_values=pv,
-                            pixel_attention_mask=pam,
-                            spatial_shapes=ss,
-                        ).last_hidden_state
-                    if was_train:
-                        vision.train()
-                    w_out = arena.write_tensors(
-                        int(msg["out_offset"]),
-                        int(msg["out_cap"]),
-                        {"last_hidden_state": feat},
-                    )
-                    if w_out.get("overflow", False):
-                        _send_msg(conn, {"ok": True, "overflow": True})
+                    if tower == "detail":
+                        if vision_detail is None:
+                            raise RuntimeError("Detail vision tower not loaded")
+                        was_train = vision_detail.training
+                        vision_detail.eval()
+                        with torch.no_grad(), _amp_ctx():
+                            feat = vision_detail(
+                                pixel_values=pv,
+                                interpolate_pos_encoding=bool(msg.get("interpolate_pos_encoding", True)),
+                            ).last_hidden_state
+                        if was_train:
+                            vision_detail.train()
+                    elif vision_is_radio:
+                        was_train = vision.training
+                        vision.eval()
+                        with torch.no_grad(), _amp_ctx():
+                            feat = cradiov4_forward_multilayer(vision, pv, indices=radio_layer_indices)
+                        if was_train:
+                            vision.train()
                     else:
-                        _send_msg(conn, {"ok": True, "overflow": False, "out_meta": w_out["tensors"]})
-                elif cmd in ("FORWARD_EVAL", "FORWARD_TRAIN"):
-                    inp = _read_tensor_pack(Path(msg["req_pack"]), device=device)
-                    pv = inp["pixel_values"].to(device=device, dtype=vis_dtype)
-                    pam = inp["pixel_attention_mask"].to(device=device)
-                    ss = inp["spatial_shapes"].to(device=device)
-                    if cmd == "FORWARD_TRAIN":
-                        feat = _exec_forward_train(pv, pam, ss, int(msg["slot_id"]))
-                    else:
+                        pam = inp["pixel_attention_mask"].to(device=device)
+                        ss = inp["spatial_shapes"].to(device=device)
                         was_train = vision.training
                         vision.eval()
                         with torch.no_grad(), _amp_ctx():
@@ -1353,124 +2356,95 @@ def _run_xpu_daemon(args: argparse.Namespace) -> None:
                             ).last_hidden_state
                         if was_train:
                             vision.train()
+                    w_out = arena.write_tensors(
+                        int(msg["out_offset"]),
+                        int(msg["out_cap"]),
+                        {"last_hidden_state": feat},
+                    )
+                    if w_out.get("overflow", False):
+                        _send_msg(conn, {"ok": True, "overflow": True})
+                    else:
+                        _send_msg(conn, {"ok": True, "overflow": False, "out_meta": w_out["tensors"]})
+                elif cmd in ("FORWARD_EVAL", "FORWARD_TRAIN"):
+                    tower = str(msg.get("tower", "global"))
+                    inp = _read_tensor_pack(Path(msg["req_pack"]), device=device)
+                    pv = inp["pixel_values"].to(device=device, dtype=vis_dtype)
+                    if tower == "detail":
+                        if vision_detail is None:
+                            raise RuntimeError("Detail vision tower not loaded")
+                        interp = bool(msg.get("interpolate_pos_encoding", True))
+                        if cmd == "FORWARD_TRAIN":
+                            feat = _exec_forward_detail_train(
+                                pv, interpolate_pos_encoding=interp, slot_id=int(msg["slot_id"])
+                            )
+                        else:
+                            was_train = vision_detail.training
+                            vision_detail.eval()
+                            with torch.no_grad(), _amp_ctx():
+                                feat = vision_detail(
+                                    pixel_values=pv, interpolate_pos_encoding=interp
+                                ).last_hidden_state
+                            if was_train:
+                                vision_detail.train()
+                    elif vision_is_radio:
+                        if cmd == "FORWARD_TRAIN":
+                            feat = _exec_forward_train(pv, None, None, int(msg["slot_id"]))
+                        else:
+                            was_train = vision.training
+                            vision.eval()
+                            with torch.no_grad(), _amp_ctx():
+                                feat = cradiov4_forward_multilayer(vision, pv, indices=radio_layer_indices)
+                            if was_train:
+                                vision.train()
+                    else:
+                        pam = inp["pixel_attention_mask"].to(device=device)
+                        ss = inp["spatial_shapes"].to(device=device)
+                        if cmd == "FORWARD_TRAIN":
+                            feat = _exec_forward_train(pv, pam, ss, int(msg["slot_id"]))
+                        else:
+                            was_train = vision.training
+                            vision.eval()
+                            with torch.no_grad(), _amp_ctx():
+                                feat = vision(
+                                    pixel_values=pv,
+                                    pixel_attention_mask=pam,
+                                    spatial_shapes=ss,
+                                ).last_hidden_state
+                            if was_train:
+                                vision.train()
                     _write_tensor_pack(Path(msg["resp_pack"]), {"last_hidden_state": feat})
                     _send_msg(conn, {"ok": True})
                 elif cmd == "ZERO_GRAD":
                     saved_slots.clear()
-                    has_accumulated_grads = False
-                    for g in grad_accums.values():
-                        g.zero_()
+                    opt_engine.zero_grad()
                     vision.zero_grad(set_to_none=True)
+                    if vision_detail is not None:
+                        vision_detail.zero_grad(set_to_none=True)
                     _send_msg(conn, {"ok": True})
                 elif cmd == "STEP":
                     saved_slots.clear()
-                    if not has_accumulated_grads or trainable_params <= 0:
-                        _send_msg(
-                            conn,
-                            {
-                                "ok": True,
-                                "applied": False,
-                                "finite": True,
-                                "vision_grad_norm": 0.0,
-                                "xpu_peak_bytes": _peak_bytes(),
-                            },
-                        )
-                        continue
-                    lr = float(msg["lr"])
-                    max_norm = float(msg.get("max_grad_norm", 1.0))
-                    post_scale = float(msg.get("post_scale", 1.0))
-                    with torch.no_grad():
-                        total_sq = torch.zeros((), device=device, dtype=torch.float32)
-                        for g in grad_accums.values():
-                            if post_scale != 1.0:
-                                g.mul_(post_scale)
-                            total_sq = total_sq + g.square().sum()
-                        gnorm = float(total_sq.sqrt().item())
-                        if not (gnorm >= 0.0 and gnorm < float("inf")):
-                            for g in grad_accums.values():
-                                g.zero_()
-                            has_accumulated_grads = False
-                            _send_msg(
-                                conn,
-                                {
-                                    "ok": True,
-                                    "applied": False,
-                                    "finite": False,
-                                    "vision_grad_norm": float("nan"),
-                                    "xpu_peak_bytes": _peak_bytes(),
-                                },
-                            )
-                            continue
-                        clip_coef = min(1.0, max_norm / (gnorm + 1e-12)) if max_norm > 0.0 else 1.0
-                        for n, p in vision.named_parameters():
-                            if not p.requires_grad or n not in grad_accums:
-                                continue
-                            g = grad_accums[n]
-                            if clip_coef < 1.0:
-                                g.mul_(clip_coef)
-                            st = optim_state.get(n)
-                            if st is None:
-                                st = {
-                                    "step": 0,
-                                    "exp_avg": torch.zeros_like(p, dtype=torch.float32, device=device),
-                                    "exp_avg_sq": torch.zeros_like(p, dtype=torch.float32, device=device),
-                                    "master_weight": p.detach().to(device=device, dtype=torch.float32).clone(),
-                                }
-                                optim_state[n] = st
-                            st["step"] += 1
-                            t = int(st["step"])
-                            exp_avg = st["exp_avg"]
-                            exp_avg_sq = st["exp_avg_sq"]
-                            master = st["master_weight"]
-                            exp_avg.mul_(beta1).add_(g, alpha=1.0 - beta1)
-                            exp_avg_sq.mul_(beta2).addcmul_(g, g, value=1.0 - beta2)
-                            bc1 = 1.0 - beta1**t
-                            bc2 = 1.0 - beta2**t
-                            step_sz = lr / bc1
-                            denom_t = (exp_avg_sq.sqrt() / math.sqrt(bc2)).add_(eps)
-                            no_decay = p.ndim < 2 or n.endswith(".bias") or "norm" in n.lower()
-                            wd = 0.0 if no_decay else weight_decay
-                            if wd != 0.0:
-                                master.mul_(1.0 - lr * wd)
-                            master.addcdiv_(exp_avg, denom_t, value=-step_sz)
-                            p.data.copy_(master.to(dtype=p.dtype))
-                            g.zero_()
-                        has_accumulated_grads = False
-                        _sync_dev()
-                        _send_msg(
-                            conn,
-                            {
-                                "ok": True,
-                                "applied": True,
-                                "finite": True,
-                                "vision_grad_norm": gnorm,
-                                "clip_coef": clip_coef,
-                                "xpu_peak_bytes": _peak_bytes(),
-                            },
-                        )
+                    step_res = opt_engine.step(
+                        _all_named_params(),
+                        lr=float(msg["lr"]),
+                        max_grad_norm=float(msg.get("max_grad_norm", 1.0)),
+                        post_scale=float(msg.get("post_scale", 1.0)),
+                        detail_lr_mult=float(msg.get("detail_lr_mult", 1.0)),
+                    )
+                    _sync_dev()
+                    _send_msg(
+                        conn,
+                        {
+                            "ok": True,
+                            **step_res,
+                            "xpu_peak_bytes": _peak_bytes(),
+                        },
+                    )
                 elif cmd == "SAVE_OPTIM":
-                    cpu_opt = {
-                        n: {
-                            "step": int(st["step"]),
-                            "exp_avg": st["exp_avg"].detach().cpu(),
-                            "exp_avg_sq": st["exp_avg_sq"].detach().cpu(),
-                            "master_weight": st["master_weight"].detach().cpu(),
-                        }
-                        for n, st in optim_state.items()
-                    }
-                    torch.save(cpu_opt, Path(msg["path"]))
+                    torch.save(opt_engine.state_dict_cpu(), Path(msg["path"]))
                     _send_msg(conn, {"ok": True})
                 elif cmd == "LOAD_OPTIM":
                     raw_opt = torch.load(Path(msg["path"]), map_location="cpu", weights_only=True)
-                    optim_state.clear()
-                    if isinstance(raw_opt, dict):
-                        for n, st in raw_opt.items():
-                            optim_state[n] = {
-                                "step": int(st["step"]),
-                                "exp_avg": st["exp_avg"].to(device=device, dtype=torch.float32),
-                                "exp_avg_sq": st["exp_avg_sq"].to(device=device, dtype=torch.float32),
-                                "master_weight": st["master_weight"].to(device=device, dtype=torch.float32),
-                            }
+                    opt_engine.load_state_dict_cpu(raw_opt)
                     _send_msg(conn, {"ok": True})
                 else:
                     _send_msg(conn, {"ok": False, "error": f"Unknown daemon command: {cmd!r}"})
@@ -1490,6 +2464,10 @@ def main() -> None:
     parser.add_argument("--ipc-dir", required=True)
     parser.add_argument("--arena-path", required=True)
     parser.add_argument("--vision-path", required=True)
+    parser.add_argument("--vision-detail-path", default=None)
+    parser.add_argument("--vision-optimizer", default="adamw", choices=VISION_OPTIMIZER_MODES)
+    parser.add_argument("--vitdet-window-size", type=int, default=None)
+    parser.add_argument("--radio-layer-indices", default="23,31")
     parser.add_argument("--device", default="xpu:0")
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--weight-decay", type=float, default=0.01)

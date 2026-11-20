@@ -643,6 +643,7 @@ def load_spark_native_safetensors(
     path: str | Path,
     *,
     allow_missing_loop_engram: bool = False,
+    allow_missing_vision_swap: bool = False,
 ) -> None:
     """Load standard BF16 `model.safetensors` or channelwise `F8_E4M3` (+ optional `q4g128` sub-LSB residual) `model.safetensors`."""
     sf_path = Path(path)
@@ -658,7 +659,7 @@ def load_spark_native_safetensors(
                 (k not in param_map and k not in buf_map and k.endswith('_scale'))
                 for k in sf_keys
             )
-            if not has_fp8:
+            if not has_fp8 and not allow_missing_vision_swap:
                 has_tie = hasattr(getattr(model, 'spark', None), 'tie_weights')
                 strict = (not has_tie) and (not allow_missing_loop_engram)
                 missing_sf, unexpected_sf = load_model(model, str(sf_path), strict=strict, device='cpu')
@@ -679,6 +680,8 @@ def load_spark_native_safetensors(
 
             loaded: set[str] = set()
             for key in sorted(sf_keys):
+                if allow_missing_vision_swap and key.startswith(('vision.', 'vision_projector.')):
+                    continue
                 if key not in param_map and key not in buf_map and key.endswith(aux_suffixes):
                     continue
                 target = param_map.get(key)
@@ -707,6 +710,8 @@ def load_spark_native_safetensors(
         sf_keys = set(tensors.keys())
         loaded = set()
         for key in sorted(sf_keys):
+            if allow_missing_vision_swap and key.startswith(('vision.', 'vision_projector.')):
+                continue
             if key not in param_map and key not in buf_map and key.endswith(aux_suffixes):
                 continue
             target = param_map.get(key)
@@ -731,12 +736,67 @@ def load_spark_native_safetensors(
                 target.data.copy_(raw_t.to(dtype=target.dtype, device=target.device))
             loaded.add(key)
 
+    if allow_missing_vision_swap:
+        missing_non_vis = {
+            k for k in param_map.keys()
+            if k not in loaded
+            and k != 'spark.lm_head.weight'
+            and not k.startswith(('vision.', 'vision_projector.'))
+            and not (allow_missing_loop_engram and k.startswith(('loop_controllers.', 'engram_anchors.')))
+        }
+        if missing_non_vis:
+            raise RuntimeError(
+                f'Missing non-vision parameters during vision-swap warm-start: {sorted(missing_non_vis)[:8]}'
+            )
+
     if hasattr(getattr(model, 'spark', None), 'tie_weights'):
         model.spark.tie_weights()
     if hasattr(model, '_ensure_tier1b_cpu_pinned'):
         model._ensure_tier1b_cpu_pinned()
     if hasattr(model, 'sync_host_vision_to_intel'):
         model.sync_host_vision_to_intel()
+
+
+class RadioMultiLayerSwiGLUProjector(nn.Module):
+    """Unified multi-layer C-RADIOv4 projector: independent RMSNorm per tapped layer (`L24`, `L32`) ->
+    channel concat (`2560`-dim) -> `2x2` pixel shuffle (`10240`-dim) -> SwiGLU MLP -> LLM hidden dim,
+    plus an early-layer DeepStack `L24` residual projection for Spark's early `visual_cross_attn`."""
+
+    def __init__(
+        self,
+        vis_dim: int,
+        hidden_size: int,
+        *,
+        num_taps: int = 2,
+        intermediate_size: int | None = None,
+        early_mid_gate_init: float = 0.35,
+    ) -> None:
+        super().__init__()
+        self.vis_dim = int(vis_dim)
+        self.num_taps = max(1, int(num_taps))
+        self.hidden_size = int(hidden_size)
+        self.layer_norms = nn.ModuleList([nn.RMSNorm(self.vis_dim, eps=1e-6) for _ in range(self.num_taps)])
+        in_dim = self.vis_dim * self.num_taps * 4
+        inter = int(intermediate_size) if intermediate_size is not None else int(hidden_size)
+        self.w_gate = nn.Linear(in_dim, inter)
+        self.w_up = nn.Linear(in_dim, inter)
+        self.w_down = nn.Linear(inter, self.hidden_size)
+        self.early_mid_proj = nn.Linear(self.vis_dim * 4, self.hidden_size)
+        self.early_mid_gate = nn.Parameter(torch.tensor(float(early_mid_gate_init)))
+
+    def forward(self, stacked_feats: torch.Tensor, hh: int, ww: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project `(B, K, N, D)` tapped spatial features into `(main_tokens, early_deepstack_tokens)`."""
+        dtype = self.w_gate.weight.dtype
+        if stacked_feats.ndim == 3:
+            # Backward safety if a single-layer `(B, N, D)` tensor is ever supplied
+            stacked_feats = stacked_feats.unsqueeze(1).expand(-1, self.num_taps, -1, -1)
+        normed = [self.layer_norms[i](stacked_feats[:, i].to(dtype)) for i in range(self.num_taps)]
+        fused_cat = torch.cat(normed, dim=-1)  # (B, N, K * D)
+        shuffled, _ = spatial_downshuffle(fused_cat, hh, ww)  # (B, N/4, K * D * 4)
+        main_tokens = self.w_down(F.silu(self.w_gate(shuffled)) * self.w_up(shuffled))
+        mid_shuffled, _ = spatial_downshuffle(normed[0], hh, ww)
+        early_tokens = main_tokens + self.early_mid_gate.to(dtype) * self.early_mid_proj(mid_shuffled)
+        return main_tokens, early_tokens
     expected_all = set(param_map.keys()) | {k for k in buf_map if k.endswith('tier1b_cold_weight')}
     missing = expected_all - loaded - {'spark.lm_head.weight'}
     if allow_missing_loop_engram:
@@ -756,7 +816,18 @@ class SparkNative(nn.Module):
         spark_dtype=getattr(torch,policy.get('spark_dtype',default_backbone_dtype))
         vision_dtype=getattr(torch,policy.get('vision_dtype',default_backbone_dtype))
 
+        self._radio_layer_indices: tuple[int, ...] = tuple(
+            int(i) for i in policy.get('radio_layer_indices', (23, 31))
+        )
+        self._radio_vitdet_window_size = (
+            int(policy['radio_vitdet_window_size'])
+            if policy.get('radio_vitdet_window_size') is not None
+            else None
+        )
+        self._last_early_visual_context: torch.Tensor | None = None
+
         if components is not None:
+            from .intel_vision_coproc import is_cradiov4_module
             self.spark=components['spark'].to(dtype=spark_dtype)
             install_spark_sdpa(self.spark)
             self.tokenizer=components['tokenizer']
@@ -765,11 +836,18 @@ class SparkNative(nn.Module):
             self.chat = ChatFormat(self.tokenizer)
             self.config=self.spark.config; self.config.use_cache=False; self.generation_config=getattr(self.spark,'generation_config',None)
             self.vision=components['vision'].to(dtype=vision_dtype)
-            if hasattr(getattr(self.vision,'vision_model',None),'head'): del self.vision.vision_model.head
-            if hasattr(self.vision,'vision_model'): self.vision.vision_model.use_head=False
-            self.image_processor=components['image_processor']
+            self.vision_backbone_type = str(
+                components.get('vision_backbone_type')
+                or ('c_radio_v4' if is_cradiov4_module(self.vision) else 'siglip2_naflex')
+            )
+            if self.vision_backbone_type != 'c_radio_v4':
+                if hasattr(getattr(self.vision,'vision_model',None),'head'): del self.vision.vision_model.head
+                if hasattr(self.vision,'vision_model'): self.vision.vision_model.use_head=False
+            self.image_processor=components.get('image_processor')
         else:
-            from transformers import (AutoTokenizer,Siglip2VisionModel,Siglip2VisionConfig,AutoImageProcessor)
+            from transformers import AutoImageProcessor, AutoTokenizer, Siglip2VisionConfig, Siglip2VisionModel
+            from .intel_vision_coproc import is_cradiov4_dir, load_cradiov4_vision_model
+
             self.spark=load_spark_backbone(paths['spark'],spark_dtype=spark_dtype,pretrained=pretrained)
             install_spark_sdpa(self.spark)
             try:
@@ -780,13 +858,34 @@ class SparkNative(nn.Module):
             self.chat = ChatFormat(self.tokenizer)
             self.config=self.spark.config; self.config.use_cache=False; self.generation_config=self.spark.generation_config
 
-            self.vision=(Siglip2VisionModel.from_pretrained(paths['vision'],local_files_only=True,dtype=vision_dtype) if pretrained else Siglip2VisionModel(Siglip2VisionConfig.from_pretrained(paths['vision'],local_files_only=True)).to(dtype=vision_dtype))
-            if hasattr(self.vision.vision_model,'head'): del self.vision.vision_model.head
-            self.vision.vision_model.use_head=False
-            self.image_processor=AutoImageProcessor.from_pretrained(paths['vision'],local_files_only=True)
+            if is_cradiov4_dir(paths['vision']):
+                self.vision_backbone_type = 'c_radio_v4'
+                self.vision = load_cradiov4_vision_model(
+                    paths['vision'],
+                    dtype=vision_dtype,
+                    pretrained=pretrained,
+                    vitdet_window_size=self._radio_vitdet_window_size,
+                )
+                self.image_processor = None
+            else:
+                self.vision_backbone_type = 'siglip2_naflex'
+                self.vision=(Siglip2VisionModel.from_pretrained(paths['vision'],local_files_only=True,dtype=vision_dtype) if pretrained else Siglip2VisionModel(Siglip2VisionConfig.from_pretrained(paths['vision'],local_files_only=True)).to(dtype=vision_dtype))
+                if hasattr(self.vision.vision_model,'head'): del self.vision.vision_model.head
+                self.vision.vision_model.use_head=False
+                self.image_processor=AutoImageProcessor.from_pretrained(paths['vision'],local_files_only=True)
 
         h=self.config.hidden_size; self.hidden=h
-        self.vision_projector=nn.Sequential(nn.LayerNorm(self.vision.config.hidden_size*4),nn.Linear(self.vision.config.hidden_size*4,h),nn.GELU(),nn.Linear(h,h))
+        if self.vision_backbone_type == 'c_radio_v4':
+            vis_dim = int(self.vision.radio_model.embed_dim)
+            self.vision_projector = RadioMultiLayerSwiGLUProjector(
+                vis_dim,
+                h,
+                num_taps=len(self._radio_layer_indices),
+                intermediate_size=int(policy.get('radio_projector_intermediate_size', h)),
+                early_mid_gate_init=float(policy.get('radio_early_mid_gate_init', 0.35)),
+            )
+        else:
+            self.vision_projector=nn.Sequential(nn.LayerNorm(self.vision.config.hidden_size*4),nn.Linear(self.vision.config.hidden_size*4,h),nn.GELU(),nn.Linear(h,h))
         # Zero-bias transparency projector: exact 0.0 on opaque RGB images, distinct on RGBA cutouts/translucency.
         self.alpha_projector=nn.Sequential(nn.Linear(16,h,bias=False),nn.GELU(),nn.Linear(h,h,bias=False))
         nn.init.normal_(self.alpha_projector[2].weight, mean=0.0, std=0.02)
@@ -862,24 +961,40 @@ class SparkNative(nn.Module):
                     allow_missing_loop_engram=bool(
                         self.enable_loop_engram and policy.get('allow_warmstart_missing_loop_engram', True)
                     ),
+                    allow_missing_vision_swap=bool(
+                        policy.get('allow_warmstart_vision_swap', self.vision_backbone_type == 'c_radio_v4')
+                    ),
                 )
                 self._warm_started_from = str(init_sf)
-            # Move Spark + SigLIP2 preserving their configured dtypes; keep connectors/adapters in float32.
+            # Move Spark + Vision preserving their configured dtypes; keep connectors/adapters in float32.
             self.spark.to(device=device,dtype=spark_dtype)
             if hasattr(self.spark,'tie_weights'): self.spark.tie_weights()
             self._intel_vision_bridge = None
             self._openvino_vision_runner = None
             self._intel_vision_trainable = False
             self._intel_vision_base_lr = float(
-                policy.get('vision_lr', policy.get('vision_learning_rate', float(policy.get('learning_rate', 6e-5)) * 0.5))
+                policy.get('vision_lr', policy.get('vision_learning_rate', float(policy.get('learning_rate', 6e-5)) * 0.1))
             )
             want_b50_xpu = bool(policy.get('intel_arc_vision_offload', False)) and paths is not None and 'vision' in paths
-            want_b50_ov = (not want_b50_xpu) and bool(policy.get('intel_arc_openvino_eval', False))
+            want_b50_ov = (
+                (not want_b50_xpu)
+                and bool(policy.get('intel_arc_openvino_eval', False))
+                and self.vision_backbone_type != 'c_radio_v4'
+            )
             if want_b50_xpu:
                 from .intel_vision_coproc import IntelArcXpuVisionBridge
                 self.vision.to(device='cpu', dtype=vision_dtype)
+                vis_opt_mode = str(
+                    policy.get(
+                        'intel_arc_vision_optimizer',
+                        'muon8bit' if self.vision_backbone_type == 'c_radio_v4' else 'adamw',
+                    )
+                )
                 self._intel_vision_bridge = IntelArcXpuVisionBridge(
                     paths['vision'],
+                    vision_optimizer=vis_opt_mode,
+                    vitdet_window_size=self._radio_vitdet_window_size,
+                    radio_layer_indices=self._radio_layer_indices,
                     xpu_python=policy.get('intel_arc_xpu_python'),
                     device_spec=str(policy.get('intel_arc_device', 'xpu:0')),
                     vision_dtype=str(policy.get('vision_dtype', default_backbone_dtype)),
@@ -898,6 +1013,11 @@ class SparkNative(nn.Module):
                 )
             else:
                 self.vision.to(device=device,dtype=vision_dtype)
+                if self.vision_backbone_type == 'c_radio_v4' and hasattr(self.vision, 'radio_model'):
+                    cond = getattr(self.vision.radio_model, 'input_conditioner', None)
+                    if cond is not None:
+                        cond.dtype = vision_dtype
+                        cond.to(device=device, dtype=vision_dtype)
             for conn in self._connector_modules():
                 conn.to(device=device,dtype=torch.float32)
             if self.enable_loop_engram:
@@ -1035,12 +1155,12 @@ class SparkNative(nn.Module):
 
     def sync_intel_vision_to_host(self, *, force: bool = False) -> bool:
         bridge = getattr(self, '_intel_vision_bridge', None)
-        if bridge is not None and getattr(self, 'vision', None) is not None:
-            synced = bridge.sync_to_host(self.vision, force=force)
-            if synced and getattr(self, '_openvino_vision_runner', None) is not None:
-                self._openvino_vision_runner.invalidate()
-            return synced
-        return False
+        if bridge is None or getattr(self, 'vision', None) is None:
+            return False
+        synced = bridge.sync_to_host(self.vision, force=force)
+        if synced and getattr(self, '_openvino_vision_runner', None) is not None:
+            self._openvino_vision_runner.invalidate()
+        return synced
 
     def sync_host_vision_to_intel(self) -> None:
         bridge = getattr(self, '_intel_vision_bridge', None)
@@ -1067,7 +1187,11 @@ class SparkNative(nn.Module):
         if bridge is None or not getattr(self, '_intel_vision_trainable', False):
             return {'applied': False, 'finite': True, 'vision_grad_norm': 0.0}
         base_lr = float(lr_override if lr_override is not None else getattr(self, '_intel_vision_base_lr', 3e-5))
-        return bridge.step(lr=base_lr * float(lr_scale), max_grad_norm=max_grad_norm, post_scale=post_scale)
+        return bridge.step(
+            lr=base_lr * float(lr_scale),
+            max_grad_norm=max_grad_norm,
+            post_scale=post_scale,
+        )
 
     def has_intel_vision_optim_state(self) -> bool:
         return self.has_intel_vision_bridge() and bool(getattr(self, '_intel_vision_trainable', False))
@@ -1341,6 +1465,9 @@ class SparkNative(nn.Module):
         for module in candidates:
             if module is not None and getattr(module,'supports_gradient_checkpointing',False):
                 module.gradient_checkpointing_enable(gradient_checkpointing_kwargs=opts)
+        vis = getattr(self, 'vision', None)
+        if vis is not None and hasattr(vis, 'radio_model') and hasattr(getattr(vis.radio_model, 'model', None), 'set_grad_checkpointing'):
+            vis.radio_model.model.set_grad_checkpointing(True)
         self._wrap_spark_gradient_checkpointing(opts)
         sound_out=getattr(self,'sound_out',None)
         if sound_out is not None and hasattr(getattr(sound_out,'dit',None),'enable_gradient_checkpointing'):
@@ -1372,11 +1499,28 @@ class SparkNative(nn.Module):
         if vision is None or last_n_layers <= 0:
             return
         vision.requires_grad_(False)
+        if hasattr(vision, 'radio_model') and hasattr(getattr(vision.radio_model, 'model', None), 'blocks'):
+            inner = vision.radio_model.model
+            blocks = inner.blocks
+            if int(last_n_layers) >= len(blocks):
+                vision.requires_grad_(True)
+            else:
+                for blk in blocks[-int(last_n_layers):]:
+                    blk.requires_grad_(True)
+                if getattr(inner, 'norm', None) is not None:
+                    inner.norm.requires_grad_(True)
+                f_norm = getattr(vision.radio_model, 'feature_normalizer', None)
+                if f_norm is not None:
+                    f_norm.requires_grad_(True)
+            return
         vmod = getattr(vision, 'vision_model', vision)
         enc_layers = getattr(getattr(vmod, 'encoder', None), 'layers', None)
         if enc_layers is not None and len(enc_layers) > 0:
-            for layer in enc_layers[-int(last_n_layers):]:
-                layer.requires_grad_(True)
+            if int(last_n_layers) >= len(enc_layers):
+                vision.requires_grad_(True)
+            else:
+                for layer in enc_layers[-int(last_n_layers):]:
+                    layer.requires_grad_(True)
         post_ln = getattr(vmod, 'post_layernorm', None)
         if post_ln is not None:
             post_ln.requires_grad_(True)
@@ -1403,13 +1547,35 @@ class SparkNative(nn.Module):
         stage_mode: str | None = None,
         unfreeze_vision_last_n_layers: int = 0,
     ):
-        """Configure parameter trainability across staged connector, defrost_loop_engram, vision, and full-Spark runs."""
+        """Configure parameter trainability across staged connector, defrost_loop_engram, vision, and full-Spark runs.
+
+        For `C-RADIOv4`, default full-Spark unfreezing is capped to the top 6 blocks (`blocks[-6:]`) so lower
+        DINOv3-7B/SAM3 geometric representations stay preserved (per RADIO1D analysis).
+        """
         mode = stage_mode or ('alignment_only' if alignment_only else 'full_spark')
         self.requires_grad_(True)
         self.freeze_infrastructure()
         self._freeze_unused_loop_pass_params()
 
         bridge = getattr(self, '_intel_vision_bridge', None)
+        is_radio = getattr(self, 'vision_backbone_type', 'siglip2_naflex') == 'c_radio_v4'
+        default_full_n = int(self.policy.get('radio_default_unfreeze_layers', 6)) if is_radio else 27
+
+        def _apply_vision_policy(want_n: int) -> None:
+            want_n = max(0, int(want_n))
+            if bridge is not None:
+                if getattr(self, 'vision', None) is not None:
+                    self.vision.requires_grad_(False)
+                wg = want_n > 0
+                bridge.configure_trainability(trainable=wg, unfreeze_last_n_layers=want_n if wg else 0)
+                self._intel_vision_trainable = wg
+            else:
+                if getattr(self, 'vision', None) is not None:
+                    if want_n > 0:
+                        self._unfreeze_late_vision_layers(want_n)
+                    else:
+                        self.vision.requires_grad_(False)
+
         if mode == 'defrost_loop_engram':
             for name in ('spark', 'vision', 'motion', 'speech_in', 'sound_in'):
                 mod = getattr(self, name, None)
@@ -1421,12 +1587,7 @@ class SparkNative(nn.Module):
             sound_out = getattr(self, 'sound_out', None)
             if sound_out is not None and getattr(sound_out, 'dit', None) is not None:
                 sound_out.dit.requires_grad_(False)
-            if bridge is not None:
-                want_v = int(unfreeze_vision_last_n_layers) > 0
-                bridge.configure_trainability(trainable=want_v, unfreeze_last_n_layers=int(unfreeze_vision_last_n_layers))
-                self._intel_vision_trainable = want_v
-            elif unfreeze_vision_last_n_layers > 0:
-                self._unfreeze_late_vision_layers(unfreeze_vision_last_n_layers)
+            _apply_vision_policy(int(unfreeze_vision_last_n_layers))
             return
 
         if mode in ('alignment_only', 'frozen_spark_connector', 'frozen_spark_cross_attn'):
@@ -1442,12 +1603,7 @@ class SparkNative(nn.Module):
                 sound_out.dit.requires_grad_(False)
             if mode == 'frozen_spark_connector' and getattr(self, 'visual_cross_attn', None) is not None:
                 self.visual_cross_attn.requires_grad_(False)
-            if bridge is not None:
-                want_v = int(unfreeze_vision_last_n_layers) > 0
-                bridge.configure_trainability(trainable=want_v, unfreeze_last_n_layers=int(unfreeze_vision_last_n_layers))
-                self._intel_vision_trainable = want_v
-            elif unfreeze_vision_last_n_layers > 0:
-                self._unfreeze_late_vision_layers(unfreeze_vision_last_n_layers)
+            _apply_vision_policy(int(unfreeze_vision_last_n_layers))
             return
 
         if mode == 'vision_late_unfreeze':
@@ -1455,31 +1611,21 @@ class SparkNative(nn.Module):
                 mod = getattr(self, name, None)
                 if mod is not None:
                     mod.requires_grad_(False)
-            if bridge is not None:
-                if getattr(self, 'vision', None) is not None:
-                    self.vision.requires_grad_(False)
-                n_unfreeze = max(1, int(unfreeze_vision_last_n_layers or 27))
-                bridge.configure_trainability(trainable=True, unfreeze_last_n_layers=n_unfreeze)
-                self._intel_vision_trainable = True
-            elif getattr(self, 'vision', None) is not None:
-                self._unfreeze_late_vision_layers(max(1, int(unfreeze_vision_last_n_layers or 2)))
+            g_n = max(1, int(unfreeze_vision_last_n_layers or (default_full_n if bridge is not None else 2)))
+            _apply_vision_policy(g_n)
             return
 
         if mode == 'full_spark':
             if bridge is not None:
-                if getattr(self, 'vision', None) is not None:
-                    self.vision.requires_grad_(False)
                 full_defrost = bool(getattr(self, 'policy', {}).get('intel_arc_vision_full_defrost', True))
-                n_unfreeze = int(unfreeze_vision_last_n_layers) if unfreeze_vision_last_n_layers > 0 else (27 if full_defrost else 0)
+                n_unfreeze = int(unfreeze_vision_last_n_layers) if unfreeze_vision_last_n_layers > 0 else (default_full_n if full_defrost else 0)
                 want_v = n_unfreeze > 0 or bool(getattr(self, 'policy', {}).get('unfreeze_vision_in_full_spark', False))
-                bridge.configure_trainability(trainable=want_v, unfreeze_last_n_layers=max(1, n_unfreeze) if want_v else 0)
-                self._intel_vision_trainable = want_v
+                _apply_vision_policy(max(1, n_unfreeze) if want_v else 0)
             elif getattr(self, 'modalities', 'omni') == 'vision_text' and getattr(self, 'vision', None) is not None:
-                # In single-GPU vision_text 24GB profile, keep SigLIP2 frozen unless explicitly unfrozen via unfreeze_vision_last_n_layers.
-                if unfreeze_vision_last_n_layers > 0:
-                    self._unfreeze_late_vision_layers(unfreeze_vision_last_n_layers)
-                elif not getattr(self, 'policy', {}).get('unfreeze_vision_in_full_spark', False):
-                    self.vision.requires_grad_(False)
+                g_n = int(unfreeze_vision_last_n_layers) if unfreeze_vision_last_n_layers > 0 else (
+                    default_full_n if getattr(self, 'policy', {}).get('unfreeze_vision_in_full_spark', False) else 0
+                )
+                _apply_vision_policy(g_n)
             if any(not p.requires_grad for p in self.spark.parameters()):
                 raise AssertionError('Full Spark is not trainable')
             return
@@ -1550,60 +1696,223 @@ class SparkNative(nn.Module):
                     views.append((crop_im,crop_alpha,(a/w,b/h,c/w,d/h),self.policy['tile_patches']))
         return views
 
+    def _radio_target_hw(
+        self,
+        orig_w: int,
+        orig_h: int,
+        *,
+        is_temporal: bool,
+        num_images: int,
+        high_res_hint: bool = False,
+    ) -> tuple[int, int]:
+        """Compute native-aspect `32px`-aligned `(H, W)` for `C-RADIOv4-H` (exact even `H//16, W//16` for `2x2` merge).
+
+        - Default budget: `256px–768px` (single still `<= 1536` patches = `<= 384` tokens; zero tiling seams!).
+        - Small/OCR crops (`max(w, h) < 384`): upscaled cleanly to `max(H, W) >= 384` (up to `512` if thin strip).
+        - High-res single-image tier (`len(images) == 1`, `max(w, h) >= radio_highres_trigger_px` or `high_res_hint`):
+          scales natively up to `1024px–1152px` (`<= 4096` patches = `<= 1024` tokens).
+        - Multi-view shaded 3D renders (`2–4` views): `384px–512px` per view.
+        - Video frames (`is_temporal`): `256px–384px` per frame.
+        """
+        align = 32  # 2 * patch_size(16) -> guarantees lossless 2x2 spatial downshuffle!
+        w = max(1, int(orig_w))
+        h = max(1, int(orig_h))
+        max_orig = max(w, h)
+
+        def _snap(val: float, lo: int, hi: int) -> int:
+            snapped = int(round(val / align)) * align
+            return max(lo, min(hi, snapped))
+
+        min_side = int(self.policy.get('radio_min_side', 256))
+        default_max_side = int(self.policy.get('radio_default_max_side', 768))
+        small_upscale_side = int(self.policy.get('radio_small_crop_min_side', 384))
+        highres_enabled = bool(self.policy.get('radio_highres_tier_enabled', True))
+        highres_trigger = int(self.policy.get('radio_highres_trigger_px', 900))
+        highres_max_side = int(self.policy.get('radio_highres_max_side', 1152))
+        default_max_patches = int(self.policy.get('radio_default_max_patches', 1536))
+        highres_max_patches = int(self.policy.get('radio_highres_max_patches', 4096))
+
+        if is_temporal:
+            cap_side = int(self.policy.get('radio_video_max_side', 384))
+            cap_patches = int(self.policy.get('radio_video_max_patches', 576))
+            floor_side = min(min_side, cap_side)
+            scale = min(cap_side / max_orig, 1.0) if max_orig >= floor_side else (floor_side / max_orig)
+        elif num_images > 1:
+            cap_side = int(self.policy.get('radio_multiview_max_side', 512 if num_images <= 4 else 384))
+            cap_patches = int(self.policy.get('radio_multiview_max_patches', 1024 if num_images <= 4 else 576))
+            floor_side = min(small_upscale_side, cap_side)
+            scale = (cap_side / max_orig) if max_orig > cap_side else (floor_side / max_orig if max_orig < floor_side else 1.0)
+        else:
+            use_highres = highres_enabled and (high_res_hint or max_orig >= highres_trigger)
+            if use_highres:
+                cap_side = highres_max_side
+                cap_patches = min(highres_max_patches, int(self.policy['max_visual_tokens']) * 4)
+                scale = min(cap_side / max_orig, 1.0) if max_orig >= cap_side else min(cap_side / max_orig, 1.0)
+            elif max_orig < small_upscale_side:
+                # Tiny/OCR crop: upscale so longest side >= 384px (or 512px for very narrow word strips)
+                cap_side = max(small_upscale_side, 512)
+                cap_patches = default_max_patches
+                target_long = small_upscale_side
+                if min(w, h) * (small_upscale_side / max_orig) < 128:
+                    target_long = min(cap_side, 512)
+                scale = target_long / max_orig
+            else:
+                cap_side = default_max_side
+                cap_patches = default_max_patches
+                scale = min(cap_side / max_orig, 1.0)
+
+        tw = _snap(w * scale, 128, cap_side)
+        th = _snap(h * scale, 128, cap_side)
+        # Keep area within `cap_patches` while preserving aspect ratio cleanly in 32px steps
+        while (tw // 16) * (th // 16) > cap_patches and max(tw, th) > 128:
+            ratio = math.sqrt(cap_patches / float((tw // 16) * (th // 16))) * 0.99
+            nw = _snap(tw * ratio, 128, cap_side)
+            nh = _snap(th * ratio, 128, cap_side)
+            if nw == tw and nh == th:
+                if tw >= th and tw > 128:
+                    nw = tw - align
+                elif th > 128:
+                    nh = th - align
+                else:
+                    break
+            tw, th = nw, nh
+        return int(th), int(tw)
+
+    def _preprocess_radio_image(
+        self,
+        image,
+        target_h: int,
+        target_w: int,
+        *,
+        is_pixel_art_atlas: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        """Resize & convert PIL RGB image to `[0, 1]` `(1, 3, H, W)` tensor for `C-RADIOv4` (`input_conditioner` normalizes)."""
+        from PIL import Image
+        th, tw = int(target_h), int(target_w)
+        if image.size != (tw, th):
+            resample = Image.Resampling.NEAREST if is_pixel_art_atlas else Image.Resampling.BICUBIC
+            resized = image.resize((tw, th), resample=resample)
+        else:
+            resized = image
+        arr = np.asarray(resized, dtype=np.float32) / 255.0
+        pv = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).contiguous()
+        patch_sz = int(getattr(getattr(self.vision, 'radio_model', None), 'patch_size', 16))
+        return {
+            'pixel_values': pv,
+            'spatial_shapes': torch.tensor([[th // patch_sz, tw // patch_sz]], dtype=torch.long),
+        }
+
     def _prepare_visual_units_and_groups(self, images, times, capture, alphas=None, visual_units=None):
         if not images:
             return [], {}
         if visual_units:
-            is_temporal=all(u.get('visual_kind')=='temporal_frame' for u in visual_units)
+            is_temporal = all(u.get('visual_kind') == 'temporal_frame' for u in visual_units)
         else:
-            is_temporal=len(images)>1 and any(float(t)!=0.0 for t in (times or []))
+            is_temporal = len(images) > 1 and any(float(t) != 0.0 for t in (times or []))
 
-        units=[]
-        for fi,raw_image in enumerate(images):
-            rgb_image,derived_alpha=extract_image_rgb_and_alpha(raw_image)
-            explicit_alpha=alphas[fi] if alphas is not None and fi<len(alphas) else None
-            alpha_arr=explicit_alpha if explicit_alpha is not None else derived_alpha
-            u_meta=visual_units[fi] if visual_units and fi<len(visual_units) else {
-                'visual_kind':'temporal_frame' if is_temporal else ('multiview_render' if len(images)>1 else 'independent_image'),
-                'visual_kind_index':VISUAL_KIND_TO_INDEX['temporal_frame' if is_temporal else ('multiview_render' if len(images)>1 else 'independent_image')],
-                'view_id':'frame' if is_temporal else 'single',
-                'view_id_index':VIEW_ID_TO_INDEX['frame' if is_temporal else 'single'],
-                'camera_right':[1.0,0.0,0.0],
-                'camera_up':[0.0,1.0,0.0],
-                'ortho_scale':1.0,
-                'timestamp_s':float(times[fi]) if times and fi<len(times) else 0.0,
-                'has_timestamp':bool(is_temporal or (times and fi<len(times) and float(times[fi])!=0.0)),
-                'capture_s':None if not capture or fi>=len(capture) or capture[fi] is None else float(capture[fi]),
-                'is_pixel_art_atlas':False,
+        is_radio = getattr(self, 'vision_backbone_type', 'siglip2_naflex') == 'c_radio_v4'
+        units = []
+        for fi, raw_image in enumerate(images):
+            rgb_image, derived_alpha = extract_image_rgb_and_alpha(raw_image)
+            explicit_alpha = alphas[fi] if alphas is not None and fi < len(alphas) else None
+            alpha_arr = explicit_alpha if explicit_alpha is not None else derived_alpha
+            u_meta = visual_units[fi] if visual_units and fi < len(visual_units) else {
+                'visual_kind': 'temporal_frame' if is_temporal else ('multiview_render' if len(images) > 1 else 'independent_image'),
+                'visual_kind_index': VISUAL_KIND_TO_INDEX['temporal_frame' if is_temporal else ('multiview_render' if len(images) > 1 else 'independent_image')],
+                'view_id': 'frame' if is_temporal else 'single',
+                'view_id_index': VIEW_ID_TO_INDEX['frame' if is_temporal else 'single'],
+                'camera_right': [1.0, 0.0, 0.0],
+                'camera_up': [0.0, 1.0, 0.0],
+                'ortho_scale': 1.0,
+                'timestamp_s': float(times[fi]) if times and fi < len(times) else 0.0,
+                'has_timestamp': bool(is_temporal or (times and fi < len(times) and float(times[fi]) != 0.0)),
+                'capture_s': None if not capture or fi >= len(capture) or capture[fi] is None else float(capture[fi]),
+                'is_pixel_art_atlas': False,
             }
-            for vi,(view_rgb,view_alpha,box,patches) in enumerate(
-                self.tile_views(rgb_image,is_temporal,alpha=alpha_arr,is_pixel_art_atlas=bool(u_meta.get('is_pixel_art_atlas',False)))
-            ):
-                batch=self.image_processor(images=view_rgb,return_tensors='pt',max_num_patches=patches)
-                units.append({'frame':fi,'view':vi,'image':view_rgb,'alpha':view_alpha,'meta':u_meta,'box':box,'patches':patches,'batch':batch})
+            is_atlas = bool(u_meta.get('is_pixel_art_atlas', False))
+            if is_radio:
+                ow, oh = rgb_image.size
+                th, tw = self._radio_target_hw(
+                    ow,
+                    oh,
+                    is_temporal=is_temporal,
+                    num_images=len(images),
+                    high_res_hint=bool(u_meta.get('high_res', False)),
+                )
+                batch = self._preprocess_radio_image(rgb_image, th, tw, is_pixel_art_atlas=is_atlas)
+                units.append({
+                    'frame': fi,
+                    'view': 0,
+                    'image': rgb_image,
+                    'alpha': alpha_arr,
+                    'meta': u_meta,
+                    'box': (0.0, 0.0, 1.0, 1.0),
+                    'hw': (th, tw),
+                    'patches': 0,
+                    'batch': batch,
+                })
+            else:
+                for vi, (view_rgb, view_alpha, box, patches) in enumerate(
+                    self.tile_views(rgb_image, is_temporal, alpha=alpha_arr, is_pixel_art_atlas=is_atlas)
+                ):
+                    batch = self.image_processor(images=view_rgb, return_tensors='pt', max_num_patches=patches)
+                    units.append({
+                        'frame': fi,
+                        'view': vi,
+                        'image': view_rgb,
+                        'alpha': view_alpha,
+                        'meta': u_meta,
+                        'box': box,
+                        'hw': None,
+                        'patches': patches,
+                        'batch': batch,
+                    })
 
         def count(unit):
-            hh,ww=(int(x) for x in unit['batch']['spatial_shapes'][0])
-            return ((hh+1)//2)*((ww+1)//2)
+            hh, ww = (int(x) for x in unit['batch']['spatial_shapes'][0])
+            return ((hh + 1) // 2) * ((ww + 1) // 2)
 
-        while sum(count(u) for u in units)>self.policy['max_visual_tokens']:
-            candidates=[u for u in units if u['patches']>64]
-            if not candidates: raise ValueError('Actual visual grids cannot fit the qualified token budget')
-            u=max(candidates,key=count); u['patches']=max(64,u['patches']//2)
-            u['batch']=self.image_processor(images=u['image'],return_tensors='pt',max_num_patches=u['patches'])
+        max_tok = int(self.policy['max_visual_tokens'])
+        while sum(count(u) for u in units) > max_tok:
+            if is_radio:
+                cands = [u for u in units if max(u['hw']) > 128]
+                if not cands:
+                    raise ValueError('Actual visual grids cannot fit the qualified token budget')
+                u = max(cands, key=count)
+                ch, cw = u['hw']
+                nh = max(128, int(round((ch * 0.8) / 32)) * 32)
+                nw = max(128, int(round((cw * 0.8) / 32)) * 32)
+                if (nh, nw) == (ch, cw):
+                    if cw >= ch and cw > 128:
+                        nw = cw - 32
+                    elif ch > 128:
+                        nh = ch - 32
+                u['hw'] = (nh, nw)
+                u['batch'] = self._preprocess_radio_image(
+                    u['image'], nh, nw, is_pixel_art_atlas=bool(u['meta'].get('is_pixel_art_atlas', False))
+                )
+            else:
+                candidates = [u for u in units if u['patches'] > 64]
+                if not candidates:
+                    raise ValueError('Actual visual grids cannot fit the qualified token budget')
+                u = max(candidates, key=count)
+                u['patches'] = max(64, u['patches'] // 2)
+                u['batch'] = self.image_processor(images=u['image'], return_tensors='pt', max_num_patches=u['patches'])
 
-        groups={}
-        for index,unit in enumerate(units):
-            groups.setdefault(unit['patches'],[]).append((index,unit))
+        groups: dict[Any, list[tuple[int, dict[str, Any]]]] = {}
+        for index, unit in enumerate(units):
+            gkey = unit['hw'] if is_radio else unit['patches']
+            groups.setdefault(gkey, []).append((index, unit))
         return units, groups
 
     def prefetch_examples_vision(self, examples: list[tuple[dict[str, Any], dict[str, Any]]]) -> None:
-        """Tile & execute 27L SigLIP2-So400M on Intel Arc Pro B50 (`xpu:0`) for `Microbatch m+1`
-        in a background thread concurrently while NVIDIA Blackwell (`cuda:0`) computes `Microbatch m`."""
+        """Tile/resize & execute vision backbone (`C-RADIOv4-H` or `SigLIP2`) on Intel Arc Pro B50 (`xpu:0`)
+        for `Microbatch m+1` concurrently while NVIDIA Blackwell (`cuda:0`) computes `Microbatch m`."""
         bridge = getattr(self, '_intel_vision_bridge', None)
         if bridge is None or not self.training or not getattr(self, '_intel_vision_trainable', False):
             return
         vis_dtype = next(self.vision.parameters()).dtype
+        is_radio = getattr(self, 'vision_backbone_type', 'siglip2_naflex') == 'c_radio_v4'
         for _row, media in examples:
             images = media.get('images')
             if not images or '_prefetched_b50_vision' in media:
@@ -1615,20 +1924,27 @@ class SparkNative(nn.Module):
                 media.get('alphas'),
                 media.get('visual_units'),
             )
-            prefetched_groups: dict[int, tuple[dict[str, torch.Tensor], tuple[int, torch.Tensor]]] = {}
-            for p_key, items in sorted(groups.items()):
-                batch = {
-                    k: torch.cat([u['batch'][k] for _, u in items], dim=0).to(
-                        dtype=vis_dtype if k == 'pixel_values' else None,
-                    )
-                    for k in ('pixel_values', 'pixel_attention_mask', 'spatial_shapes')
-                }
+            prefetched_groups: dict[Any, tuple[dict[str, torch.Tensor], tuple[int, torch.Tensor]]] = {}
+            for gkey, items in sorted(groups.items()):
+                if is_radio:
+                    batch = {
+                        'pixel_values': torch.cat([u['batch']['pixel_values'] for _, u in items], dim=0).to(dtype=vis_dtype),
+                        'spatial_shapes': torch.cat([u['batch']['spatial_shapes'] for _, u in items], dim=0),
+                    }
+                else:
+                    batch = {
+                        k: torch.cat([u['batch'][k] for _, u in items], dim=0).to(
+                            dtype=vis_dtype if k == 'pixel_values' else None,
+                        )
+                        for k in ('pixel_values', 'pixel_attention_mask', 'spatial_shapes')
+                    }
                 res = bridge.prefetch_forward_train(batch, out_dtype=vis_dtype)
-                prefetched_groups[p_key] = (batch, res)
+                prefetched_groups[gkey] = (batch, res)
             media['_prefetched_b50_vision'] = (units, groups, prefetched_groups)
 
-    def image_tokens(self,images,times,capture,alphas=None,visual_units=None,_prefetched=None):
+    def image_tokens(self, images, times, capture, alphas=None, visual_units=None, _prefetched=None):
         if not images:
+            self._last_early_visual_context = None
             return None
         if _prefetched is not None:
             units, groups, prefetched_groups = _prefetched
@@ -1638,99 +1954,166 @@ class SparkNative(nn.Module):
             )
             prefetched_groups = None
 
-        outputs=[None]*len(units)
-        vis_dtype=next(self.vision.parameters()).dtype
-        proj_dtype=self.vision_projector[0].weight.dtype
+        is_radio = getattr(self, 'vision_backbone_type', 'siglip2_naflex') == 'c_radio_v4'
+        outputs = [None] * len(units)
+        early_outputs = [None] * len(units) if is_radio else None
+        vis_dtype = next(self.vision.parameters()).dtype
+        proj_dtype = (
+            self.vision_projector.w_gate.weight.dtype
+            if isinstance(self.vision_projector, RadioMultiLayerSwiGLUProjector)
+            else self.vision_projector[0].weight.dtype
+        )
 
         bridge = getattr(self, '_intel_vision_bridge', None)
         ov_runner = getattr(self, '_openvino_vision_runner', None)
-        for p_key,items in sorted(groups.items()):
-            if bridge is not None:
-                if prefetched_groups is not None and p_key in prefetched_groups:
-                    batch, pre_res = prefetched_groups[p_key]
-                else:
-                    batch={
-                        k:torch.cat([u['batch'][k] for _,u in items],dim=0).to(
-                            dtype=vis_dtype if k=='pixel_values' else None,
-                        )
-                        for k in ('pixel_values','pixel_attention_mask','spatial_shapes')
-                    }
-                    pre_res = None
-                features=bridge.forward(
-                    batch,
-                    training_mode=self.training,
-                    out_device=self.device,
-                    out_dtype=vis_dtype,
-                    prefetched_result=pre_res,
-                )
-            elif ov_runner is not None and not self.training:
-                batch={
-                    k:torch.cat([u['batch'][k] for _,u in items],dim=0)
-                    for k in ('pixel_values','pixel_attention_mask','spatial_shapes')
-                }
-                features=ov_runner.forward(
-                    batch,
-                    out_device=self.device,
-                    out_dtype=vis_dtype,
-                )
-            else:
-                vis_dev=next(self.vision.parameters()).device
-                batch={
-                    k:torch.cat([u['batch'][k] for _,u in items],dim=0).to(
-                        vis_dev,
-                        dtype=vis_dtype if k=='pixel_values' else None,
+        for gkey, items in sorted(groups.items()):
+            if is_radio:
+                if bridge is not None:
+                    if prefetched_groups is not None and gkey in prefetched_groups:
+                        batch, pre_res = prefetched_groups[gkey]
+                    else:
+                        batch = {
+                            'pixel_values': torch.cat([u['batch']['pixel_values'] for _, u in items], dim=0).to(dtype=vis_dtype),
+                            'spatial_shapes': torch.cat([u['batch']['spatial_shapes'] for _, u in items], dim=0),
+                        }
+                        pre_res = None
+                    features = bridge.forward(
+                        {'pixel_values': batch['pixel_values']},
+                        training_mode=self.training,
+                        out_device=self.device,
+                        out_dtype=vis_dtype,
+                        prefetched_result=pre_res,
                     )
-                    for k in ('pixel_values','pixel_attention_mask','spatial_shapes')
-                }
-                features=self.vision(**batch).last_hidden_state.to(self.device)
-            for position,(index,unit) in enumerate(items):
-                fi,vi,box,u_meta=unit['frame'],unit['view'],unit['box'],unit['meta']
-                hh,ww=(int(x) for x in batch['spatial_shapes'][position])
-                tokens,_=spatial_downshuffle(features[position:position+1],hh,ww)
-                tokens=self.vision_projector(tokens.to(proj_dtype))
+                else:
+                    from .intel_vision_coproc import cradiov4_forward_multilayer
+                    vis_dev = next(self.vision.parameters()).device
+                    pv = torch.cat([u['batch']['pixel_values'] for _, u in items], dim=0).to(vis_dev, dtype=vis_dtype)
+                    sp = torch.cat([u['batch']['spatial_shapes'] for _, u in items], dim=0)
+                    batch = {'pixel_values': pv, 'spatial_shapes': sp}
+                    features = cradiov4_forward_multilayer(
+                        self.vision,
+                        pv,
+                        indices=self._radio_layer_indices,
+                    ).to(self.device)
+            else:
+                if bridge is not None:
+                    if prefetched_groups is not None and gkey in prefetched_groups:
+                        batch, pre_res = prefetched_groups[gkey]
+                    else:
+                        batch = {
+                            k: torch.cat([u['batch'][k] for _, u in items], dim=0).to(
+                                dtype=vis_dtype if k == 'pixel_values' else None,
+                            )
+                            for k in ('pixel_values', 'pixel_attention_mask', 'spatial_shapes')
+                        }
+                        pre_res = None
+                    features = bridge.forward(
+                        batch,
+                        training_mode=self.training,
+                        out_device=self.device,
+                        out_dtype=vis_dtype,
+                        prefetched_result=pre_res,
+                    )
+                elif ov_runner is not None and not self.training:
+                    batch = {
+                        k: torch.cat([u['batch'][k] for _, u in items], dim=0)
+                        for k in ('pixel_values', 'pixel_attention_mask', 'spatial_shapes')
+                    }
+                    features = ov_runner.forward(
+                        batch,
+                        out_device=self.device,
+                        out_dtype=vis_dtype,
+                    )
+                else:
+                    vis_dev = next(self.vision.parameters()).device
+                    batch = {
+                        k: torch.cat([u['batch'][k] for _, u in items], dim=0).to(
+                            vis_dev,
+                            dtype=vis_dtype if k == 'pixel_values' else None,
+                        )
+                        for k in ('pixel_values', 'pixel_attention_mask', 'spatial_shapes')
+                    }
+                    features = self.vision(**batch).last_hidden_state.to(self.device)
 
-                alpha_feat=compute_patch_alpha_transparency_features(unit['alpha'],hh,ww,self.device).to(proj_dtype)
-                tokens=tokens+self.alpha_projector(alpha_feat)
+            for position, (index, unit) in enumerate(items):
+                fi, vi, box, u_meta = unit['frame'], unit['view'], unit['box'], unit['meta']
+                hh, ww = (int(x) for x in batch['spatial_shapes'][position])
+                if is_radio:
+                    tokens, early_tokens = self.vision_projector(features[position:position + 1], hh, ww)
+                else:
+                    tokens, _ = spatial_downshuffle(features[position:position + 1], hh, ww)
+                    tokens = self.vision_projector(tokens.to(proj_dtype))
+                    early_tokens = None
 
-                gh,gw=(hh+1)//2,(ww+1)//2
-                yy,xx=torch.meshgrid(torch.arange(gh,device=self.device),torch.arange(gw,device=self.device),indexing='ij')
-                xx,yy=xx.flatten().float(),yy.flatten().float(); xmin,ymin,xmax,ymax=box
-                x0=2*xx/ww; x1=torch.clamp(2*xx+2,max=ww)/ww
-                y0=2*yy/hh; y1=torch.clamp(2*yy+2,max=hh)/hh
-                x=xmin+(x0+x1)/2*(xmax-xmin); y=ymin+(y0+y1)/2*(ymax-ymin)
-                bw=(x1-x0)*(xmax-xmin); bh=(y1-y0)*(ymax-ymin)
+                alpha_feat = compute_patch_alpha_transparency_features(unit['alpha'], hh, ww, self.device).to(proj_dtype)
+                alpha_emb = self.alpha_projector(alpha_feat)
 
-                has_ts=bool(u_meta.get('has_timestamp',False))
-                time_val=float(u_meta.get('timestamp_s',0.0)) if has_ts else 0.0
-                cap=u_meta.get('capture_s')
-                clock=[time_val/60,math.sin(time_val) if has_ts else 0.,math.cos(time_val) if has_ts else 1.,0. if cap is None else float(cap)/3600,0. if cap is None else 1.]
-                coord=torch.stack([x,y,bw,bh,torch.full_like(x,float(fi)),*([torch.full_like(x,v) for v in clock]),torch.full_like(x,float(vi)),torch.full_like(x,float(vi==0))],dim=-1).to(proj_dtype)
+                gh, gw = (hh + 1) // 2, (ww + 1) // 2
+                yy, xx = torch.meshgrid(torch.arange(gh, device=self.device), torch.arange(gw, device=self.device), indexing='ij')
+                xx, yy = xx.flatten().float(), yy.flatten().float()
+                xmin, ymin, xmax, ymax = box
+                x0 = 2 * xx / ww
+                x1 = torch.clamp(2 * xx + 2, max=ww) / ww
+                y0 = 2 * yy / hh
+                y1 = torch.clamp(2 * yy + 2, max=hh) / hh
+                x = xmin + (x0 + x1) / 2 * (xmax - xmin)
+                y = ymin + (y0 + y1) / 2 * (ymax - ymin)
+                bw = (x1 - x0) * (xmax - xmin)
+                bh = (y1 - y0) * (ymax - ymin)
 
-                cam_vec=torch.tensor(
+                has_ts = bool(u_meta.get('has_timestamp', False))
+                time_val = float(u_meta.get('timestamp_s', 0.0)) if has_ts else 0.0
+                cap = u_meta.get('capture_s')
+                clock = [
+                    time_val / 60,
+                    math.sin(time_val) if has_ts else 0.0,
+                    math.cos(time_val) if has_ts else 1.0,
+                    0.0 if cap is None else float(cap) / 3600,
+                    0.0 if cap is None else 1.0,
+                ]
+                coord = torch.stack(
                     [
-                        *u_meta.get('camera_right',[1.,0.,0.])[:3],
-                        *u_meta.get('camera_up',[0.,1.,0.])[:3],
-                        float(u_meta.get('ortho_scale',1.0)),
-                        float(bool(u_meta.get('is_pixel_art_atlas',False))),
+                        x, y, bw, bh,
+                        torch.full_like(x, float(fi)),
+                        *([torch.full_like(x, v) for v in clock]),
+                        torch.full_like(x, float(vi)),
+                        torch.full_like(x, float(vi == 0)),
+                    ],
+                    dim=-1,
+                ).to(proj_dtype)
+
+                cam_vec = torch.tensor(
+                    [
+                        *u_meta.get('camera_right', [1.0, 0.0, 0.0])[:3],
+                        *u_meta.get('camera_up', [0.0, 1.0, 0.0])[:3],
+                        float(u_meta.get('ortho_scale', 1.0)),
+                        float(bool(u_meta.get('is_pixel_art_atlas', False))),
                     ],
                     device=self.device,
                     dtype=proj_dtype,
-                ).view(1,1,8).expand(1,tokens.shape[1],8)
+                ).view(1, 1, 8).expand(1, tokens.shape[1], 8)
 
-                vkind_idx=int(u_meta.get('visual_kind_index',VISUAL_KIND_TO_INDEX.get(u_meta.get('visual_kind','independent_image'),0)))
-                vid_idx=int(u_meta.get('view_id_index',VIEW_ID_TO_INDEX.get(u_meta.get('view_id','single'),0)))
+                vkind_idx = int(u_meta.get('visual_kind_index', VISUAL_KIND_TO_INDEX.get(u_meta.get('visual_kind', 'independent_image'), 0)))
+                vid_idx = int(u_meta.get('view_id_index', VIEW_ID_TO_INDEX.get(u_meta.get('view_id', 'single'), 0)))
 
-                token_out=(
-                    tokens
+                meta_add = (
+                    alpha_emb
                     + self.spatial_clock(coord[None])
                     + self.camera_pose_encoder(cam_vec)
                     + self.visual_kind_embedding.weight[vkind_idx].to(proj_dtype)
                     + self.view_id_embedding.weight[vid_idx].to(proj_dtype)
                     + self.modality.weight[0].to(proj_dtype)
                 )
-                token_out=self.visual_token_drop(token_out)
-                outputs[index]=token_out.to(self.embed_dtype)
-        return torch.cat(outputs,dim=1) if outputs else None
+                token_out = self.visual_token_drop(tokens + meta_add)
+                outputs[index] = token_out.to(self.embed_dtype)
+                if early_outputs is not None and early_tokens is not None:
+                    early_outputs[index] = self.visual_token_drop(early_tokens + meta_add).to(self.embed_dtype)
+
+        if early_outputs is not None and all(e is not None for e in early_outputs):
+            self._last_early_visual_context = torch.cat(early_outputs, dim=1)
+        else:
+            self._last_early_visual_context = None
+        return torch.cat(outputs, dim=1) if outputs else None
 
     def motion_tokens(self,frames):
         if not frames or getattr(self,'motion',None) is None: return None
@@ -1844,10 +2227,19 @@ class SparkNative(nn.Module):
 
         xattn_blk = self._xattn_block_for_layer(layer_idx)
         if xattn_blk is not None and visual_context is not None:
-            if grad_ckpt and (hidden.requires_grad or visual_context.requires_grad or any(p.requires_grad for p in xattn_blk.parameters())):
-                hidden = checkpoint(xattn_blk, hidden, visual_context, use_reentrant=False)
+            eff_ctx = visual_context
+            if layer_idx < max(1, int(getattr(self, 'loop_start', 12))):
+                early_ctx = getattr(self, '_last_early_visual_context', None)
+                if (
+                    early_ctx is not None
+                    and early_ctx.shape == visual_context.shape
+                    and early_ctx.device == visual_context.device
+                ):
+                    eff_ctx = early_ctx
+            if grad_ckpt and (hidden.requires_grad or eff_ctx.requires_grad or any(p.requires_grad for p in xattn_blk.parameters())):
+                hidden = checkpoint(xattn_blk, hidden, eff_ctx, use_reentrant=False)
             else:
-                hidden = xattn_blk(hidden, visual_context)
+                hidden = xattn_blk(hidden, eff_ctx)
         return hidden
 
     def forward_looped_model(
