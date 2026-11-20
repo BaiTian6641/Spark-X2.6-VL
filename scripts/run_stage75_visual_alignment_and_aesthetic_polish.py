@@ -140,7 +140,7 @@ def v25_record_to_example(rec: dict[str, Any]) -> tuple[dict[str, Any], dict[str
         "source_family": str(rec.get("source_family", "synccraft_aesthetic_v25_cc0")),
     }
     if imgs:
-        vkind = "multiview" if len(imgs) > 1 else "independent_image"
+        vkind = "multiview_render" if len(imgs) > 1 else "independent_image"
         media = visual_media(imgs, visual_kind=vkind)
     else:
         media = empty_media()

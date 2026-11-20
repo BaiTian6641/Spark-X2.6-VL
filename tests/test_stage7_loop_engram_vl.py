@@ -545,7 +545,22 @@ def test_stage75_frozen_backbone_partition_and_data_selection(tmp_path) -> None:
         partition_stage75_trainable_parameters,
         select_stage75a_pixel_indispensable_rids,
         select_stage75b_balanced_rids,
+        v25_record_to_example,
     )
+    from PIL import Image
+
+    mv_row, mv_media = v25_record_to_example(
+        {
+            "id": "v25_mv_test",
+            "task": "v25_intent_router_and_mood_control",
+            "prompt": "test",
+            "answer": "<think>t</think>\nok",
+            "images": [Image.new("RGB", (32, 32)), Image.new("RGB", (32, 32))],
+        }
+    )
+    assert mv_row["_family"] == "image"
+    assert mv_media["visual_kind"] == "multiview_render"
+    assert len(mv_media["images"]) == 2
 
     # 1. Verify frozen_spark_cross_attn freezes 100% of Spark + Loop + En1B while leaving connectors & cross-attn trainable
     class _DummyStage75Model(torch.nn.Module):
