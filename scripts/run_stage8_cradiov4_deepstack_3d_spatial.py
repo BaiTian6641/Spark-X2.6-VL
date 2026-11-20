@@ -67,8 +67,9 @@ from colab.final.spatial_3d_primitives_corpus import (  # noqa: E402
 )
 from colab.final.storage import manifest  # noqa: E402
 from scripts.run_stage75_visual_alignment_and_aesthetic_polish import (  # noqa: E402
-    audit_param_trainability,
-    evaluate_visual_calibration,
+    _select_eval_image_rids,
+    measure_visual_alignment_diagnostics,
+    partition_stage75_trainable_parameters,
     select_stage75a_pixel_indispensable_rids,
     select_stage75b_balanced_rids,
     v25_record_to_example,
@@ -150,7 +151,7 @@ def _run_stage8_phase(
     )
     model.train()
 
-    param_audit = audit_param_trainability(model)
+    param_audit = partition_stage75_trainable_parameters(model)
     if is_frozen_spark and param_audit.get("spark:trainable", 0) != 0:
         raise AssertionError(f"Expected frozen Spark in {stage_name}, got {param_audit}")
     if (not is_frozen_spark) and param_audit.get("spark:trainable", 0) == 0:
@@ -643,15 +644,18 @@ def main() -> None:
     handoff = read(handoff_path)
     reader = MediaReader(args.stage7_work_root, handoff, cfg, token=hf_token, reserve=0)
 
+    eval_rids = _select_eval_image_rids(db_path, max_items=args.eval_images)
+    probe_ex = _pair_to_example(spatial3d_pairs[0]) if spatial3d_pairs else None
     try:
         # Baseline visual calibration right after C-RADIOv4-H swap (before Stage-8A)
-        cal_pre = evaluate_visual_calibration(
+        cal_pre = measure_visual_alignment_diagnostics(
             model,
             catalogue=catalogue,
             reader=reader,
-            cfg=cfg,
-            max_images=args.eval_images,
-            seed=args.seed,
+            config=cfg,
+            eval_rids=eval_rids,
+            v25_probe_example=probe_ex,
+            tag="pre_stage8a",
         )
         emit("stage8_pre_calibration", **cal_pre)
 
@@ -679,13 +683,14 @@ def main() -> None:
             checkpoint_dir=args.output_root / "ckpt-stage8a",
             seed=args.seed + 10,
         )
-        cal_post_8a = evaluate_visual_calibration(
+        cal_post_8a = measure_visual_alignment_diagnostics(
             model,
             catalogue=catalogue,
             reader=reader,
-            cfg=cfg,
-            max_images=args.eval_images,
-            seed=args.seed,
+            config=cfg,
+            eval_rids=eval_rids,
+            v25_probe_example=probe_ex,
+            tag="post_stage8a",
         )
         emit("stage8_post_8a_calibration", **cal_post_8a)
 
@@ -718,13 +723,14 @@ def main() -> None:
             checkpoint_dir=args.output_root / "ckpt-stage8b",
             seed=args.seed + 20,
         )
-        cal_post_8b = evaluate_visual_calibration(
+        cal_post_8b = measure_visual_alignment_diagnostics(
             model,
             catalogue=catalogue,
             reader=reader,
-            cfg=cfg,
-            max_images=args.eval_images,
-            seed=args.seed,
+            config=cfg,
+            eval_rids=eval_rids,
+            v25_probe_example=probe_ex,
+            tag="post_stage8b",
         )
         emit("stage8_post_8b_calibration", **cal_post_8b)
 
