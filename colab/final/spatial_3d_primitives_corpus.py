@@ -664,7 +664,7 @@ def build_shaded_3d_spatial_primitives_records(
 
         # --- Task D: Multi-View 3D Cross-Angle Correspondence & Front/Back Flip ---
         if len(rendered_views) >= 4:
-            v_indices = [0, 1, 2, 4]  # front-right 3/4, front-left 3/4, right profile, rear-right 3/4
+            v_indices = [0, 1, 2, 4] if len(rendered_views) >= 5 else [0, 1, 2, 3]  # front-right, front-left, right profile, rear/left
             mv_frames: list[str] = []
             mv_units: list[dict[str, Any]] = []
             mv_blobs: dict[str, bytes] = {}

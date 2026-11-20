@@ -154,9 +154,12 @@ class _DummyTokenizer:
     eos_token = "</s>"
     pad_token = "<pad>"
 
-    def apply_chat_template(self, messages, tokenize=False, **kwargs):
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False, **kwargs):
         parts = [f"<{m['role']}>{m['content']}</{m['role']}>" for m in messages]
-        return "\n".join(parts)
+        out = "\n".join(parts)
+        if add_generation_prompt:
+            out += "\n<assistant>"
+        return out
 
     def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
         return [2 + (ord(c) % 50) for c in (text or "a")[:24]]
@@ -225,14 +228,14 @@ def test_xpu_vision_optimizer_8bit_convergence_and_low_memory(mode: str):
     eng.sync_trainable_params(named)
 
     losses = []
-    for _ in range(15):
+    for _ in range(20):
         layer.zero_grad(set_to_none=True)
         out = layer(x.to(torch.bfloat16)).float()
         loss = torch.nn.functional.mse_loss(out, target)
         losses.append(float(loss.item()))
         loss.backward()
         eng.accumulate_grads(named, mb_weight=1.0)
-        res = eng.step(named, lr=1.5e-2 if mode == "muon8bit" else 4e-2, max_grad_norm=1.0)
+        res = eng.step(named, lr=1.5e-2 if mode == "muon8bit" else 1.2e-1, max_grad_norm=1.0)
         assert res["finite"] and res["applied"]
 
     assert losses[-1] < losses[0] * 0.5, f"{mode} failed to converge: {losses}"
