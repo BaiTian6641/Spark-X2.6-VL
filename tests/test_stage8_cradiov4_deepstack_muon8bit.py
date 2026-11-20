@@ -338,32 +338,173 @@ def test_vision_swap_warmstart_preserves_spark_and_cross_attn(tmp_path: Path):
     assert torch.equal(dst.vision.radio_model.model.blocks[0].fc1.weight, orig_vis_w)
 
 
-def test_shaded_3d_spatial_primitives_and_nemotron_converter():
-    # 1. Nemotron inline [x1, y1, x2, y2] -> <box> + relational <dash>
-    sample = (
+def test_shaded_3d_spatial_primitives_and_nemotron_converter(tmp_path: Path):
+    from scripts.audit_stage8_dataset_quality import (
+        audit_records,
+        parse_visual_primitives,
+        render_primitive_overlay_sheet,
+    )
+
+    # 1. Nemotron inline [x1, y1, x2, y2] -> <box> + relational <dash> / <circle> / <point>
+    sample_rel = (
         "<think>\nThere is a red cube [120, 200, 320, 420] to the left of a blue sphere [620, 210, 780, 410].\n</think>\nYes"
     )
-    out = _convert_nemotron_boxes_to_primitives(sample)
-    assert '<box x1="120" y1="200" x2="320" y2="420"' in out
-    assert '<box x1="620" y1="210" x2="780" y2="410"' in out
-    assert "<dash " in out
+    out_rel = _convert_nemotron_boxes_to_primitives(sample_rel)
+    assert '<box x1="120" y1="200" x2="320" y2="420"' in out_rel
+    assert '<box x1="620" y1="210" x2="780" y2="410"' in out_rel
+    assert "<dash " in out_rel
 
-    # 2. Real full-color shaded 3D records with all 4 primitives + Front/Back + Left/Right!
+    # Degenerate overlapping centers (< 6px apart) must NOT emit a degenerate <dash>
+    sample_same = "<think>\nBox A [200, 200, 400, 400] is right next to Box B [201, 200, 401, 400].\n</think>\nSame"
+    out_same = _convert_nemotron_boxes_to_primitives(sample_same)
+    assert "<dash " not in out_same
+
+    # Single round/spherical object emits <circle>
+    sample_round = "<think>\nLocate the metallic sphere [300, 250, 500, 450] in the scene.\n</think>\nSphere"
+    out_round = _convert_nemotron_boxes_to_primitives(sample_round)
+    assert "<circle " in out_round
+
+    # Single non-round object with location keyword emits <point>
+    sample_pt = "<think>\nPoint to the center location of the red book [400, 300, 520, 460].\n</think>\nBook"
+    out_pt = _convert_nemotron_boxes_to_primitives(sample_pt)
+    assert "<point " in out_pt
+
+    # 2. Real full-color shaded 3D records with all 6 tasks, 4 primitives, bilingual EN+ZH, animation arcs, and 50/50 Yes/No!
     pairs = build_shaded_3d_spatial_primitives_records(seed=42, panel_size=(128, 128), angles_per_asset=4)
-    assert len(pairs) >= 20
+    assert len(pairs) >= 60
     tasks = {r["task"] for r, _ in pairs}
-    assert "spatial_3d_kinematic_dash_and_joints" in tasks
-    assert "spatial_3d_front_back_depth_order" in tasks
-    assert "spatial_3d_left_right_orientation_facing" in tasks
-    assert "spatial_3d_multiview_correspondence" in tasks
+    for req_t in (
+        "spatial_3d_kinematic_dash_and_joints",
+        "spatial_3d_front_back_depth_order",
+        "spatial_3d_left_right_orientation_facing",
+        "spatial_3d_multiview_correspondence",
+        "spatial_3d_rig_animation_arc",
+        "spatial_3d_yesno_depth_and_lr",
+    ):
+        assert req_t in tasks, f"Missing task {req_t}"
 
     all_answers = "\n".join(r["answer"] for r, _ in pairs)
     for prim in ("<point ", "<box ", "<dash ", "<circle "):
         assert prim in all_answers, f"Missing primitive {prim}"
 
-    # Verify renders are genuine full-color shaded studio RGB (NOT monochrome B&W cutouts!)
-    first_row, first_blobs = pairs[0]
-    first_png = next(iter(first_blobs.values()))
-    im = np.asarray(Image.open(io.BytesIO(first_png)).convert("RGB"), dtype=np.float32)
-    channel_spread = float(np.mean(np.max(im, axis=-1) - np.min(im, axis=-1)))
-    assert channel_spread > 5.0, f"Expected full-color shaded 3D render, got monochrome spread={channel_spread}"
+    # 3. Verify `spatial_3d_rig_animation_arc`: 2 frames genuinely differ in pixels & valid <circle>/<dash>/<point z=..>!
+    anim_pairs = [(r, b) for r, b in pairs if r["task"] == "spatial_3d_rig_animation_arc"]
+    assert len(anim_pairs) >= 10
+    for r, b in anim_pairs[:6]:
+        assert len(r["frames"]) == 2
+        im1 = np.asarray(Image.open(io.BytesIO(b[r["frames"][0]])).convert("RGB"), dtype=np.float32)
+        im2 = np.asarray(Image.open(io.BytesIO(b[r["frames"][1]])).convert("RGB"), dtype=np.float32)
+        mean_diff = float(np.mean(np.abs(im2 - im1)))
+        assert mean_diff > 0.6, f"Animation frames did not visibly articulate: diff={mean_diff}"
+        prims, errs = parse_visual_primitives(r["answer"])
+        assert not errs, f"Invalid primitives in anim record {r['id']}: {errs}"
+        kinds = {p["kind"] for p in prims}
+        assert {"point", "box", "dash", "circle"}.issubset(kinds)
+        assert any(p["kind"] == "point" and p.get("z") in ("near", "mid", "far") for p in prims)
+        assert any(p["kind"] == "dash" and "anim_arc:" in str(p.get("label", "")) for p in prims)
+
+    # 4. Verify `spatial_3d_yesno_depth_and_lr` strict 50/50 Yes/No balance!
+    yn_pairs = [(r, b) for r, b in pairs if r["task"] == "spatial_3d_yesno_depth_and_lr"]
+    assert len(yn_pairs) >= 20
+    n_yes = sum(1 for r, _ in yn_pairs if (r.get("metadata") or {}).get("ground_truth_yesno") == "yes")
+    n_no = sum(1 for r, _ in yn_pairs if (r.get("metadata") or {}).get("ground_truth_yesno") == "no")
+    assert n_yes > 0 and n_no > 0
+    assert 0.45 <= (n_yes / float(n_yes + n_no)) <= 0.55
+
+    # 5. Verify bilingual (`en` + `zh`) 3D spatial coverage (>= 10% zh)
+    langs = [r["language"] for r, _ in pairs]
+    assert "en" in langs and "zh" in langs
+    assert (langs.count("zh") / float(len(langs))) >= 0.10
+
+    # 6. Full quality audit passes 100% cleanly & contact sheet renders cleanly!
+    rep = audit_records(pairs, check_distribution=True, check_all_tasks=True)
+    assert rep["passed"], f"Audit failed on valid shaded 3D corpus: {rep['failures'][:10]}"
+    assert rep["failures_count"] == 0
+    sheet_path = render_primitive_overlay_sheet(pairs, tmp_path / "overlay_test.png")
+    assert sheet_path is not None and sheet_path.is_file() and sheet_path.stat().st_size > 10_000
+
+
+def test_stage8_dataset_quality_audit_catches_defects():
+    from scripts.audit_stage8_dataset_quality import audit_records
+
+    def _make_png(arr_u8: np.ndarray) -> bytes:
+        buf = io.BytesIO()
+        Image.fromarray(arr_u8, mode="RGB").save(buf, format="PNG")
+        return buf.getvalue()
+
+    # Colorful full-color shaded test frame (high chroma + std)
+    yy, xx = np.mgrid[0:160, 0:160]
+    color_arr = np.stack(
+        [
+            np.clip(30 + (xx > 40) * (xx < 120) * (yy > 30) * (yy < 130) * 180, 0, 255),
+            np.clip(35 + (xx > 40) * (xx < 120) * (yy > 30) * (yy < 130) * 80, 0, 255),
+            np.clip(55 + (xx > 40) * (xx < 120) * (yy > 30) * (yy < 130) * 20, 0, 255),
+        ],
+        axis=-1,
+    ).astype(np.uint8)
+    color_png = _make_png(color_arr)
+
+    # Black-and-white cutout silhouette (R == G == B -> chroma == 0!)
+    bw_arr = np.where(((xx > 40) & (xx < 120) & (yy > 30) & (yy < 130))[..., None], 255, 0).astype(np.uint8)
+    bw_arr = np.repeat(bw_arr, 3, axis=-1)
+    bw_png = _make_png(bw_arr)
+
+    def _base_row(rid: str, task: str, answer: str, frame: str = "f.png") -> dict:
+        return {
+            "id": rid,
+            "source_group": "test_grp",
+            "language": "en",
+            "task": task,
+            "prompt": "Inspect this shaded 3D render and verify coordinates.",
+            "answer": answer,
+            "frames": [frame],
+            "enable_thinking": True,
+            "metadata": {"source": "unit_test"},
+        }
+
+    # 1. Valid record passes single-record audit
+    ok_ans = (
+        '<think>\nGrounded <point x="300" y="400" z="near" label="head"/> '
+        '<box x1="250" y1="350" x2="360" y2="450" label="head"/> '
+        '<circle cx="300" cy="400" r="32" label="pivot:head"/> '
+        '<dash x1="300" y1="400" x2="520" y2="460" label="head_to_neck"/>.\n</think>\n'
+        "The head sits in front of the neck."
+    )
+    ok_rep = audit_records([(_base_row("ok_1", "spatial_3d_kinematic_dash_and_joints", ok_ans), {"f.png": color_png})], check_distribution=False)
+    assert ok_rep["passed"], f"Expected valid record to pass: {ok_rep['failures']}"
+
+    # 2. Out-of-range box (> 1000) caught
+    bad_box_ans = '<think>\nOut of bounds <box x1="100" y1="200" x2="1200" y2="400" label="bad"/>.\n</think>\nDone.'
+    rep_box = audit_records([(_base_row("bad_box", "spatial_3d_front_back_depth_order", bad_box_ans), {"f.png": color_png})], check_distribution=False)
+    assert not rep_box["passed"]
+    assert any(f["check"] == "primitive_invalid" for f in rep_box["failures"])
+
+    # 3. Black-and-white cutout silhouette caught on spatial_3d_* task!
+    rep_bw = audit_records([(_base_row("bad_bw", "spatial_3d_front_back_depth_order", ok_ans), {"f.png": bw_png})], check_distribution=False)
+    assert not rep_bw["passed"]
+    assert any(f["check"] == "bw_cutout_detected" for f in rep_bw["failures"])
+
+    # 4. Degenerate <dash> (length < 4.0) caught!
+    bad_dash_ans = '<think>\nDegenerate arrow <dash x1="400" y1="400" x2="401" y2="401" label="tiny"/>.\n</think>\nDone.'
+    rep_dash = audit_records([(_base_row("bad_dash", "spatial_3d_kinematic_dash_and_joints", bad_dash_ans), {"f.png": color_png})], check_distribution=False)
+    assert not rep_dash["passed"]
+    assert any("dash_degenerate_len" in f["detail"] for f in rep_dash["failures"])
+
+    # 5. Severe Yes-bias (100% Yes) on spatial_3d_yesno_depth_and_lr caught!
+    yes_ans = (
+        '<think>\nCheck <point x="200" y="300" z="near" label="a"/> <box x1="180" y1="280" x2="240" y2="340" label="a"/> '
+        '<dash x1="200" y1="300" x2="600" y2="300" label="a->b"/>.\n</think>\nYes, part a is closer to the camera.'
+    )
+    biased_pairs = [
+        (_base_row(f"yn_{i}", "spatial_3d_yesno_depth_and_lr", yes_ans), {"f.png": color_png})
+        for i in range(6)
+    ]
+    rep_bias = audit_records(biased_pairs, check_distribution=True, check_all_tasks=False)
+    assert not rep_bias["passed"]
+    assert any(f["check"] == "yesno_imbalance" for f in rep_bias["failures"])
+
+    # 6. Benchmark leakage caught!
+    leak_row = _base_row("pope_val_001", "nemotron_v3_gqa_spatial_relations", ok_ans)
+    rep_leak = audit_records([(leak_row, {"f.png": color_png})], check_distribution=False)
+    assert not rep_leak["passed"]
+    assert any(f["check"] == "benchmark_leakage" for f in rep_leak["failures"])

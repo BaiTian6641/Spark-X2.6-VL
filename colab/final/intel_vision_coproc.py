@@ -1006,6 +1006,8 @@ class IntelArcXpuVisionBridge:
         self.resp_pack = self.ipc_dir / "resp.pack"
         self._grad_seq = 0
         self._slot_counter = 0
+        self._fwd_eval_count = 0
+        self._fwd_train_count = 0
 
         env = intel_arc_runtime_env()
         repo_root = str(Path(__file__).resolve().parents[2])
@@ -1208,6 +1210,7 @@ class IntelArcXpuVisionBridge:
                 if not resp.get("ok", False):
                     raise RuntimeError(f"Intel Arc XPU vision daemon error: {resp.get('error', 'unknown')}")
                 if not resp.get("overflow", False):
+                    self._fwd_train_count += 1
                     out = self.arena.read_tensors(
                         resp["out_meta"],
                         device=out_device,
@@ -1229,6 +1232,7 @@ class IntelArcXpuVisionBridge:
             resp = _recv_msg(self._sock)
             if not resp.get("ok", False):
                 raise RuntimeError(f"Intel Arc XPU vision daemon error: {resp.get('error', 'unknown')}")
+            self._fwd_train_count += 1
             out = _read_tensor_pack(self.resp_pack, device="cpu")["last_hidden_state"].to(
                 device=out_device, dtype=out_dtype
             )
@@ -1342,6 +1346,7 @@ class IntelArcXpuVisionBridge:
                 if not resp.get("ok", False):
                     raise RuntimeError(f"Intel Arc XPU vision daemon error: {resp.get('error', 'unknown')}")
                 if not resp.get("overflow", False):
+                    self._fwd_eval_count += 1
                     return self.arena.read_tensors(
                         resp["out_meta"],
                         device=out_device,
@@ -1356,6 +1361,7 @@ class IntelArcXpuVisionBridge:
             resp = _recv_msg(self._sock)
             if not resp.get("ok", False):
                 raise RuntimeError(f"Intel Arc XPU vision daemon error: {resp.get('error', 'unknown')}")
+            self._fwd_eval_count += 1
             out = _read_tensor_pack(self.resp_pack, device="cpu")["last_hidden_state"]
             return out.to(device=out_device, dtype=out_dtype)
 
@@ -1544,8 +1550,10 @@ class IntelArcXpuVisionBridge:
         self._rpc({"cmd": "LOAD_OPTIM", "path": str(opt_file)})
 
     def telemetry(self) -> dict[str, Any]:
+        proc = getattr(self, "_proc", None)
         return {
             **self.device_info,
+            "xpu_pid": int(proc.pid) if (proc is not None and proc.poll() is None) else None,
             "vision_optimizer": self.vision_optimizer,
             "has_detail_tower": self.has_detail_tower(),
             "trainable_active": self._trainable,
@@ -1554,6 +1562,8 @@ class IntelArcXpuVisionBridge:
             "detail_unfreeze_last_n_layers": self._detail_unfreeze_last_n_layers,
             "dirty_on_xpu": self._dirty_on_xpu,
             "detail_dirty_on_xpu": self._detail_dirty_on_xpu,
+            "fwd_eval_count": int(self._fwd_eval_count),
+            "fwd_train_count": int(self._fwd_train_count),
             "last_step": self._last_step_stats,
         }
 

@@ -15,8 +15,10 @@ Strictly enforces BOTH `C-RADIOv4-H` architectural safeguards:
      on Intel Arc Pro B50 (`xpu:0`); lower 26 blocks (`0..25`) remain 100% frozen.
 2. **Left/Right Orientation & Real 3D Model Understanding (NEVER black-and-white cutouts)**:
    - Combines full-color shaded 3D renders with `<point>`, `<box>`, `<dash>` (bone chains, facing arrows,
-     `front_to_back` depth rays), and `<circle>` joint pivots + `nvidia/Nemotron-Image-Training-v3` spatial/geometric
-     CoT (`gqa_1`, `geometry3k`, `aokvqa_2`) + Stage-7 Visual Primitives + `v25` Vigorous Carved Masterworks + Frontier replay.
+     `front_to_back` depth rays, 2-frame SE(3) animation arcs), `<circle>` joint pivots, balanced 50/50 Yes/No,
+     and EN/ZH bilingual spatial QA + `nvidia/Nemotron-Image-Training-v3` spatial/geometric CoT
+     (`clevr_1`, `zhwiki_1`, `plotqa_1`, `gqa_1`, `gqa_2`, `geometry3k`, `aokvqa_2`) + Stage-7 Visual Primitives
+     + `v25` Vigorous Carved Masterworks + Frontier replay.
 """
 from __future__ import annotations
 
@@ -309,6 +311,8 @@ def _run_stage8_phase(
                     extra["b50_vgrad"] = round(float(lst.get("vision_grad_norm", 0.0)), 5)
                     extra["b50_gib"] = round(float(lst.get("xpu_peak_bytes", 0)) / (1024**3), 2)
                     extra["b50_opt"] = str(tel.get("vision_optimizer", ""))
+                    extra["b50_fwd"] = int(tel.get("fwd_eval_count", 0)) + int(tel.get("fwd_train_count", 0))
+                    extra["b50_pid"] = tel.get("xpu_pid")
                 emit(
                     "stage8_progress",
                     stage=stage_name,
@@ -499,6 +503,9 @@ def main() -> None:
     ap.add_argument("--nemotron-max-gqa", type=int, default=1200)
     ap.add_argument("--nemotron-max-geo", type=int, default=900)
     ap.add_argument("--nemotron-max-aokvqa", type=int, default=900)
+    ap.add_argument("--nemotron-max-clevr", type=int, default=800)
+    ap.add_argument("--nemotron-max-zhwiki", type=int, default=400)
+    ap.add_argument("--nemotron-max-plotqa", type=int, default=300)
     ap.add_argument("--eval-images", type=int, default=48)
     ap.add_argument("--seed", type=int, default=20261121)
     ap.add_argument("--intel-vision", type=str, default="xpu", choices=("xpu", "none"))
@@ -526,6 +533,9 @@ def main() -> None:
         max_gqa=args.nemotron_max_gqa,
         max_geometry3k=args.nemotron_max_geo,
         max_aokvqa=args.nemotron_max_aokvqa,
+        max_clevr=args.nemotron_max_clevr,
+        max_zhwiki=args.nemotron_max_zhwiki,
+        max_plotqa=args.nemotron_max_plotqa,
         seed=args.seed + 202,
     )
     emit(

@@ -354,7 +354,7 @@ def eval_terminal_bench_holdout(model: Any, token: str | None, version: str = "4
 def eval_v8_sculpted_and_v41_gate_d(model: Any, export_dir: Path) -> dict[str, Any]:
     ensure_synccraft_importable()
     from synccraft.dsl.parser import parse_program
-    from synccraft.exporters.bbmodel_exporter import export_bbmodel
+    from synccraft.backends.bbmodel5_exporter import export_bbmodel
     from synccraft.kinematics.se3_chain import compile_geometry
     from synccraft.world.assembly_world_tasks import (
         build_modular_assembly_world_tasks,
@@ -437,7 +437,7 @@ def eval_v8_sculpted_and_v41_gate_d(model: Any, export_dir: Path) -> dict[str, A
             asset_entry["exported_files"].append(dsl_p.name)
 
             try:
-                bb_doc = export_bbmodel(prog, sc, model_name=aid)
+                bb_doc = export_bbmodel(sc, name=aid, program=prog)
                 bb_p = export_dir / f"{aid}.bbmodel"
                 bb_p.write_text(json.dumps(bb_doc, indent=2), encoding="utf-8")
                 asset_entry["exported_files"].append(bb_p.name)
