@@ -24,6 +24,7 @@ def load(directory,device='cuda',*,intel_vision:str|None=None):
         config['intel_arc_openvino_eval']=False
     else:
         config['intel_arc_vision_offload']=False
+        config['intel_arc_openvino_eval']=False
     model=SparkNative(reload_paths(directory,config=config),config,device=device,pretrained=False)
     load_spark_native_safetensors(model,directory/'model.safetensors')
     model.eval()

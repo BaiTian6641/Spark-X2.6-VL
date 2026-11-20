@@ -655,6 +655,7 @@ def _export_stage75_releases(
 
     cfg = read(out_bf16_dir / "config.json")
     cfg["intel_arc_vision_offload"] = False
+    cfg["intel_arc_openvino_eval"] = False
     cfg["stage75_visual_alignment_and_v25_aesthetic"] = True
     cfg["blockbench_style_version"] = "v25"
     write(out_bf16_dir / "config.json", cfg)
