@@ -736,6 +736,18 @@ def load_spark_native_safetensors(
                 target.data.copy_(raw_t.to(dtype=target.dtype, device=target.device))
             loaded.add(key)
 
+    # Handle bidirectional safetensors tied-weight deduplication (`spark.lm_head.weight` <-> `spark.model.embedding.weight` / `embed_tokens.weight`)
+    embed_key = next((k for k in ('spark.model.embedding.weight', 'spark.model.embed_tokens.weight') if k in param_map), None)
+    if embed_key is not None and 'spark.lm_head.weight' in param_map:
+        if 'spark.lm_head.weight' in loaded and embed_key not in loaded:
+            if param_map[embed_key].data_ptr() != param_map['spark.lm_head.weight'].data_ptr():
+                param_map[embed_key].data.copy_(param_map['spark.lm_head.weight'].data)
+            loaded.add(embed_key)
+        elif embed_key in loaded and 'spark.lm_head.weight' not in loaded:
+            if param_map['spark.lm_head.weight'].data_ptr() != param_map[embed_key].data_ptr():
+                param_map['spark.lm_head.weight'].data.copy_(param_map[embed_key].data)
+            loaded.add('spark.lm_head.weight')
+
     expected_all = set(param_map.keys()) | {k for k in buf_map if k.endswith('tier1b_cold_weight')}
     missing = expected_all - loaded - {'spark.lm_head.weight'}
     if allow_missing_loop_engram:
