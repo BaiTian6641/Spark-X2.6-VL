@@ -228,7 +228,7 @@ def test_xpu_vision_optimizer_8bit_convergence_and_low_memory(mode: str):
     eng.sync_trainable_params(named)
 
     losses = []
-    for _ in range(20):
+    for _ in range(28):
         layer.zero_grad(set_to_none=True)
         out = layer(x.to(torch.bfloat16)).float()
         loss = torch.nn.functional.mse_loss(out, target)

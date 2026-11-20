@@ -119,14 +119,11 @@ def render_shaded_3d_with_spatial_annotations(
     sc = compile_geometry(program)
     bone_parent_map: dict[str, str | None] = {}
     bone_pivot_world: dict[str, np.ndarray] = {}
-    for b in getattr(program, "bones", ()):
-        bname = str(b.name)
-        bone_parent_map[bname] = str(b.parent) if getattr(b, "parent", None) else None
-    for bname, bf in (getattr(sc, "bone_frames", None) or {}).items():
-        if hasattr(bf, "translation"):
-            bone_pivot_world[str(bname)] = np.asarray(bf.translation, dtype=np.float64)
-        elif hasattr(bf, "origin"):
-            bone_pivot_world[str(bname)] = np.asarray(bf.origin, dtype=np.float64)
+    for wb in (getattr(sc, "bones", None) or ()):
+        bname = str(wb.name)
+        bone_parent_map[bname] = str(wb.parent_name) if getattr(wb, "parent_name", None) else None
+        if getattr(wb, "pivot_world", None) is not None:
+            bone_pivot_world[bname] = np.asarray(wb.pivot_world, dtype=np.float64)
 
     quads: list[tuple[np.ndarray, np.ndarray, bool]] = []
     bone_verts: dict[str, list[np.ndarray]] = {}
