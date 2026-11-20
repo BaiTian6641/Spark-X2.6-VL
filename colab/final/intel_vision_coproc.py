@@ -497,6 +497,8 @@ class XpuVisionOptimizerEngine:
         }
 
     def state_dict_cpu(self) -> dict[str, Any]:
+        if not self.optim_state:
+            return {}
         out: dict[str, Any] = {"mode": self.mode, "states": {}}
         for n, st in self.optim_state.items():
             ser: dict[str, Any] = {"kind": st.get("kind", "adamw"), "step": int(st["step"])}

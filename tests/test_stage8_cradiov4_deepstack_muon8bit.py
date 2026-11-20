@@ -154,6 +154,10 @@ class _DummyTokenizer:
     eos_token = "</s>"
     pad_token = "<pad>"
 
+    def apply_chat_template(self, messages, tokenize=False, **kwargs):
+        parts = [f"<{m['role']}>{m['content']}</{m['role']}>" for m in messages]
+        return "\n".join(parts)
+
     def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
         return [2 + (ord(c) % 50) for c in (text or "a")[:24]]
 
@@ -211,30 +215,31 @@ def test_int8_blockwise_and_newton_schulz5():
 @pytest.mark.parametrize("mode", ["muon8bit", "apollo8bit"])
 def test_xpu_vision_optimizer_8bit_convergence_and_low_memory(mode: str):
     torch.manual_seed(42)
-    layer = nn.Linear(128, 64, bias=True).to(dtype=torch.bfloat16)
-    target = torch.randn(16, 64)
-    x = torch.randn(16, 128)
+    # Shape (256, 256) exercises the actual 8-bit Muon / Apollo 2D matrix path (min_dim >= 128)!
+    layer = nn.Linear(256, 256, bias=True).to(dtype=torch.bfloat16)
+    target = torch.randn(16, 256)
+    x = torch.randn(16, 256)
 
     eng = XpuVisionOptimizerEngine(mode=mode, device=torch.device("cpu"), weight_decay=0.01)
     named = [(f"global.{n}", p) for n, p in layer.named_parameters()]
     eng.sync_trainable_params(named)
 
     losses = []
-    for _ in range(12):
+    for _ in range(15):
         layer.zero_grad(set_to_none=True)
         out = layer(x.to(torch.bfloat16)).float()
         loss = torch.nn.functional.mse_loss(out, target)
         losses.append(float(loss.item()))
         loss.backward()
         eng.accumulate_grads(named, mb_weight=1.0)
-        res = eng.step(named, lr=2e-2 if mode == "muon8bit" else 5e-2, max_grad_norm=1.0)
+        res = eng.step(named, lr=1.5e-2 if mode == "muon8bit" else 4e-2, max_grad_norm=1.0)
         assert res["finite"] and res["applied"]
 
     assert losses[-1] < losses[0] * 0.5, f"{mode} failed to converge: {losses}"
-    # Verify 8-bit optimizer state stays compact (well below FP32 AdamW's 8 B/param!)
+    # Verify 8-bit optimizer state stays ultra-compact (< 1.5 B/param vs FP32 AdamW's 12 B/param!)
     w_numel = layer.weight.numel()
     bytes_per_param = eng.optimizer_state_bytes() / float(w_numel)
-    assert bytes_per_param < 2.2, f"{mode} state too large: {bytes_per_param:.2f} B/param"
+    assert bytes_per_param < 1.5, f"{mode} state too large: {bytes_per_param:.2f} B/param"
 
 
 def test_radio_multilayer_swiglu_projector_rmsnorm_balances_variance():

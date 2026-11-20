@@ -551,7 +551,7 @@ def build_shaded_3d_spatial_primitives_records(
                     "answer": _wrap_think("\n".join(think_lines), ans_body),
                     "target": {"kind": "text", "text": ans_body},
                     "metadata": {
-                        "provenance": make_clean_room_provenance("spatial3d_kinematic_dash", asset_id=aid),
+                        "provenance": make_clean_room_provenance(aid, title=f"spatial3d_kinematic_dash:{aid}", license_spdx="CC0-1.0"),
                         "primitives": ["point", "box", "dash", "circle"],
                     },
                 }
@@ -601,7 +601,7 @@ def build_shaded_3d_spatial_primitives_records(
                         "answer": _wrap_think(think_fb, ans_fb),
                         "target": {"kind": "text", "text": ans_fb},
                         "metadata": {
-                            "provenance": make_clean_room_provenance("spatial3d_front_back", asset_id=aid),
+                            "provenance": make_clean_room_provenance(aid, title=f"spatial3d_front_back:{aid}", license_spdx="CC0-1.0"),
                             "front_bone": closer,
                             "back_bone": farther,
                         },
@@ -655,7 +655,7 @@ def build_shaded_3d_spatial_primitives_records(
                     "answer": _wrap_think(think_lr, ans_lr),
                     "target": {"kind": "text", "text": ans_lr},
                     "metadata": {
-                        "provenance": make_clean_room_provenance("spatial3d_left_right_orientation", asset_id=aid),
+                        "provenance": make_clean_room_provenance(aid, title=f"spatial3d_left_right_orientation:{aid}", license_spdx="CC0-1.0"),
                         "facing_lr": lr_dir,
                         "facing_fb": fb_dir,
                     },
@@ -736,7 +736,7 @@ def build_shaded_3d_spatial_primitives_records(
                     "answer": _wrap_think("\n".join(think_mv), ans_mv),
                     "target": {"kind": "text", "text": ans_mv},
                     "metadata": {
-                        "provenance": make_clean_room_provenance("spatial3d_multiview_correspondence", asset_id=aid),
+                        "provenance": make_clean_room_provenance(aid, title=f"spatial3d_multiview_correspondence:{aid}", license_spdx="CC0-1.0"),
                         "tracked_bone": best_b,
                     },
                 }
