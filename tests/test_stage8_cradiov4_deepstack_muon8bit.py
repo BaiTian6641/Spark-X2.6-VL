@@ -508,3 +508,30 @@ def test_stage8_dataset_quality_audit_catches_defects():
     rep_leak = audit_records([(leak_row, {"f.png": color_png})], check_distribution=False)
     assert not rep_leak["passed"]
     assert any(f["check"] == "benchmark_leakage" for f in rep_leak["failures"])
+
+
+def test_nemotron_multiturn_extracts_single_balanced_spatial_turn():
+    from colab.final.spatial_3d_primitives_corpus import _extract_qa_from_nemotron_row
+
+    row = {
+        "messages": [
+            {"role": "user", "content": [{"type": "image", "image": "CLEVR_train_000001.png"}, "What color is the matte object?"]},
+            {"role": "assistant", "content": ["<think>\nThere is a red block [100, 120, 240, 260].\n</think>\nRed."]},
+            {"role": "user", "content": ["Is it shiny?"]},  # anaphoric turn -> skipped!
+            {"role": "assistant", "content": ["<think>\nNo, matte.\n</think>\nNo."]},
+            {"role": "user", "content": ["Is the red cube to the left of the blue sphere?"]},
+            {
+                "role": "assistant",
+                "content": [
+                    "<think>\nRed cube [100, 120, 240, 260] is left of blue sphere [580, 140, 740, 300].\n</think>\nYes, it is to the left."
+                ],
+            },
+        ]
+    }
+    res = _extract_qa_from_nemotron_row(row)
+    assert res is not None
+    img_ref, prompt, ans = res
+    assert img_ref == "CLEVR_train_000001.png"
+    assert "left of the blue sphere" in prompt
+    assert ans.count("<think>") == 1 and ans.count("</think>") == 1
+    assert "<box " in ans and "<dash " in ans

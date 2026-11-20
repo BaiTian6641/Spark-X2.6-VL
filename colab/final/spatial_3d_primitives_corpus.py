@@ -1830,64 +1830,124 @@ def _validate_normalized_image_quality(jpg_bytes: bytes, *, min_side: int = 128,
 
 
 def _sanitize_nemotron_answer(answer: str) -> str | None:
-    """Ensure every Nemotron answer has balanced `<think>...</think>`, non-empty final answer, and healthy repetition."""
+    """Ensure every Nemotron answer has exactly one balanced `<think>...</think>`, non-empty final answer, and healthy repetition."""
     raw = str(answer or "").strip()
     if not raw:
         return None
-    has_open = "<think>" in raw
-    has_close = "</think>" in raw
-    if not has_open and not has_close:
+    n_open = raw.count("<think>")
+    n_close = raw.count("</think>")
+    if n_open == 0 and n_close == 0:
         # Clean direct answer -> wrap concisely so Stage-8 CoT format is uniform
         if len(raw) < 2:
             return None
         raw = _wrap_think("Inspecting the image carefully to verify the visual evidence before answering.", raw)
-    elif not (has_open and has_close and raw.find("<think>") < raw.find("</think>")):
+    elif not (n_open == 1 and n_close == 1 and raw.find("<think>") < raw.find("</think>")):
         return None
+    else:
+        open_idx = raw.find("<think>")
+        close_idx = raw.find("</think>")
+        think_body = raw[open_idx + len("<think>") : close_idx].strip()
+        final_body = raw[close_idx + len("</think>") :].strip()
+        if not think_body or not final_body:
+            return None
     health = check_generation_collapse_health(raw, expect_thinking=True, max_rep_4gram=0.145, max_think_chars=4400)
     return raw if health["healthy"] else None
 
 
+def _msg_text_and_image(content: Any) -> tuple[str, str]:
+    """Extract concatenated text and first image reference from a Nemotron message content field."""
+    img_ref = ""
+    parts: list[str] = []
+    if isinstance(content, str):
+        if content.strip():
+            parts.append(content.strip())
+    elif isinstance(content, list):
+        for part in content:
+            if isinstance(part, str):
+                if part.strip():
+                    parts.append(part.strip())
+            elif isinstance(part, dict):
+                if part.get("image") and not img_ref:
+                    img_ref = str(part["image"])
+                if part.get("text") and str(part["text"]).strip():
+                    parts.append(str(part["text"]).strip())
+    return "\n".join(parts).strip(), img_ref
+
+
+_NEMOTRON_SPATIAL_TURN_KWS: tuple[str, ...] = (
+    "left",
+    "right",
+    "behind",
+    "front",
+    "closer",
+    "farther",
+    "between",
+    "above",
+    "below",
+    "next to",
+    "facing",
+    "side",
+    "sphere",
+    "cube",
+    "cylinder",
+    "angle",
+)
+
+
 def _extract_qa_from_nemotron_row(obj: dict[str, Any]) -> tuple[str, str, str] | None:
+    """Extract the highest-value single `(img_ref, prompt, clean_answer)` turn from a 1-turn or multi-turn Nemotron row.
+
+    Multi-turn datasets like `clevr_1` and `gqa_1` store several `(user, assistant)` pairs per image.
+    Selecting a single self-contained turn (preferring explicit spatial queries) preserves exact single-`<think>`
+    grammar and prevents runaway sequence length.
+    """
     msgs = obj.get("messages") or []
     img_ref = ""
-    user_txt_parts: list[str] = []
-    asst_txt_parts: list[str] = []
+    turns: list[tuple[str, str]] = []
+    pending_user: str | None = None
     for m in msgs:
         role = m.get("role", "")
-        content = m.get("content")
-        if isinstance(content, str):
-            if role == "user":
-                user_txt_parts.append(content)
-            elif role == "assistant":
-                asst_txt_parts.append(content)
-        elif isinstance(content, list):
-            for part in content:
-                if isinstance(part, str):
-                    if role == "user":
-                        user_txt_parts.append(part)
-                    elif role == "assistant":
-                        asst_txt_parts.append(part)
-                elif isinstance(part, dict):
-                    if part.get("image") and not img_ref:
-                        img_ref = str(part["image"])
-                    if part.get("text"):
-                        if role == "user":
-                            user_txt_parts.append(str(part["text"]))
-                        elif role == "assistant":
-                            asst_txt_parts.append(str(part["text"]))
-    prompt = "\n".join(p.strip() for p in user_txt_parts if p.strip()).strip()
-    answer = "\n".join(p.strip() for p in asst_txt_parts if p.strip()).strip()
-    if not img_ref or not prompt or not answer:
+        txt, m_img = _msg_text_and_image(m.get("content"))
+        if m_img and not img_ref:
+            img_ref = m_img
+        if role == "user":
+            if txt:
+                pending_user = txt
+        elif role == "assistant":
+            if pending_user and txt:
+                turns.append((pending_user, txt))
+            pending_user = None
+
+    if not img_ref or not turns or _has_banned_benchmark_name(img_ref):
         return None
-    if _has_banned_benchmark_name(prompt) or _has_banned_benchmark_name(img_ref):
+
+    best_spatial: tuple[str, str] | None = None
+    best_fallback: tuple[str, str] | None = None
+    for t_idx, (pr, raw_ans) in enumerate(turns):
+        if _has_banned_benchmark_name(pr):
+            continue
+        if len(pr) > 2000:
+            continue
+        # Guard against anaphoric follow-up turns ("it", "that one") when selecting turns > 0
+        p_low = pr.lower()
+        if t_idx > 0 and re.search(r"\b(it|its|they|them|that one|those ones)\b", p_low):
+            continue
+        converted = _convert_nemotron_boxes_to_primitives(raw_ans)
+        clean_ans = _sanitize_nemotron_answer(converted)
+        if clean_ans is None:
+            continue
+        if len(clean_ans) > 4600 or (len(pr) + len(clean_ans)) > 6800:
+            continue
+        if any(kw in p_low for kw in _NEMOTRON_SPATIAL_TURN_KWS):
+            best_spatial = (pr, clean_ans)
+            break
+        if best_fallback is None:
+            best_fallback = (pr, clean_ans)
+
+    chosen = best_spatial or best_fallback
+    if chosen is None:
         return None
-    converted = _convert_nemotron_boxes_to_primitives(answer)
-    clean_ans = _sanitize_nemotron_answer(converted)
-    if clean_ans is None:
-        return None
-    if len(prompt) > 2000 or len(clean_ans) > 4600 or (len(prompt) + len(clean_ans)) > 6800:
-        return None
-    return img_ref, prompt, clean_ans
+    return img_ref, chosen[0], chosen[1]
 
 
 def _load_nemotron_embedded_tar_subset(
