@@ -736,18 +736,14 @@ def load_spark_native_safetensors(
                 target.data.copy_(raw_t.to(dtype=target.dtype, device=target.device))
             loaded.add(key)
 
+    expected_all = set(param_map.keys()) | {k for k in buf_map if k.endswith('tier1b_cold_weight')}
+    missing = expected_all - loaded - {'spark.lm_head.weight'}
+    if allow_missing_loop_engram:
+        missing = {k for k in missing if not k.startswith(('loop_controllers.', 'engram_anchors.'))}
     if allow_missing_vision_swap:
-        missing_non_vis = {
-            k for k in param_map.keys()
-            if k not in loaded
-            and k != 'spark.lm_head.weight'
-            and not k.startswith(('vision.', 'vision_projector.'))
-            and not (allow_missing_loop_engram and k.startswith(('loop_controllers.', 'engram_anchors.')))
-        }
-        if missing_non_vis:
-            raise RuntimeError(
-                f'Missing non-vision parameters during vision-swap warm-start: {sorted(missing_non_vis)[:8]}'
-            )
+        missing = {k for k in missing if not k.startswith(('vision.', 'vision_projector.'))}
+    if missing:
+        raise RuntimeError(f'Missing parameters when loading SparkNative safetensors: {sorted(missing)[:8]}')
 
     if hasattr(getattr(model, 'spark', None), 'tie_weights'):
         model.spark.tie_weights()
@@ -797,12 +793,6 @@ class RadioMultiLayerSwiGLUProjector(nn.Module):
         mid_shuffled, _ = spatial_downshuffle(normed[0], hh, ww)
         early_tokens = main_tokens + self.early_mid_gate.to(dtype) * self.early_mid_proj(mid_shuffled)
         return main_tokens, early_tokens
-    expected_all = set(param_map.keys()) | {k for k in buf_map if k.endswith('tier1b_cold_weight')}
-    missing = expected_all - loaded - {'spark.lm_head.weight'}
-    if allow_missing_loop_engram:
-        missing = {k for k in missing if not k.startswith(('loop_controllers.', 'engram_anchors.'))}
-    if missing:
-        raise RuntimeError(f'Missing parameters when loading SparkNative safetensors: {sorted(missing)[:8]}')
 
 
 class SparkNative(nn.Module):
