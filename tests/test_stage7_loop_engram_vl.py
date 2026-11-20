@@ -506,3 +506,104 @@ def test_chunked_linear_cross_entropy_exact_grads_and_pinned_stage() -> None:
         acc.close()
 
 
+def test_aesthetic_v25_masterworks_all_strict_pass_and_locate_grid() -> None:
+    from colab.final.aesthetic_v25_vigorous_corpus import (
+        AESTHETIC_V25_TASKS,
+        build_aesthetic_v25_vigorous_records,
+        build_all_v25_verified_masterworks,
+    )
+
+    mws = build_all_v25_verified_masterworks()
+    assert len(mws) == 8
+    domains = {m["domain"] for m in mws}
+    moods = {m["mood"] for m in mws}
+    assert domains == {"D1", "D2", "D3", "D4"}
+    assert {"M1", "M3", "M4"}.issubset(moods)
+    for m in mws:
+        rep = m["verification"]
+        assert rep["audit_passed"] is True, f"{m['asset_id']} audit failed"
+        assert rep["g1_g12"]["passed_strict"] is True, f"{m['asset_id']} G1-G12: {rep['g1_g12']}"
+        assert rep["grounding"]["rest_ok"] is True, f"{m['asset_id']} 4-foot grounding: {rep['grounding']}"
+        assert rep["clips_ok"] is True, f"{m['asset_id']} clips: {rep['clip_audits']}"
+        assert rep["passed_all"] is True
+
+    recs = build_aesthetic_v25_vigorous_records(seed=20261120, max_records=64, panel_size=(128, 128), grid_size=(192, 192))
+    assert len(recs) == 58
+    seen_tasks = {r["task"] for r in recs}
+    assert seen_tasks == set(AESTHETIC_V25_TASKS)
+    loc_recs = [r for r in recs if r["task"] == "v25_two_pass_locate_then_zoom"]
+    assert len(loc_recs) == 18
+    # Verify jittered camera coordinates genuinely vary (impossible to guess from text prior!)
+    xs = {r["metadata"]["eye_point_1000"][0] for r in loc_recs}
+    ys = {r["metadata"]["eye_point_1000"][1] for r in loc_recs}
+    assert len(xs) >= 12 and len(ys) >= 12
+
+
+def test_stage75_frozen_backbone_partition_and_data_selection(tmp_path) -> None:
+    import sqlite3
+    from scripts.run_stage75_visual_alignment_and_aesthetic_polish import (
+        partition_stage75_trainable_parameters,
+        select_stage75a_pixel_indispensable_rids,
+        select_stage75b_balanced_rids,
+    )
+
+    # 1. Verify frozen_spark_cross_attn freezes 100% of Spark + Loop + En1B while leaving connectors & cross-attn trainable
+    class _DummyStage75Model(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.spark = torch.nn.Linear(16, 16)
+            self.loop_controllers = torch.nn.Linear(16, 16)
+            self.engram_anchors = torch.nn.Linear(16, 16)
+            self.vision = torch.nn.Linear(16, 16)
+            self.vision_projector = torch.nn.Linear(16, 16)
+            self.visual_cross_attn = torch.nn.Linear(16, 16)
+
+        def named_groups(self):
+            for name, p in self.named_parameters():
+                if name.startswith("spark."):
+                    grp = "spark"
+                elif name.startswith(("loop_controllers.", "engram_anchors.")):
+                    grp = "engram_mhc"
+                elif name.startswith("vision."):
+                    grp = "vision"
+                else:
+                    grp = "connectors"
+                yield grp, name, p
+
+    dummy = _DummyStage75Model()
+    for mod in (dummy.spark, dummy.loop_controllers, dummy.engram_anchors, dummy.vision):
+        mod.requires_grad_(False)
+    part = partition_stage75_trainable_parameters(dummy)
+    assert part.get("spark:trainable", 0) == 0
+    assert part.get("engram_mhc:trainable", 0) == 0
+    assert part["connectors:trainable"] == sum(p.numel() for p in dummy.vision_projector.parameters()) + sum(
+        p.numel() for p in dummy.visual_cross_attn.parameters()
+    )
+
+    # 2. Verify Stage-7.5A selects strictly visual rows (0 text-only rows) while 7.5B balances visual + text replay
+    db = tmp_path / "corpus.sqlite"
+    con = sqlite3.connect(str(db))
+    con.execute("CREATE TABLE rows (rid TEXT, split TEXT, family TEXT, language TEXT, task TEXT)")
+    rows = [
+        ("img_ocr_1", "train", "image", "en", "ocr_vqa"),
+        ("img_chart_1", "train", "image", "en", "chartqa"),
+        ("img_pt_1", "train", "image", "en", "visual_primitives_point_count"),
+        ("vid_1", "train", "video", "en", "video_tracking"),
+        ("txt_code_1", "train", "text", "en", "swe_bench_pro"),
+        ("txt_math_1", "train", "text", "en", "supergpqa"),
+    ]
+    con.executemany("INSERT INTO rows VALUES (?, ?, ?, ?, ?)", rows)
+    con.commit()
+    con.close()
+
+    rids_a, _ = select_stage75a_pixel_indispensable_rids(db, target_catalogue_samples=20, seed=1)
+    assert len(rids_a) == 20
+    assert all(not r.startswith("txt_") for r in rids_a)
+
+    rids_b, _ = select_stage75b_balanced_rids(db, target_catalogue_samples=20, vision_fraction=0.5, seed=2)
+    assert len(rids_b) == 20
+    assert sum(1 for r in rids_b if r.startswith("txt_")) == 10
+    assert sum(1 for r in rids_b if not r.startswith("txt_")) == 10
+
+
+
