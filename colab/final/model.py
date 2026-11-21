@@ -638,12 +638,22 @@ def export_spark_native_fp8_safetensors(model: nn.Module, path: str | Path) -> d
     return {'quantized_linear_tensors': quantized_count, 'residual_format': 'q4g128', 'bytes': dest.stat().st_size}
 
 
+_PROJECTOR_RMS_MATCH_KEYS = frozenset({
+    'vision_projector.out_norm.weight',
+    'vision_projector.out_scale',
+    'vision_projector.early_out_norm.weight',
+    'vision_projector.early_out_scale',
+    'vision_projector.meta_scale',
+})
+
+
 def load_spark_native_safetensors(
     model: nn.Module,
     path: str | Path,
     *,
     allow_missing_loop_engram: bool = False,
     allow_missing_vision_swap: bool = False,
+    allow_missing_projector_out_norm: bool = False,
 ) -> None:
     """Load standard BF16 `model.safetensors` or channelwise `F8_E4M3` (+ optional `q4g128` sub-LSB residual) `model.safetensors`."""
     sf_path = Path(path)
@@ -661,13 +671,15 @@ def load_spark_native_safetensors(
             )
             if not has_fp8 and not allow_missing_vision_swap:
                 has_tie = hasattr(getattr(model, 'spark', None), 'tie_weights')
-                strict = (not has_tie) and (not allow_missing_loop_engram)
+                strict = (not has_tie) and (not allow_missing_loop_engram) and (not allow_missing_projector_out_norm)
                 missing_sf, unexpected_sf = load_model(model, str(sf_path), strict=strict, device='cpu')
                 if has_tie:
                     model.spark.tie_weights()
                 missing = set(missing_sf) - {'spark.lm_head.weight'}
                 if allow_missing_loop_engram:
                     missing = {k for k in missing if not k.startswith(('loop_controllers.', 'engram_anchors.'))}
+                if allow_missing_projector_out_norm:
+                    missing = {k for k in missing if k not in _PROJECTOR_RMS_MATCH_KEYS}
                 if missing:
                     raise RuntimeError(f'Missing parameters when loading SparkNative safetensors: {sorted(missing)[:8]}')
                 if unexpected_sf:
@@ -754,6 +766,8 @@ def load_spark_native_safetensors(
         missing = {k for k in missing if not k.startswith(('loop_controllers.', 'engram_anchors.'))}
     if allow_missing_vision_swap:
         missing = {k for k in missing if not k.startswith(('vision.', 'vision_projector.'))}
+    if allow_missing_projector_out_norm:
+        missing = {k for k in missing if k not in _PROJECTOR_RMS_MATCH_KEYS}
     if missing:
         raise RuntimeError(f'Missing parameters when loading SparkNative safetensors: {sorted(missing)[:8]}')
 
@@ -768,7 +782,12 @@ def load_spark_native_safetensors(
 class RadioMultiLayerSwiGLUProjector(nn.Module):
     """Unified multi-layer C-RADIOv4 projector: independent RMSNorm per tapped layer (`L24`, `L32`) ->
     channel concat (`2560`-dim) -> `2x2` pixel shuffle (`10240`-dim) -> SwiGLU MLP -> LLM hidden dim,
-    plus an early-layer DeepStack `L24` residual projection for Spark's early `visual_cross_attn`."""
+    plus an early-layer DeepStack `L24` residual projection for Spark's early `visual_cross_attn`.
+
+    When `output_rms_match=True` (Stage-10+), applies learnable-scale exit `RMSNorm` (`out_scale_init=0.035`)
+    and normalized metadata scaling (`meta_scale_init=0.008`) so visual tokens enter Spark Layer 0 matched
+    to `Spark-X2.6-4B`'s native text embedding RMS (`~0.025-0.030`) instead of swamping the 48-layer residual stream.
+    """
 
     def __init__(
         self,
@@ -778,11 +797,15 @@ class RadioMultiLayerSwiGLUProjector(nn.Module):
         num_taps: int = 2,
         intermediate_size: int | None = None,
         early_mid_gate_init: float = 0.35,
+        output_rms_match: bool = False,
+        out_scale_init: float = 0.035,
+        meta_scale_init: float = 0.008,
     ) -> None:
         super().__init__()
         self.vis_dim = int(vis_dim)
         self.num_taps = max(1, int(num_taps))
         self.hidden_size = int(hidden_size)
+        self.output_rms_match = bool(output_rms_match)
         self.layer_norms = nn.ModuleList([nn.RMSNorm(self.vis_dim, eps=1e-6) for _ in range(self.num_taps)])
         in_dim = self.vis_dim * self.num_taps * 4
         inter = int(intermediate_size) if intermediate_size is not None else int(hidden_size)
@@ -791,6 +814,12 @@ class RadioMultiLayerSwiGLUProjector(nn.Module):
         self.w_down = nn.Linear(inter, self.hidden_size)
         self.early_mid_proj = nn.Linear(self.vis_dim * 4, self.hidden_size)
         self.early_mid_gate = nn.Parameter(torch.tensor(float(early_mid_gate_init)))
+        if self.output_rms_match:
+            self.out_norm = nn.RMSNorm(self.hidden_size, eps=1e-6)
+            self.out_scale = nn.Parameter(torch.tensor(float(out_scale_init)))
+            self.early_out_norm = nn.RMSNorm(self.hidden_size, eps=1e-6)
+            self.early_out_scale = nn.Parameter(torch.tensor(float(out_scale_init)))
+            self.meta_scale = nn.Parameter(torch.tensor(float(meta_scale_init)))
 
     def forward(self, stacked_feats: torch.Tensor, hh: int, ww: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Project `(B, K, N, D)` tapped spatial features into `(main_tokens, early_deepstack_tokens)`."""
@@ -801,10 +830,14 @@ class RadioMultiLayerSwiGLUProjector(nn.Module):
         normed = [self.layer_norms[i](stacked_feats[:, i].to(dtype)) for i in range(self.num_taps)]
         fused_cat = torch.cat(normed, dim=-1)  # (B, N, K * D)
         shuffled, _ = spatial_downshuffle(fused_cat, hh, ww)  # (B, N/4, K * D * 4)
-        main_tokens = self.w_down(F.silu(self.w_gate(shuffled)) * self.w_up(shuffled))
+        main_raw = self.w_down(F.silu(self.w_gate(shuffled)) * self.w_up(shuffled))
         mid_shuffled, _ = spatial_downshuffle(normed[0], hh, ww)
-        early_tokens = main_tokens + self.early_mid_gate.to(dtype) * self.early_mid_proj(mid_shuffled)
-        return main_tokens, early_tokens
+        early_raw = main_raw + self.early_mid_gate.to(dtype) * self.early_mid_proj(mid_shuffled)
+        if self.output_rms_match:
+            main_tokens = self.out_scale.to(dtype) * self.out_norm(main_raw)
+            early_tokens = self.early_out_scale.to(dtype) * self.early_out_norm(early_raw)
+            return main_tokens, early_tokens
+        return main_raw, early_raw
 
 
 class SparkNative(nn.Module):
@@ -899,6 +932,9 @@ class SparkNative(nn.Module):
                 num_taps=len(self._radio_layer_indices),
                 intermediate_size=int(policy.get('radio_projector_intermediate_size', h)),
                 early_mid_gate_init=float(policy.get('radio_early_mid_gate_init', 0.35)),
+                output_rms_match=bool(policy.get('radio_output_rms_match', False)),
+                out_scale_init=float(policy.get('radio_out_scale_init', 0.035)),
+                meta_scale_init=float(policy.get('radio_meta_scale_init', 0.008)),
             )
         else:
             self.vision_projector=nn.Sequential(nn.LayerNorm(self.vision.config.hidden_size*4),nn.Linear(self.vision.config.hidden_size*4,h),nn.GELU(),nn.Linear(h,h))
@@ -979,6 +1015,9 @@ class SparkNative(nn.Module):
                     ),
                     allow_missing_vision_swap=bool(
                         policy.get('allow_warmstart_vision_swap', self.vision_backbone_type == 'c_radio_v4')
+                    ),
+                    allow_missing_projector_out_norm=bool(
+                        policy.get('allow_warmstart_projector_rms_match', False)
                     ),
                 )
                 self._warm_started_from = str(init_sf)
@@ -2120,10 +2159,16 @@ class SparkNative(nn.Module):
                     + self.view_id_embedding.weight[vid_idx].to(proj_dtype)
                     + self.modality.weight[0].to(proj_dtype)
                 )
-                token_out = self.visual_token_drop(tokens + meta_add)
+                if getattr(self.vision_projector, 'output_rms_match', False):
+                    m_f32 = meta_add.float()
+                    m_rms = m_f32.pow(2).mean(dim=-1, keepdim=True).add(1e-6).sqrt()
+                    meta_eff = (m_f32 / m_rms).to(proj_dtype) * self.vision_projector.meta_scale.to(proj_dtype)
+                else:
+                    meta_eff = meta_add
+                token_out = self.visual_token_drop(tokens + meta_eff)
                 outputs[index] = token_out.to(self.embed_dtype)
                 if early_outputs is not None and early_tokens is not None:
-                    early_outputs[index] = self.visual_token_drop(early_tokens + meta_add).to(self.embed_dtype)
+                    early_outputs[index] = self.visual_token_drop(early_tokens + meta_eff).to(self.embed_dtype)
 
         if early_outputs is not None and all(e is not None for e in early_outputs):
             self._last_early_visual_context = torch.cat(early_outputs, dim=1)

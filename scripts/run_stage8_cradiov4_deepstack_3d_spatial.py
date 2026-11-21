@@ -114,7 +114,10 @@ def _extract_stage8_gate_stats(model: Any) -> dict[str, Any]:
     gates: dict[str, float] = {}
     proj_norms: dict[str, float] = {}
     for name, p in model.named_parameters():
-        if "gate_attn" in name or "gate_ffn" in name or "early_mid_gate" in name:
+        if any(
+            k in name
+            for k in ("gate_attn", "gate_ffn", "early_mid_gate", "out_scale", "early_out_scale", "meta_scale")
+        ):
             gates[name] = round(float(p.detach().float().mean().item()), 6)
         elif name.startswith("vision_projector.") and p.ndim == 2:
             proj_norms[name] = round(float(p.detach().float().norm().item()), 4)

@@ -907,40 +907,83 @@ def eval_v28_sculpted_and_gate_d(model: Any, export_dir: Path) -> dict[str, Any]
 
     gate_d_rep = evaluate_gate_d_proposer(holdout_prop, _proposer_fn)
 
-    # 2. Unseen v28 D3/D4/D5 (Pole A + Pole B + Mechanical) Generation + Full-Textured Audit
+    # 2. Unseen v28 D3/D4/D5 (Pole A + Pole B + Mechanical) Generation + 1-Turn Compiler-Feedback Repair + Full-Textured Audit
     v28_results: list[dict[str, Any]] = []
+    one_shot_compiled = 0
+    one_shot_strict = 0
     compiled_ok = 0
     strict_pass = 0
+    total_repair_tokens = 0
     for item in UNSEEN_V28_PROMPTS:
         aid = item["id"]
         best_dsl = ""
-        best_ver: dict[str, Any] = {"passed": False}
+        best_ver: dict[str, Any] = {"passed_all": False}
+        last_cand = ""
+        last_err = ""
+        item_one_shot_compiled = False
+        item_one_shot_strict = False
         for attempt in range(2):
+            if attempt == 0:
+                cur_prompt = item["prompt"]
+            else:
+                # Deterministic SyncCraft parser/compiler feedback ONLY (zero ground truth!)
+                cur_prompt = (
+                    f"[SyncCraft Block-DSL v4.1 Compiler Repair]\n"
+                    f"Your previous Block-DSL v4.1 draft failed SyncCraft verification with:\n"
+                    f"  Error: {last_err or 'no valid @rig block emitted'}\n\n"
+                    f"Previous draft:\n```blockdsl\n{last_cand[:4200]}\n```\n\n"
+                    f"Original brief:\n{item['prompt']}\n\n"
+                    "Diagnose the exact Block-DSL v4.1 grammar/structural violation inside `<think>...</think>` "
+                    "(use valid `@meta` keys `texel_density`/`units_per_block`, `root bone <name>`, valid `box` keys only) "
+                    "and output ONLY the repaired, compilable ```blockdsl ... ``` program."
+                )
             out = _gen(
                 model,
-                item["prompt"],
+                cur_prompt,
                 max_new_tokens=1600,
                 do_sample=(attempt > 0),
-                temperature=0.50,
+                temperature=0.45,
             )
+            if attempt > 0:
+                total_repair_tokens += max(1, len(out) // 4)
             _, bd = strip_think_block(out)
             cand = _extract_dsl_candidate(bd)
             if not cand:
+                last_err = "no ```blockdsl``` @rig block extracted"
                 continue
+            last_cand = cand
             try:
                 ver = verify_v25_dsl_asset(cand, tier=str(item.get("tier") or "auto"))
                 best_dsl = cand
                 best_ver = ver
+                if attempt == 0:
+                    item_one_shot_compiled = True
+                    item_one_shot_strict = bool(ver.get("passed_all"))
                 if ver.get("passed_all"):
                     break
+                failed = [
+                    k
+                    for k, v in (ver.get("construct_check") or {}).items()
+                    if isinstance(v, dict) and v.get("passed") is False
+                ]
+                last_err = f"compiled but missed v28 gates: {failed}"
             except Exception as exc:
-                best_ver = {"passed_all": False, "error": str(exc)[:240]}
+                last_err = str(exc)[:240]
+                if not best_dsl:
+                    best_ver = {"passed_all": False, "error": last_err}
+
+        if item_one_shot_compiled:
+            one_shot_compiled += 1
+        if item_one_shot_strict:
+            one_shot_strict += 1
 
         entry: dict[str, Any] = {
             "id": aid,
             "domain": item["domain"],
             "mood": item["mood"],
             "polarity": item["polarity"],
+            "one_shot_compiled": item_one_shot_compiled,
+            "one_shot_passed": item_one_shot_strict,
             "passed": bool(best_ver.get("passed_all")),
             "summary": {k: v for k, v in best_ver.items() if k != "bbmodel"},
             "exported_files": [],
@@ -971,8 +1014,11 @@ def eval_v28_sculpted_and_gate_d(model: Any, export_dir: Path) -> dict[str, Any]
         "benchmark": "Blockbench_sculpted_style-v28 + SyncCraft ba969f3 Gate D",
         "gate_d_proposer": gate_d_rep,
         "v28_evaluated": len(UNSEEN_V28_PROMPTS),
+        "v28_one_shot_compile_rate": round(one_shot_compiled / n_v28, 4),
+        "v28_one_shot_strict_pass_rate": round(one_shot_strict / n_v28, 4),
         "v28_compile_rate": round(compiled_ok / n_v28, 4),
         "v28_strict_pass_rate": round(strict_pass / n_v28, 4),
+        "v28_repair_tokens_used": total_repair_tokens,
         "v28_assets": v28_results,
         "elapsed_s": round(time.monotonic() - t0, 2),
     }

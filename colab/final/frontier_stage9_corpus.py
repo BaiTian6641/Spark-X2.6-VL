@@ -890,8 +890,10 @@ def build_synthetic_scene_ocr_pairs(
     *,
     seed: int = 20261141,
     max_items: int = 240,
+    include_charts_and_tables: bool = False,
 ) -> list[tuple[dict[str, Any], dict[str, bytes]]]:
-    """Generate clean, full-color, multi-font synthetic Scene-Text, KIE Receipt, Doc-Line, and Math-Formula OCR pairs
+    """Generate clean, full-color, multi-font synthetic Scene-Text, KIE Receipt, Doc-Line, Math-Formula,
+    and (when `include_charts_and_tables=True`) Colored Bar-Chart & Dense Table VQA OCR pairs
     (`enable_thinking=False`, zero OCRBench overlap, guaranteed color contrast chroma > 12)."""
     import io
     from PIL import Image, ImageDraw, ImageFont
@@ -931,6 +933,15 @@ def build_synthetic_scene_ocr_pairs(
         "int_0^1 x^2 dx = 1/3",
         "det(A) = ad - bc",
     )
+    regions = ("Nordic", "Alpine", "Coastal", "Delta", "Highland", "Steppe", "Basin", "Mesa")
+    legend_names = ("Solar Output", "Wind Share", "Hydro Flow", "Grid Reserve", "Thermal Load", "Transit Share")
+    bar_colors = (
+        ("blue", (48, 118, 212)),
+        ("orange", (224, 118, 36)),
+        ("green", (46, 158, 92)),
+        ("red", (206, 56, 62)),
+        ("purple", (134, 72, 186)),
+    )
     bg_palettes = (
         ((32, 68, 118), (248, 246, 232), (218, 174, 56)),   # navy sign + cream text + gold border
         ((156, 38, 34), (252, 250, 244), (240, 210, 120)),  # crimson sign + warm white
@@ -940,12 +951,18 @@ def build_synthetic_scene_ocr_pairs(
         ((58, 44, 78), (250, 242, 224), (210, 148, 86)),    # twilight storefront
     )
 
+    n_modes = 6 if include_charts_and_tables else 4
     pairs: list[tuple[dict[str, Any], dict[str, bytes]]] = []
     for i in range(max_items):
-        mode = i % 4  # 0=scene sign, 1=receipt KIE, 2=multi-line doc snippet, 3=math formula
+        mode = i % n_modes
         bg, fg, accent = bg_palettes[rng.randrange(len(bg_palettes))]
-        w = rng.choice((448, 512, 576))
-        h = rng.choice((320, 384, 448))
+        w = rng.choice((576, 640, 768)) if mode >= 4 else rng.choice((448, 512, 576))
+        h = rng.choice((448, 512)) if mode >= 4 else rng.choice((320, 384, 448))
+        if mode >= 4:
+            # High-contrast light colored paper for charts/tables (guaranteed RGB chroma > 14!)
+            bg = rng.choice(((238, 244, 252), (248, 242, 224), (234, 248, 238)))
+            fg = (22, 32, 48)
+            accent = (48, 110, 188)
         im = Image.new("RGB", (w, h), bg)
         draw = ImageDraw.Draw(im)
         # Add subtle colored decorative bands / frames so image has realistic scene context & non-flat RGB chroma
@@ -1007,7 +1024,7 @@ def build_synthetic_scene_ocr_pairs(
                 prompt = "What are the opening Hours listed on this notice?\nRead the text/formula carefully from the image and answer directly and concisely."
                 ans = hr
             subtask = "doc_vqa_notice"
-        else:
+        elif mode == 3:
             expr = rng.choice(formulas)
             f_m = _font(rng.randint(30, 44))
             draw.text((36, 62), "Formula:", fill=accent, font=_font(24))
@@ -1015,6 +1032,75 @@ def build_synthetic_scene_ocr_pairs(
             prompt = "Transcribe the exact mathematical expression shown in this image.\nRead the text/formula carefully from the image and answer directly and concisely."
             ans = expr
             subtask = "formula_ocr"
+        elif mode == 4:
+            # Colored bar chart with legend & exact numeric value labels (matches Doc/Chart VQA!)
+            cats = rng.sample(regions, 4)
+            vals = [round(rng.uniform(8.0, 94.0), 1) for _ in cats]
+            leg_pair = rng.sample(list(zip(bar_colors, legend_names)), 2)
+            (c1_name, c1_rgb), l1_txt = leg_pair[0]
+            (c2_name, c2_rgb), l2_txt = leg_pair[1]
+            f_t = _font(22)
+            f_s = _font(17)
+            draw.text((30, 46), f"Regional Index ({rng.randint(2020, 2026)})", fill=fg, font=f_t)
+            # Draw legend
+            draw.rectangle([w - 230, 46, w - 210, 64], fill=c1_rgb)
+            draw.text((w - 202, 45), l1_txt, fill=fg, font=f_s)
+            draw.rectangle([w - 230, 72, w - 210, 90], fill=c2_rgb)
+            draw.text((w - 202, 71), l2_txt, fill=fg, font=f_s)
+            base_y = h - 72
+            top_y = 120
+            draw.line([(56, top_y), (56, base_y), (w - 36, base_y)], fill=fg, width=2)
+            slot_w = (w - 110) // len(cats)
+            for idx_c, (cat_nm, val) in enumerate(zip(cats, vals)):
+                x0 = 72 + idx_c * slot_w
+                bar_h = max(16, int((val / 100.0) * (base_y - top_y - 20)))
+                col_rgb = c1_rgb if idx_c % 2 == 0 else c2_rgb
+                draw.rectangle([x0, base_y - bar_h, x0 + slot_w - 26, base_y], fill=col_rgb, outline=fg, width=2)
+                draw.text((x0 + 4, base_y - bar_h - 24), f"{val:.1f}", fill=fg, font=f_s)
+                draw.text((x0 + 2, base_y + 10), cat_nm, fill=fg, font=f_s)
+            ask_m = i % 3
+            if ask_m == 0:
+                pick_idx = rng.randrange(len(cats))
+                prompt = f"What is the numeric value for {cats[pick_idx]} in this chart?\nRead the text/formula carefully from the image and answer directly and concisely."
+                ans = f"{vals[pick_idx]:.1f}"
+            elif ask_m == 1:
+                best_idx = max(range(len(vals)), key=lambda j: vals[j])
+                prompt = "Which region has the highest bar value in this chart?\nRead the text/formula carefully from the image and answer directly and concisely."
+                ans = cats[best_idx]
+            else:
+                prompt = f"According to the legend, what does the {c1_name} color represent?\nRead the text/formula carefully from the image and answer directly and concisely."
+                ans = l1_txt
+            subtask = "bar_chart_vqa"
+        else:
+            # Multi-column structured table lookup (exact row x column reading!)
+            cols = ("Region", "Year", "Output", "Rate")
+            picked_regs = rng.sample(regions, 4)
+            rows_data = [
+                (reg, str(2022 + r_idx), f"{rng.randint(120, 980)} MW", f"{round(rng.uniform(1.2, 18.9), 2)}%")
+                for r_idx, reg in enumerate(picked_regs)
+            ]
+            f_hdr = _font(21)
+            f_cel = _font(19)
+            draw.text((34, 48), "Quarterly Operations Table", fill=fg, font=_font(24))
+            col_xs = [34, 180, 290, 430]
+            y_hdr = 94
+            draw.rectangle([28, y_hdr - 6, w - 28, y_hdr + 30], fill=accent)
+            for cx, cn in zip(col_xs, cols):
+                draw.text((cx, y_hdr), cn, fill=(252, 252, 252), font=f_hdr)
+            for r_idx, rvals in enumerate(rows_data):
+                ry = y_hdr + 42 + r_idx * 48
+                if r_idx % 2 == 1:
+                    draw.rectangle([28, ry - 6, w - 28, ry + 32], fill=(220, 232, 246))
+                for cx, cell in zip(col_xs, rvals):
+                    draw.text((cx, ry), cell, fill=fg, font=f_cel)
+            pick_r = rng.randrange(len(rows_data))
+            pick_c = rng.choice((2, 3))
+            prompt = (
+                f"In the table, what is the {cols[pick_c]} for {rows_data[pick_r][0]}?\n"
+                "Read the text/formula carefully from the image and answer directly and concisely."
+            )
+            ans = rows_data[pick_r][pick_c]
+            subtask = "dense_table_vqa"
 
         buf = io.BytesIO()
         im.save(buf, format="PNG")
@@ -1040,3 +1126,189 @@ def build_synthetic_scene_ocr_pairs(
         pairs.append((rec, {mem: buf.getvalue()}))
     emit("stage9_synthetic_ocr_pairs_ready", count=len(pairs))
     return pairs
+
+
+def build_v28_grammar_repair_records(
+    v28_records: list[dict[str, Any]],
+    *,
+    seed: int = 20261150,
+    max_items: int = 96,
+) -> list[dict[str, Any]]:
+    """Build solver-verified Block-DSL v4.1 Grammar-Error Contrastive Self-Repair records from verified `v28` assets.
+
+    Injects the exact real-world schema/syntax mistakes observed on unseen `v28` generation (`texel_size` vs
+    `texel_density`, `root_limb_place` vs `root bone`, illegal `axis:` inside `box {}`, illegal `and` in `bone`
+    headers, invalid `size_step` / missing `mirror_x` parens), runs SyncCraft's REAL `parse_program()` to capture
+    the exact parser diagnostic, and supervises the exact compilable repair.
+    """
+    from .synccraft_bridge import _extract_dsl_candidate, ensure_synccraft_importable
+
+    ensure_synccraft_importable()
+    from synccraft.dsl.parser import parse_program
+
+    rng = random.Random(seed)
+    # Extract unique verified Block-DSL v4.1 programs from `v28_records`
+    clean_dsls: list[tuple[str, str]] = []
+    seen_sigs: set[str] = set()
+    for rec in v28_records:
+        dsl = _extract_dsl_candidate(str(rec.get("answer") or ""))
+        if not dsl or "@rig" not in dsl:
+            continue
+        sig = hashlib.sha256(dsl.encode("utf-8")).hexdigest()[:12]
+        if sig in seen_sigs:
+            continue
+        try:
+            parse_program(dsl)
+        except Exception:
+            continue
+        seen_sigs.add(sig)
+        clean_dsls.append((str(rec.get("id") or sig), dsl))
+
+    if not clean_dsls:
+        return []
+
+    def _mutate_texel_size(s: str) -> tuple[str, str]:
+        return s.replace("texel_density:", "texel_size:", 1), "Replace invalid @meta key `texel_size` with exact Block-DSL v4.1 key `texel_density`."
+
+    def _mutate_root_keyword(s: str) -> tuple[str, str]:
+        return re.sub(r"\broot\s+bone\b", "root_limb_place bone", s, count=1), "A `@rig` root declaration must start with exact keywords `root bone <name>`, never `root_limb_place`."
+
+    def _mutate_box_axis(s: str) -> tuple[str, str]:
+        return re.sub(r"(box\s+[a-zA-Z0-9_]+[^{]*\{[^}]*size\s*:\s*\[[^\]]+\])", r"\1, axis:[0,1,0]", s, count=1), "Remove illegal `axis` field from `box { ... }`; valid box keys are `size`, `material`, `rest_euler`, `inflate`, `prism_group`, `plane_normal`."
+
+    def _mutate_bone_and(s: str) -> tuple[str, str]:
+        return re.sub(r"(\bbone\s+[a-zA-Z0-9_]+)(\s+attach\()", r"\1 and extra\2", s, count=1), "Remove illegal `and` token from `bone <name>` header; declare each bone cleanly with `bone <name> attach(...)` and optional `mirror_x(<mirror_name>)`."
+
+    def _mutate_meta_units(s: str) -> tuple[str, str]:
+        return s.replace("units_per_block:", "voxel_units:", 1), "Replace invalid @meta key `voxel_units` with exact Block-DSL v4.1 key `units_per_block`."
+
+    def _mutate_box_color(s: str) -> tuple[str, str]:
+        return re.sub(r"(box\s+[a-zA-Z0-9_]+[^{]*\{[^}]*material\s*:\s*[a-zA-Z0-9_]+)", r"\1, color:\"#ff0000\"", s, count=1), "Remove illegal inline `color` field inside `box { ... }`; define ramps in `@palette` and reference them via `material:<name>`."
+
+    mutators = (
+        ("texel_size", _mutate_texel_size),
+        ("root_keyword", _mutate_root_keyword),
+        ("box_axis", _mutate_box_axis),
+        ("bone_and", _mutate_bone_and),
+        ("meta_units", _mutate_meta_units),
+        ("box_color", _mutate_box_color),
+    )
+
+    out_records: list[dict[str, Any]] = []
+    idx = 0
+    for aid, dsl in clean_dsls:
+        if len(dsl) > 5800:
+            continue
+        for mname, fn in mutators:
+            if len(out_records) >= max_items:
+                break
+            broken, fix_hint = fn(dsl)
+            if broken == dsl:
+                continue
+            try:
+                parse_program(broken)
+                continue  # Did not trigger a real parser error; skip
+            except Exception as exc:
+                err_msg = str(exc).strip()[:240]
+
+            prompt = (
+                f"[SyncCraft Block-DSL v4.1 Compiler Repair — `{mname}`]\n"
+                f"The following `Block-DSL v4.1` draft failed `parse_program()` with:\n"
+                f"  Error: {err_msg}\n\n"
+                f"```blockdsl\n{broken}\n```\n\n"
+                "Diagnose the exact Block-DSL v4.1 grammar violation inside `<think>...</think>` and output ONLY the "
+                "repaired, compilable ```blockdsl ... ``` program."
+            )
+            think = (
+                f"SyncCraft parser reported: `{err_msg}`.\n"
+                f"Root cause & exact Block-DSL v4.1 grammar rule: {fix_hint}\n"
+                "Apply the exact schema fix while preserving all bones, pivots, palettes, symmetry, and `@behavior` clips."
+            )
+            ans = f"<think>\n{think}\n</think>\n```blockdsl\n{dsl}\n```"
+            if len(prompt) + len(ans) > 9000:
+                # Truncate broken preview cleanly when full asset is large, keeping the exact error region intact!
+                continue
+            h = hashlib.sha256(f"v28_repair:{aid}:{mname}:{idx}".encode("utf-8")).hexdigest()[:14]
+            out_records.append(
+                {
+                    "id": f"stage10_v28_grammar_repair_{mname}_{h}",
+                    "source_group": f"stage10_v28_grammar_repair_{mname}",
+                    "language": "en",
+                    "task": "stage10_v28_grammar_repair",
+                    "visual_kind": None,
+                    "frames": [],
+                    "enable_thinking": True,
+                    "prompt": prompt,
+                    "answer": ans,
+                    "target": {"kind": "text", "text": f"```blockdsl\n{dsl}\n```"},
+                    "metadata": {
+                        "source": "stage10_synccraft_parser_repair",
+                        "license_spdx": "CC0-1.0",
+                        "mutation": mname,
+                        "parser_error": err_msg,
+                        "real_text_corpus": True,
+                    },
+                }
+            )
+            idx += 1
+
+    # Also add compact one-shot Block-DSL v4.1 Grammar Reference Cards (covers every allowed keyword!)
+    grammar_cards = (
+        (
+            "schema_meta_and_palette",
+            "List the exact valid `@meta` and `@palette` syntax in `Block-DSL v4.1` (`audit_profile: sculpted`) and fix common mistakes like `texel_size` or inline `color:`.",
+            "Recall the strict SyncCraft v4.1 grammar: `@meta` uses `archetype`, `target_profile`, `texel_density`, `units_per_block`, `dsl_version`, `size_step`, `audit_profile`. `@palette` defines `ramp(...)` entries referenced via `material:<name>`.",
+            (
+                "Valid `Block-DSL v4.1` header & palette grammar:\n"
+                "```blockdsl\n"
+                "@meta { archetype:entity, target_profile:bedrock_entity, texel_density:16, units_per_block:16, dsl_version:\"4.1\", size_step:0.5, audit_profile:sculpted }\n"
+                "@palette {\n"
+                "  primary: ramp(base_lch=[0.46,0.12,240], steps=5, hue_shift=[-16,18])\n"
+                "  accent: ramp(base_lch=[0.78,0.16,65], steps=4, hue_shift=[-10,12])\n"
+                "}\n"
+                "```\n"
+                "- **Never** write `texel_size` (use `texel_density`), `voxel_units` (use `units_per_block`), or inline `color:` inside `box { ... }`."
+            ),
+        ),
+        (
+            "schema_rig_root_bone_and_box",
+            "What is the exact `Block-DSL v4.1` grammar for `@rig`, `root bone`, child `bone ... attach(...) mirror_x(...)`, and `box { ... }` fields?",
+            "Recall `@rig` requires `root bone <name> { pivot_local:[x,y,z] ... }`, child bones use `bone <name> attach(parent_box=..., anchor=[...], align=[...]) mirror_x(<r_name>) { ... }` (never `and` or `root_limb_place`), and `box` only accepts `size`, `material`, `rest_euler`, `inflate`, `prism_group`, `plane_normal` (never `axis`).",
+            (
+                "Valid `Block-DSL v4.1` `@rig` grammar:\n"
+                "```blockdsl\n"
+                "@rig {\n"
+                "  root bone pelvis {\n"
+                "    pivot_local:[0,12,0]\n"
+                "    box core { size:[6,5,8], material:primary, prism_group:\"torso\" }\n"
+                "    bone leg_l attach(parent_box=core, anchor=[-1,-0.6,0], align=[1,1,0]) mirror_x(leg_r) {\n"
+                "      joint_limits:[[-55,55],[-25,25],[-25,25]]\n"
+                "      box femur { size:[2,5,2.5], material:primary }\n"
+                "    }\n"
+                "  }\n"
+                "}\n"
+                "```\n"
+                "- **Never** write `root_limb_place`, `bone a and b`, or `axis:` inside `box { ... }`."
+            ),
+        ),
+    )
+    for cid, q, th, bd in grammar_cards:
+        out_records.append(
+            {
+                "id": f"stage10_v28_grammar_card_{cid}",
+                "source_group": "stage10_v28_grammar_cards",
+                "language": "en",
+                "task": "stage10_v28_grammar_repair",
+                "visual_kind": None,
+                "frames": [],
+                "enable_thinking": True,
+                "prompt": q,
+                "answer": f"<think>\n{th}\n</think>\n{bd}",
+                "target": {"kind": "text", "text": bd},
+                "metadata": {"source": "stage10_synccraft_grammar_cards", "license_spdx": "CC0-1.0", "real_text_corpus": True},
+            }
+        )
+
+    rng.shuffle(out_records)
+    emit("stage10_v28_grammar_repair_ready", count=len(out_records), source_masterworks=len(clean_dsls))
+    return out_records[:max_items]
