@@ -306,7 +306,10 @@ def build_nemotron_terminal_pivot_records(
                 break
             if not ln.strip():
                 continue
-            obj = json.loads(ln)
+            try:
+                obj = json.loads(ln)
+            except json.JSONDecodeError:
+                continue
             tname = str(obj.get("task_name") or "").strip()
             rcp = obj.get("responses_create_params") or {}
             inp = rcp.get("input") if isinstance(rcp, dict) else None
@@ -374,6 +377,36 @@ def build_nemotron_terminal_pivot_records(
     return records
 
 
+def _compact_long_think(th: str | None, *, max_chars: int = 2100) -> str:
+    """Distill verbose teacher `<think>` traces at paragraph/sentence boundaries while removing backtrack loops."""
+    raw = str(th or "").strip()
+    if not raw:
+        return "Work through the problem rigorously from first principles and verify the final result."
+    # Filter out pure circular self-interruption paragraphs ("Wait, let me double check...")
+    paras = [p.strip() for p in re.split(r"\n{2,}", raw) if p.strip()]
+    cleaned: list[str] = []
+    backtrack_pat = re.compile(r"^(?:wait|hmm|hold on|actually|let me re-?read|alternatively)\b", re.IGNORECASE)
+    for p in paras:
+        if len(cleaned) >= 1 and backtrack_pat.match(p) and len(p) < 420:
+            continue
+        cleaned.append(p)
+    joined = "\n\n".join(cleaned) if cleaned else raw
+    if len(joined) <= max_chars:
+        return joined
+    # Preserve opening setup + closing verification at clean sentence boundaries
+    head_budget = int(max_chars * 0.55)
+    tail_budget = max_chars - head_budget - 32
+    head_slice = joined[:head_budget]
+    dot_h = max(head_slice.rfind(". "), head_slice.rfind("\n"))
+    if dot_h > head_budget // 2:
+        head_slice = head_slice[: dot_h + 1].rstrip()
+    tail_slice = joined[-tail_budget:]
+    dot_t = tail_slice.find(". ")
+    if 0 < dot_t < tail_budget // 2:
+        tail_slice = tail_slice[dot_t + 2 :].lstrip()
+    return f"{head_slice}\n\n[Key derivation verified]\n{tail_slice}"[:max_chars].strip()
+
+
 def build_openthoughts3_stem_records(
     *,
     token: str | None,
@@ -392,7 +425,10 @@ def build_openthoughts3_stem_records(
     }
     domain_counts = {k: 0 for k in domain_caps}
 
-    shard_files = [f"data/train-{i:05d}-of-00120.parquet" for i in range(6)]
+    # OpenThoughts3-1.2M is domain-ordered across 120 shards:
+    # ~00000..00024 = code, ~00040..00105 = math, ~00112..00119 = science
+    shard_ids = (115, 118, 119, 40, 80, 0, 5)
+    shard_files = [f"data/train-{i:05d}-of-00120.parquet" for i in shard_ids]
     for sf in shard_files:
         if len(records) >= max_items:
             break
@@ -418,13 +454,14 @@ def build_openthoughts3_stem_records(
                     if _is_contaminated(pr) or _is_contaminated(raw_ans):
                         continue
                     th, bd = _split_reasoning_and_body(raw_ans)
-                    if not bd or len(bd) < 24:
+                    if not bd or len(bd) < 24 or len(bd) > 4000:
                         continue
+                    compact_th = _compact_long_think(th, max_chars=2100)
                     sup = sanitize_and_bound_think_trace(
-                        th or "Work through the problem rigorously from first principles.",
+                        compact_th,
                         bd,
                         enable_thinking=True,
-                        max_think_chars=2600,
+                        max_think_chars=2400,
                         max_answer_chars=4400,
                     )
                     if sup is None or len(pr) + len(sup) > 6800:
@@ -491,7 +528,10 @@ def build_nemotron_science_v2_records(
             for ln in lines:
                 if added_f >= per_file or len(records) >= max_items:
                     break
-                obj = json.loads(ln)
+                try:
+                    obj = json.loads(ln)
+                except json.JSONDecodeError:
+                    continue
                 msgs = obj.get("messages") or []
                 user_txt = ""
                 asst_txt = ""
