@@ -418,6 +418,7 @@ def build_openthoughts3_stem_records(
         return []
     rng = random.Random(seed)
     records: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
     domain_caps = {
         "science": int(max_items * 0.45),
         "math": int(max_items * 0.30),
@@ -469,9 +470,13 @@ def build_openthoughts3_stem_records(
                     if not check_generation_collapse_health(sup, expect_thinking=True, max_rep_4gram=0.115)["healthy"]:
                         continue
                     h = hashlib.sha256(f"ot3:{dom}:{pr[:140]}".encode("utf-8")).hexdigest()[:16]
+                    rid = f"stage9_ot3_{dom}_{h}"
+                    if rid in seen_ids:
+                        continue
+                    seen_ids.add(rid)
                     records.append(
                         {
-                            "id": f"stage9_ot3_{dom}_{h}",
+                            "id": rid,
                             "source_group": f"stage9_ot3_{dom}_{int(h[:4], 16) % 64:02d}",
                             "language": "en",
                             "task": "stage9_openthoughts3_stem_reasoning",
@@ -742,8 +747,16 @@ def build_stage9_frontier_training_records(
         )
     )
 
-    emit("stage9_frontier_corpus_ready", total_records=len(all_recs))
-    return all_recs
+    # Deduplicate final Frontier pool strictly by record ID (ensures 100% unique training prompts)
+    deduped: list[dict[str, Any]] = []
+    seen_all: set[str] = set()
+    for rec in all_recs:
+        rid = str(rec.get("id") or "")
+        if rid and rid not in seen_all:
+            seen_all.add(rid)
+            deduped.append(rec)
+    emit("stage9_frontier_corpus_ready", total_records=len(deduped), duplicates_removed=len(all_recs) - len(deduped))
+    return deduped
 
 
 # ---------------------------------------------------------------------------
