@@ -1185,6 +1185,14 @@ def build_v28_grammar_repair_records(
     def _mutate_box_color(s: str) -> tuple[str, str]:
         return re.sub(r"(box\s+[a-zA-Z0-9_]+[^{]*\{[^}]*material\s*:\s*[a-zA-Z0-9_]+)", r"\1, color:\"#ff0000\"", s, count=1), "Remove illegal inline `color` field inside `box { ... }`; define ramps in `@palette` and reference them via `material:<name>`."
 
+    def _mutate_mirror_syntax(s: str) -> tuple[str, str]:
+        return re.sub(r"\bmirror_x\(([a-zA-Z0-9_]+)\)", r"mirror_x:\1", s, count=1), "Fix `mirror_x` call syntax to `mirror_x(<mirrored_bone_name>)` with parentheses, never `mirror_x:<name>`."
+
+    def _mutate_chain_and(s: str) -> tuple[str, str]:
+        if re.search(r"\bchain\s+[a-zA-Z0-9_]+", s):
+            return re.sub(r"(\bchain\s+[a-zA-Z0-9_]+)", r"\1 and tail_extra", s, count=1), "Remove illegal `and` token from `chain <name>` header; declare one chain per block."
+        return re.sub(r"(\broot\s+bone\s+[a-zA-Z0-9_]+)", r"\1 and spine", s, count=1), "Remove illegal `and` token from `root bone <name>` header; declare a single root bone identifier."
+
     mutators = (
         ("texel_size", _mutate_texel_size),
         ("root_keyword", _mutate_root_keyword),
@@ -1192,12 +1200,83 @@ def build_v28_grammar_repair_records(
         ("bone_and", _mutate_bone_and),
         ("meta_units", _mutate_meta_units),
         ("box_color", _mutate_box_color),
+        ("mirror_syntax", _mutate_mirror_syntax),
+        ("chain_and", _mutate_chain_and),
     )
+
+    def _compact_compilable_subrig(src_dsl: str, max_chars: int = 3600) -> str | None:
+        """Keep full DSL if <= max_chars; otherwise trim trailing blocks/child bones preserving exact parse_program() validity."""
+        if len(src_dsl) <= max_chars:
+            return src_dsl
+        rig_idx = src_dsl.find("@rig")
+        if rig_idx >= 0:
+            brace_open = src_dsl.find("{", rig_idx)
+            if brace_open >= 0:
+                depth = 0
+                rig_end = -1
+                for pos in range(brace_open, len(src_dsl)):
+                    ch = src_dsl[pos]
+                    if ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                        if depth == 0:
+                            rig_end = pos + 1
+                            break
+                if rig_end > 0:
+                    rig_only = src_dsl[:rig_end].strip()
+                    if len(rig_only) <= max_chars:
+                        try:
+                            parse_program(rig_only)
+                            return rig_only
+                        except Exception:
+                            pass
+                    lines = rig_only.splitlines()
+                    for max_children in (4, 3, 2, 1):
+                        out_lines: list[str] = []
+                        cur_depth = 0
+                        in_rig = False
+                        kept_children = 0
+                        skipping_child = False
+                        skip_depth = 0
+                        for ln in lines:
+                            st = ln.strip()
+                            opens = ln.count("{")
+                            closes = ln.count("}")
+                            if not in_rig:
+                                out_lines.append(ln)
+                                if "@rig" in st:
+                                    in_rig = True
+                                cur_depth += opens - closes
+                                continue
+                            if skipping_child:
+                                cur_depth += opens - closes
+                                if cur_depth <= skip_depth:
+                                    skipping_child = False
+                                continue
+                            if cur_depth == 2 and re.match(r"^(?:bone|chain)\s+", st) and opens > closes:
+                                if kept_children >= max_children:
+                                    skipping_child = True
+                                    skip_depth = cur_depth
+                                    cur_depth += opens - closes
+                                    continue
+                                kept_children += 1
+                            out_lines.append(ln)
+                            cur_depth += opens - closes
+                        compact = "\n".join(out_lines).strip()
+                        if len(compact) <= max_chars:
+                            try:
+                                parse_program(compact)
+                                return compact
+                            except Exception:
+                                continue
+        return None
 
     out_records: list[dict[str, Any]] = []
     idx = 0
-    for aid, dsl in clean_dsls:
-        if len(dsl) > 5800:
+    for aid, full_dsl in clean_dsls:
+        dsl = _compact_compilable_subrig(full_dsl, max_chars=3600)
+        if not dsl:
             continue
         for mname, fn in mutators:
             if len(out_records) >= max_items:
@@ -1226,7 +1305,6 @@ def build_v28_grammar_repair_records(
             )
             ans = f"<think>\n{think}\n</think>\n```blockdsl\n{dsl}\n```"
             if len(prompt) + len(ans) > 9000:
-                # Truncate broken preview cleanly when full asset is large, keeping the exact error region intact!
                 continue
             h = hashlib.sha256(f"v28_repair:{aid}:{mname}:{idx}".encode("utf-8")).hexdigest()[:14]
             out_records.append(
