@@ -525,7 +525,7 @@ def main() -> None:
     ap.add_argument("--max-nemotron-science", type=int, default=1200)
     ap.add_argument("--v28-max-records", type=int, default=96)
     ap.add_argument("--synth-ocr-max", type=int, default=240)
-    ap.add_argument("--wake-cross-attn-gate", type=float, default=0.02)
+    ap.add_argument("--wake-cross-attn-gate", type=float, default=0.0)
     ap.add_argument("--rsi3-v28-explore", type=int, default=16)
     ap.add_argument("--rsi3-frontier-explore", type=int, default=36)
     ap.add_argument("--eval-images", type=int, default=48)
