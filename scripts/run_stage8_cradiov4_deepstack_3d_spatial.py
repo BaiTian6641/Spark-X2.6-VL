@@ -203,6 +203,10 @@ def _run_stage8_phase(
         row, packet = catalogue.row(str(payload))
         with reader.packet(packet) as get:
             media = prepare_media(row, get, base_cfg)
+        if kind == "cat_direct":
+            from colab.final.frontier_stage9_corpus import convert_catalogue_row_to_direct_mode
+
+            row = convert_catalogue_row_to_direct_mode(row)
         return row, media
 
     emit(

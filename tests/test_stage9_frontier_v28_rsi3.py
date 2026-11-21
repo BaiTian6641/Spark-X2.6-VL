@@ -12,6 +12,8 @@ from colab.final.frontier_stage9_corpus import (
     _format_bounded_agent_trajectory,
     _is_contaminated,
     _split_reasoning_and_body,
+    build_synthetic_scene_ocr_pairs,
+    convert_catalogue_row_to_direct_mode,
 )
 from scripts.eval_stage9_frontier_and_3d_suite import (
     _extract_choice_letter,
@@ -23,6 +25,7 @@ from scripts.run_stage9_frontier_v28_and_rsi3 import (
     audit_stage9_records_strict,
     evaluate_rsi3_promotion_gate,
     score_rsi3_terminal_or_stem_candidate,
+    wake_dead_cross_attn_gates,
 )
 
 
@@ -130,6 +133,65 @@ def test_stage9_strict_audit_rsi3_oracle_and_promotion_gate():
     bad_cand = {"mean_real_loss": 0.62, "mean_media_advantage": 0.02, "v25_locate_probe": {"predicted": "Clean concise answer."}}
     assert evaluate_rsi3_promotion_gate(parent, good_cand)["accepted"]
     assert not evaluate_rsi3_promotion_gate(parent, bad_cand)["accepted"]
+
+
+def test_stage9_direct_ocr_yesno_and_cross_attn_gate_wakeup():
+    import io
+    import torch
+
+    # 1. Synthetic scene OCR pairs: full-color RGB, non-thinking, concise exact answers across 4 modes
+    pairs = build_synthetic_scene_ocr_pairs(seed=20261141, max_items=16)
+    assert len(pairs) == 16
+    subtasks = set()
+    for rec, blobs in pairs:
+        assert rec["enable_thinking"] is False
+        assert rec["answer"] and "<think>" not in rec["answer"]
+        subtasks.add(rec["metadata"]["subtask"])
+        mem = rec["frames"][0]
+        im = Image.open(io.BytesIO(blobs[mem])).convert("RGB")
+        arr = np.asarray(im, dtype=np.float32)
+        chroma = float(np.mean(np.abs(arr[..., 0] - arr[..., 1]) + np.abs(arr[..., 1] - arr[..., 2])))
+        assert chroma > 10.0, f"Expected full-color RGB synthetic OCR card, got chroma={chroma:.2f}"
+    assert subtasks == {"scene_text_recognition", "kie_receipt", "doc_vqa_notice", "formula_ocr"}
+
+    # 2. Direct-mode conversion strips <think> cleanly for POPE Yes/No & OCR
+    r_no = convert_catalogue_row_to_direct_mode(
+        {
+            "task": "visual_primitives_existence_yesno",
+            "prompt": "Is there any `bicycle` visible in this image? Answer strictly `Yes` or `No`.",
+            "answer": "<think>\nScanning image...\n</think>\nNo",
+            "enable_thinking": True,
+        }
+    )
+    assert r_no["enable_thinking"] is False
+    assert r_no["answer"] == "No"
+    assert "Please answer yes or no." in r_no["prompt"]
+
+    r_ocr = convert_catalogue_row_to_direct_mode(
+        {
+            "task": "vision_textvqa_train",
+            "prompt": "What brand is written on the bottle?",
+            "answer": "<think>\nScanning tokens...\n</think>\nFinal Answer: Polaris",
+            "enable_thinking": True,
+        }
+    )
+    assert r_ocr["enable_thinking"] is False
+    assert r_ocr["answer"] == "Polaris"
+
+    # 3. Dead cross-attn gate wakeup nudges stuck ~1e-5 gates to 0.02 while leaving open gates intact
+    class _Dummy(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.visual_cross_attn = torch.nn.ModuleList([torch.nn.Module(), torch.nn.Module()])
+            self.visual_cross_attn[0].gate_attn = torch.nn.Parameter(torch.tensor([1.3e-5]))
+            self.visual_cross_attn[1].gate_attn = torch.nn.Parameter(torch.tensor([0.12]))
+
+    m = _Dummy()
+    nudged = wake_dead_cross_attn_gates(m, min_abs_gate=0.02)
+    assert "visual_cross_attn.0.gate_attn" in nudged
+    assert "visual_cross_attn.1.gate_attn" not in nudged
+    assert abs(float(m.visual_cross_attn[0].gate_attn.item()) - 0.02) < 1e-6
+    assert abs(float(m.visual_cross_attn[1].gate_attn.item()) - 0.12) < 1e-6
 
 
 def test_aesthetic_v28_biomech_corpus_compiles_and_audits_clean():

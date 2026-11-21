@@ -57,6 +57,8 @@ from colab.final.data import Catalogue, MediaReader  # noqa: E402
 from colab.final.frontier_stage9_corpus import (  # noqa: E402
     build_dapo_math_rsi3_pool,
     build_stage9_frontier_training_records,
+    build_synthetic_scene_ocr_pairs,
+    select_stage9_direct_ocr_and_yesno_rids,
 )
 from colab.final.inference import empty_media, generate, visual_media  # noqa: E402
 from colab.final.model import SparkNative, load_spark_native_safetensors  # noqa: E402
@@ -467,6 +469,23 @@ def evaluate_rsi3_promotion_gate(
     }
 
 
+def wake_dead_cross_attn_gates(model: Any, *, min_abs_gate: float = 0.02) -> dict[str, dict[str, float]]:
+    """Break zero-gradient saddle point on stuck Flamingo `visual_cross_attn.*.gate_attn` scalars (`~1e-5 -> 0.02`).
+
+    Leaves already-open gates untouched and logs exact before/after scalar values.
+    """
+    nudged: dict[str, dict[str, float]] = {}
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if "visual_cross_attn" in name and name.endswith("gate_attn"):
+                before = float(p.detach().float().mean().item())
+                if abs(before) < float(min_abs_gate):
+                    sign = 1.0 if before >= 0.0 else -1.0
+                    p.fill_(sign * float(min_abs_gate))
+                    nudged[name] = {"before": round(before, 6), "after": round(float(p.detach().float().mean().item()), 6)}
+    return nudged
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
@@ -489,13 +508,13 @@ def main() -> None:
         type=Path,
         default=Path("work/spark-x26-4b-loop48-en1b-vl-stage9-frontier-rsi3"),
     )
-    ap.add_argument("--stage9a-updates", type=int, default=450)
+    ap.add_argument("--stage9a-updates", type=int, default=550)
     ap.add_argument("--rsi3-updates", type=int, default=160)
     ap.add_argument("--grad-accum", type=int, default=12)
     ap.add_argument("--backbone-lr", type=float, default=1.8e-5)
-    ap.add_argument("--connector-lr", type=float, default=6.0e-5)
-    ap.add_argument("--engram-lr", type=float, default=4.5e-5)
-    ap.add_argument("--vision-lr", type=float, default=1.5e-6)
+    ap.add_argument("--connector-lr", type=float, default=8.0e-5)
+    ap.add_argument("--engram-lr", type=float, default=5.0e-5)
+    ap.add_argument("--vision-lr", type=float, default=2.0e-6)
     ap.add_argument("--unfreeze-vision-layers", type=int, default=6)
     ap.add_argument("--vision-optimizer", type=str, default="muon8bit", choices=("muon8bit", "apollo8bit", "adamw"))
     ap.add_argument("--intel-vision", type=str, default="xpu", choices=("xpu", "none"))
@@ -505,6 +524,8 @@ def main() -> None:
     ap.add_argument("--max-ot3-stem", type=int, default=1600)
     ap.add_argument("--max-nemotron-science", type=int, default=1200)
     ap.add_argument("--v28-max-records", type=int, default=96)
+    ap.add_argument("--synth-ocr-max", type=int, default=240)
+    ap.add_argument("--wake-cross-attn-gate", type=float, default=0.02)
     ap.add_argument("--rsi3-v28-explore", type=int, default=16)
     ap.add_argument("--rsi3-frontier-explore", type=int, default=36)
     ap.add_argument("--eval-images", type=int, default=48)
@@ -517,12 +538,13 @@ def main() -> None:
     db_path = args.stage7_work_root / "metadata/corpus.sqlite"
     handoff_path = args.stage7_work_root / "metadata/HANDOFF.json"
 
-    # 1. Build & Strictly Audit Stage-9 Frontier + v28 + 3D Spatial Corpora
+    # 1. Build & Strictly Audit Stage-9 Frontier + v28 + 3D Spatial + Direct Scene-OCR Corpora
     tb41_excluded = _fetch_tb41_excluded_task_ids(hf_token)
     emit("stage9_build_corpora_start", excluded_tb41_tasks=len(tb41_excluded))
 
     v28_records = build_aesthetic_v28_biomech_records(seed=args.seed, max_records=args.v28_max_records)
     spatial3d_pairs = build_shaded_3d_spatial_primitives_records(seed=args.seed + 11, panel_size=(384, 384), angles_per_asset=6)
+    synth_ocr_pairs = build_synthetic_scene_ocr_pairs(seed=args.seed + 17, max_items=args.synth_ocr_max)
     frontier_records = build_stage9_frontier_training_records(
         token=hf_token,
         max_nemotron_terminal=args.max_nemotron_terminal,
@@ -535,25 +557,35 @@ def main() -> None:
     )
 
     audit_rep = audit_stage9_records_strict(
-        frontier_records, v28_records, spatial3d_pairs, excluded_tb41_ids=tb41_excluded
+        frontier_records, v28_records, list(spatial3d_pairs) + list(synth_ocr_pairs), excluded_tb41_ids=tb41_excluded
     )
     write(args.output_root / "STAGE9_DATASET_AUDIT.json", audit_rep)
     emit("stage9_dataset_audit_done", passed=audit_rep["passed"], failures=audit_rep["failures_count"], total=audit_rep["total_checked"])
     if not audit_rep["passed"]:
         raise RuntimeError(f"Stage-9 pre-training dataset quality gate FAILED: {audit_rep['failures'][:5]}")
 
-    # 2. Construct Stage-9A balanced anti-forgetting mix (35% Frontier + 18% v28 + 22% 3D 4-Primitives + 25% Broad Visual/Replay)
+    # 2. Construct Stage-9A balanced anti-forgetting mix:
+    #    ~32% Frontier + ~16% v28 + ~18% Shaded 3D 4-Primitives + ~14% Direct OCR & 50/50 Yes/No + ~20% Broad Visual/Text Replay
     rng = random.Random(args.seed)
     total_9a = args.stage9a_updates * args.grad_accum
-    n_front = min(int(total_9a * 0.35), max(1, len(frontier_records)))
-    n_v28 = min(int(total_9a * 0.18), max(1, len(v28_records) * 12))
-    n_s3d = min(int(total_9a * 0.22), max(1, len(spatial3d_pairs) * 3))
-    n_cat = max(1, total_9a - n_front - n_v28 - n_s3d)
+    n_front = min(int(total_9a * 0.32), max(1, len(frontier_records)))
+    n_v28 = min(int(total_9a * 0.16), max(1, len(v28_records) * 12))
+    n_s3d = min(int(total_9a * 0.18), max(1, len(spatial3d_pairs) * 3))
+    n_direct_total = int(total_9a * 0.14)
+    n_synth_ocr = min(len(synth_ocr_pairs), max(0, int(n_direct_total * 0.28)))
+    n_cat_direct = max(0, n_direct_total - n_synth_ocr)
+    n_cat = max(1, total_9a - n_front - n_v28 - n_s3d - n_synth_ocr - n_cat_direct)
 
+    direct_rids, direct_summary = select_stage9_direct_ocr_and_yesno_rids(
+        db_path, target_samples=n_cat_direct, seed=args.seed + 5
+    )
     cat_9a_rids, cat_9a_summary = select_stage75b_balanced_rids(
         db_path, target_catalogue_samples=n_cat, vision_fraction=0.70, seed=args.seed + 3
     )
     order_9a: list[tuple[str, Any]] = [("cat", rid) for rid in cat_9a_rids]
+    order_9a.extend(("cat_direct", rid) for rid in direct_rids)
+    for i in range(n_synth_ocr):
+        order_9a.append(("pair", synth_ocr_pairs[i % len(synth_ocr_pairs)]))
     for i in range(n_front):
         order_9a.append(("pair", _text_record_to_pair(frontier_records[i % len(frontier_records)])))
     for i in range(n_v28):
@@ -570,7 +602,15 @@ def main() -> None:
                     "dry_run": True,
                     "audit": audit_rep,
                     "order_9a": len(order_9a),
-                    "breakdown": {"frontier": n_front, "v28": n_v28, "spatial3d": n_s3d, "catalogue": n_cat},
+                    "breakdown": {
+                        "frontier": n_front,
+                        "v28": n_v28,
+                        "spatial3d": n_s3d,
+                        "direct_ocr_yesno_cat": len(direct_rids),
+                        "direct_synth_ocr": n_synth_ocr,
+                        "catalogue_replay": len(cat_9a_rids),
+                    },
+                    "direct_ocr_yesno_summary": direct_summary,
                 },
                 indent=2,
             )
@@ -600,6 +640,13 @@ def main() -> None:
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     model = SparkNative(paths, cfg, device=device, pretrained=True)
     model.gradient_checkpointing_enable()
+    woken_gates = (
+        wake_dead_cross_attn_gates(model, min_abs_gate=float(args.wake_cross_attn_gate))
+        if float(args.wake_cross_attn_gate) > 0.0
+        else {}
+    )
+    if woken_gates:
+        emit("stage9_woke_dead_cross_attn_gates", nudged=woken_gates)
 
     catalogue = Catalogue(db_path)
     handoff = read(handoff_path)
@@ -660,11 +707,14 @@ def main() -> None:
         )
         total_rsi3 = args.rsi3_updates * args.grad_accum
         n_sig = min(total_rsi3 // 2, max(1, len(rsi3_signal_items) * 6))
-        n_rep_cat = max(1, total_rsi3 - n_sig)
+        n_rsi_direct = min(len(direct_rids), int(total_rsi3 * 0.15))
+        n_rep_cat = max(1, total_rsi3 - n_sig - n_rsi_direct)
         cat_rsi_rids, _ = select_stage75b_balanced_rids(
             db_path, target_catalogue_samples=n_rep_cat, vision_fraction=0.65, seed=args.seed + 201
         )
         order_rsi3: list[tuple[str, Any]] = [("cat", rid) for rid in cat_rsi_rids]
+        for i in range(n_rsi_direct):
+            order_rsi3.append(("cat_direct", direct_rids[i % len(direct_rids)]))
         for i in range(n_sig):
             order_rsi3.append(rsi3_signal_items[i % len(rsi3_signal_items)])
         rng.shuffle(order_rsi3)
@@ -723,6 +773,8 @@ def main() -> None:
                 "selected_phase": selected_phase,
             },
             "dataset_audit": audit_rep,
+            "woken_cross_attn_gates": woken_gates,
+            "direct_ocr_yesno_summary": direct_summary,
             "stage9a_cat_summary": cat_9a_summary,
             "calibration": {"pre_9a": cal_pre, "post_9a": cal_post_9a, "post_rsi3": cal_post_rsi3},
             "stage9a": res_9a,
