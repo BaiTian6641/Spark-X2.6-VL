@@ -654,6 +654,7 @@ def load_spark_native_safetensors(
     allow_missing_loop_engram: bool = False,
     allow_missing_vision_swap: bool = False,
     allow_missing_projector_out_norm: bool = False,
+    allow_missing_projector_reinit: bool = False,
 ) -> None:
     """Load standard BF16 `model.safetensors` or channelwise `F8_E4M3` (+ optional `q4g128` sub-LSB residual) `model.safetensors`."""
     sf_path = Path(path)
@@ -669,7 +670,7 @@ def load_spark_native_safetensors(
                 (k not in param_map and k not in buf_map and k.endswith('_scale'))
                 for k in sf_keys
             )
-            if not has_fp8 and not allow_missing_vision_swap:
+            if not has_fp8 and not allow_missing_vision_swap and not allow_missing_projector_reinit:
                 has_tie = hasattr(getattr(model, 'spark', None), 'tie_weights')
                 strict = (not has_tie) and (not allow_missing_loop_engram) and (not allow_missing_projector_out_norm)
                 missing_sf, unexpected_sf = load_model(model, str(sf_path), strict=strict, device='cpu')
@@ -693,6 +694,8 @@ def load_spark_native_safetensors(
             loaded: set[str] = set()
             for key in sorted(sf_keys):
                 if allow_missing_vision_swap and key.startswith(('vision.', 'vision_projector.')):
+                    continue
+                if allow_missing_projector_reinit and key.startswith('vision_projector.'):
                     continue
                 if key not in param_map and key not in buf_map and key.endswith(aux_suffixes):
                     continue
@@ -723,6 +726,8 @@ def load_spark_native_safetensors(
         loaded = set()
         for key in sorted(sf_keys):
             if allow_missing_vision_swap and key.startswith(('vision.', 'vision_projector.')):
+                continue
+            if allow_missing_projector_reinit and key.startswith('vision_projector.'):
                 continue
             if key not in param_map and key not in buf_map and key.endswith(aux_suffixes):
                 continue
@@ -766,6 +771,8 @@ def load_spark_native_safetensors(
         missing = {k for k in missing if not k.startswith(('loop_controllers.', 'engram_anchors.'))}
     if allow_missing_vision_swap:
         missing = {k for k in missing if not k.startswith(('vision.', 'vision_projector.'))}
+    if allow_missing_projector_reinit:
+        missing = {k for k in missing if not k.startswith('vision_projector.')}
     if allow_missing_projector_out_norm:
         missing = {k for k in missing if k not in _PROJECTOR_RMS_MATCH_KEYS}
     if missing:
@@ -815,6 +822,8 @@ class RadioMultiLayerSwiGLUProjector(nn.Module):
         self.early_mid_proj = nn.Linear(self.vis_dim * 4, self.hidden_size)
         self.early_mid_gate = nn.Parameter(torch.tensor(float(early_mid_gate_init)))
         if self.output_rms_match:
+            nn.init.zeros_(self.w_down.bias)
+            nn.init.zeros_(self.early_mid_proj.bias)
             self.out_norm = nn.RMSNorm(self.hidden_size, eps=1e-6)
             self.out_scale = nn.Parameter(torch.tensor(float(out_scale_init)))
             self.early_out_norm = nn.RMSNorm(self.hidden_size, eps=1e-6)
@@ -1018,6 +1027,9 @@ class SparkNative(nn.Module):
                     ),
                     allow_missing_projector_out_norm=bool(
                         policy.get('allow_warmstart_projector_rms_match', False)
+                    ),
+                    allow_missing_projector_reinit=bool(
+                        policy.get('reinit_vision_projector', False)
                     ),
                 )
                 self._warm_started_from = str(init_sf)

@@ -905,7 +905,15 @@ def eval_v28_sculpted_and_gate_d(model: Any, export_dir: Path) -> dict[str, Any]
         except Exception:
             return {"pattern": "lateral_sequence", "froude": 0.20, "duty": 0.65}
 
-    gate_d_rep = evaluate_gate_d_proposer(holdout_prop, _proposer_fn)
+    try:
+        gate_d_rep = evaluate_gate_d_proposer(holdout_prop, _proposer_fn)
+    except Exception as exc:
+        gate_d_rep = {
+            "gate_d_pass": False,
+            "first_try_success_rate": 0.0,
+            "mean_solver_calls": None,
+            "error": str(exc)[:240],
+        }
 
     # 2. Unseen v28 D3/D4/D5 (Pole A + Pole B + Mechanical) Generation + 1-Turn Compiler-Feedback Repair + Full-Textured Audit
     v28_results: list[dict[str, Any]] = []

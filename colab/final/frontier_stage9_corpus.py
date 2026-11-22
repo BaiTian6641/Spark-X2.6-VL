@@ -808,11 +808,11 @@ def convert_catalogue_row_to_direct_mode(row: dict[str, Any]) -> dict[str, Any]:
         out["prompt"] = f"{base_q} Please answer yes or no."
         out["answer"] = yn
     else:
-        # Crisp OCR / TextVQA / DocVQA / ChartQA / LaTeX direct transcription (never ramble!)
-        if len(body) > 220 and "\n" in body:
+        # Crisp OCR / TextVQA / DocVQA / ChartQA / LaTeX direct transcription (keep multi-line document text intact!)
+        if task != "document_ocr" and len(body) > 220 and "\n" in body:
             body = body.splitlines()[0].strip()
         out["prompt"] = f"{prompt}\nRead the text/formula carefully from the image and answer directly and concisely."
-        out["answer"] = body[:360] if body else raw_ans[:360]
+        out["answer"] = body[:420] if body else raw_ans[:420]
     out["enable_thinking"] = False
     return out
 
@@ -1144,6 +1144,7 @@ def build_v28_grammar_repair_records(
     from .synccraft_bridge import _extract_dsl_candidate, ensure_synccraft_importable
 
     ensure_synccraft_importable()
+    from synccraft.dsl.ast_nodes import validate_program
     from synccraft.dsl.parser import parse_program
 
     rng = random.Random(seed)
@@ -1193,6 +1194,22 @@ def build_v28_grammar_repair_records(
             return re.sub(r"(\bchain\s+[a-zA-Z0-9_]+)", r"\1 and tail_extra", s, count=1), "Remove illegal `and` token from `chain <name>` header; declare one chain per block."
         return re.sub(r"(\broot\s+bone\s+[a-zA-Z0-9_]+)", r"\1 and spine", s, count=1), "Remove illegal `and` token from `root bone <name>` header; declare a single root bone identifier."
 
+    def _mutate_palette_rgb(s: str) -> tuple[str, str]:
+        return re.sub(r"\bramp\([^)]+\)", "rgb(112, 138, 196)", s, count=1), "Never use `rgb(...)` in `@palette`; every material entry must use `ramp(base_lch=[L,C,H], steps=..., hue_shift=[...])`."
+
+    def _mutate_meta_author(s: str) -> tuple[str, str]:
+        return s.replace("audit_profile:sculpted", 'audit_profile:sculpted, author:"studio"', 1), "Remove unsupported `@meta` key `author`; `@meta` only accepts `archetype`, `target_profile`, `texel_density`, `units_per_block`, `dsl_version`, `size_step`, `audit_profile`."
+
+    def _mutate_size_step_025(s: str) -> tuple[str, str]:
+        def _bump(m: re.Match[str]) -> str:
+            x, y, z = m.group(1), m.group(2), m.group(3)
+            try:
+                xv = round(float(x) + 0.25, 2)
+                return f"size:[{xv},{y},{z}]"
+            except Exception:
+                return m.group(0)
+        return re.sub(r"size:\s*\[\s*([0-9]+(?:\.[0-9]+)?)\s*,\s*([0-9]+(?:\.[0-9]+)?)\s*,\s*([0-9]+(?:\.[0-9]+)?)\s*\]", _bump, s, count=1), "Quantize every `box` `size:[x,y,z]` component to an exact multiple of `meta.size_step` (`0.5`, e.g., `2.0`, `2.5`, `3.0` — never `.25` or `.75`)."
+
     mutators = (
         ("texel_size", _mutate_texel_size),
         ("root_keyword", _mutate_root_keyword),
@@ -1202,6 +1219,9 @@ def build_v28_grammar_repair_records(
         ("box_color", _mutate_box_color),
         ("mirror_syntax", _mutate_mirror_syntax),
         ("chain_and", _mutate_chain_and),
+        ("palette_rgb", _mutate_palette_rgb),
+        ("meta_author", _mutate_meta_author),
+        ("size_step_025", _mutate_size_step_025),
     )
 
     def _compact_compilable_subrig(src_dsl: str, max_chars: int = 3600) -> str | None:
@@ -1285,8 +1305,9 @@ def build_v28_grammar_repair_records(
             if broken == dsl:
                 continue
             try:
-                parse_program(broken)
-                continue  # Did not trigger a real parser error; skip
+                prog_broken = parse_program(broken)
+                validate_program(prog_broken)
+                continue  # Did not trigger a real parser or validator error; skip
             except Exception as exc:
                 err_msg = str(exc).strip()[:240]
 
@@ -1369,6 +1390,17 @@ def build_v28_grammar_repair_records(
                 "- **Never** write `root_limb_place`, `bone a and b`, or `axis:` inside `box { ... }`."
             ),
         ),
+        (
+            "schema_size_step_palette_and_gait_enums",
+            "State the exact `Block-DSL v4.1` rules for `size_step:0.5`, `@palette` ramps, `@meta` fields, and valid SyncCraft `propose_gait_from_style` pattern enums.",
+            "Every `box` `size` component must be an exact multiple of `size_step:0.5` (never `.25` or `.75`), every `@palette` entry must use `ramp(base_lch=...)` (never `rgb(...)`), `@meta` forbids unknown fields like `author`, and SyncCraft gait `pattern` must be an exact enum identifier (never prose).",
+            (
+                "- **`size_step:0.5`**: Every `size:[x,y,z]` value must end in `.0` or `.5` (e.g. `[2.5, 4, 3.5]`, never `0.25` or `5.25`).\n"
+                "- **`@palette`**: Always use `ramp(base_lch=[L,C,H], steps=..., hue_shift=[...])`; never use `rgb(...)`.\n"
+                "- **`@meta`**: Only valid keys (`archetype`, `target_profile`, `texel_density`, `units_per_block`, `dsl_version`, `size_step`, `audit_profile`); never add `author`.\n"
+                "- **SyncCraft Gait Enum**: `pattern` in `propose_gait_from_style` JSON must be an exact canonical enum token such as `\"lateral_sequence\"`, `\"trot\"`, `\"gallop\"`, `\"bound\"`, `\"pace\"`, `\"stalk\"`, `\"biped_walk\"`, `\"biped_run\"`, `\"fly\"`, or `\"swim\"` — never a prose phrase."
+            ),
+        ),
     )
     for cid, q, th, bd in grammar_cards:
         out_records.append(
@@ -1390,3 +1422,182 @@ def build_v28_grammar_repair_records(
     rng.shuffle(out_records)
     emit("stage10_v28_grammar_repair_ready", count=len(out_records), source_masterworks=len(clean_dsls))
     return out_records[:max_items]
+
+
+def build_hf_real_ocr_pairs(
+    *,
+    token: str | None = None,
+    max_docvqa: int = 2400,
+    max_synthdog: int = 2000,
+    seed: int = 20261162,
+) -> list[tuple[dict[str, Any], dict[str, bytes]]]:
+    """Stream commercial-clean real OCR / Document VQA pairs (`lmms-lab/DocVQA` train [Apache-2.0]
+    and `naver-clova-ix/synthdog-en` train [MIT]) with zero `OCRBench` test overlap.
+
+    Images are normalized cleanly to RGB JPEG bytes (max side <= 1024 px) and paired with concise
+    direct-mode (`enable_thinking=False`) targets to teach true character-level readout through
+    `C-RADIOv4-H` -> `RadioMultiLayerSwiGLUProjector`.
+    """
+    import io
+    from PIL import Image
+    from huggingface_hub import HfApi, hf_hub_download
+    import pyarrow.parquet as pq
+
+    rng = random.Random(seed)
+    api = HfApi(token=token)
+    out_pairs: list[tuple[dict[str, Any], dict[str, bytes]]] = []
+
+    def _encode_rgb_jpeg(raw_img: Any, max_side: int = 1024) -> bytes | None:
+        try:
+            if isinstance(raw_img, Image.Image):
+                im = raw_img.convert("RGB")
+            elif isinstance(raw_img, dict) and raw_img.get("bytes"):
+                im = Image.open(io.BytesIO(raw_img["bytes"])).convert("RGB")
+            elif isinstance(raw_img, (bytes, bytearray)):
+                im = Image.open(io.BytesIO(raw_img)).convert("RGB")
+            else:
+                return None
+            w, h = im.size
+            if min(w, h) < 16:
+                return None
+            if max(w, h) > max_side:
+                sc = max_side / float(max(w, h))
+                im = im.resize((max(32, int(round(w * sc))), max(32, int(round(h * sc)))), Image.Resampling.BICUBIC)
+            buf = io.BytesIO()
+            im.save(buf, format="JPEG", quality=92)
+            return buf.getvalue()
+        except Exception:
+            return None
+
+    # 1. `lmms-lab/DocVQA` (Apache-2.0, train split ONLY — zero overlap with OCRBench test)
+    if max_docvqa > 0:
+        doc_count = 0
+        try:
+            info = api.dataset_info("lmms-lab/DocVQA")
+            train_pqs = sorted(
+                s.rfilename
+                for s in (info.siblings or [])
+                if s.rfilename.startswith("DocVQA/train-") and s.rfilename.endswith(".parquet")
+            )
+            for shard in train_pqs[:3]:
+                if doc_count >= max_docvqa:
+                    break
+                pq_path = hf_hub_download("lmms-lab/DocVQA", shard, repo_type="dataset", token=token)
+                tbl = pq.read_table(pq_path, columns=["questionId", "question", "image", "answers"])
+                idxs = list(range(tbl.num_rows))
+                rng.shuffle(idxs)
+                for ridx in idxs:
+                    if doc_count >= max_docvqa:
+                        break
+                    row = tbl.slice(ridx, 1).to_pylist()[0]
+                    q = str(row.get("question") or "").strip()
+                    ans_list = row.get("answers") or []
+                    if isinstance(ans_list, str):
+                        ans_list = [ans_list]
+                    clean_ans = [str(a).strip() for a in ans_list if str(a).strip()]
+                    if not q or not clean_ans:
+                        continue
+                    ans = min(clean_ans, key=len)
+                    if len(ans) > 160 or len(q) > 400:
+                        continue
+                    jpg = _encode_rgb_jpeg(row.get("image"), max_side=960)
+                    if jpg is None:
+                        continue
+                    qid = str(row.get("questionId") or f"{shard}_{ridx}")
+                    h = hashlib.sha256(f"docvqa_train:{qid}:{q}".encode("utf-8")).hexdigest()[:14]
+                    mem = f"hf_docvqa_{h}.jpg"
+                    rec = {
+                        "id": f"stage105_hf_docvqa_{h}",
+                        "source_group": "stage105_hf_docvqa_train",
+                        "language": "en",
+                        "task": "stage105_direct_docvqa_real",
+                        "visual_kind": "independent_image",
+                        "frames": [mem],
+                        "enable_thinking": False,
+                        "prompt": f"{q}\nRead the text/formula carefully from the image and answer directly and concisely.",
+                        "answer": ans,
+                        "target": {"kind": "text", "text": ans},
+                        "metadata": {
+                            "source": "lmms-lab/DocVQA",
+                            "license_spdx": "Apache-2.0",
+                            "split": "train",
+                            "real_document_scan": True,
+                            "pixel_indispensable": True,
+                        },
+                    }
+                    out_pairs.append((rec, {mem: jpg}))
+                    doc_count += 1
+        except Exception as exc:
+            emit("stage105_hf_docvqa_warning", error=str(exc)[:180])
+        emit("stage105_hf_docvqa_ready", count=doc_count)
+
+    # 2. `naver-clova-ix/synthdog-en` (MIT, train split ONLY — realistic multi-font English text transcription)
+    if max_synthdog > 0:
+        sd_count = 0
+        sd_prompts = (
+            "Read all visible text in the image accurately and concisely.",
+            "Transcribe the text shown in this image directly.",
+            "What exact text is written in this image? Answer directly and concisely.",
+        )
+        try:
+            info = api.dataset_info("naver-clova-ix/synthdog-en")
+            train_pqs = sorted(
+                s.rfilename
+                for s in (info.siblings or [])
+                if s.rfilename.startswith("data/train-") and s.rfilename.endswith(".parquet")
+            )
+            for shard in train_pqs[:2]:
+                if sd_count >= max_synthdog:
+                    break
+                pq_path = hf_hub_download("naver-clova-ix/synthdog-en", shard, repo_type="dataset", token=token)
+                tbl = pq.read_table(pq_path, columns=["image", "ground_truth"])
+                idxs = list(range(tbl.num_rows))
+                rng.shuffle(idxs)
+                for ridx in idxs:
+                    if sd_count >= max_synthdog:
+                        break
+                    row = tbl.slice(ridx, 1).to_pylist()[0]
+                    gt_raw = str(row.get("ground_truth") or "")
+                    try:
+                        gt_obj = json.loads(gt_raw)
+                        txt = str((gt_obj.get("gt_parse") or {}).get("text_sequence") or "").strip()
+                    except Exception:
+                        continue
+                    txt = re.sub(r"\s+", " ", txt).strip()
+                    if not (16 <= len(txt) <= 220):
+                        continue
+                    # Skip noisy OCR artifacts or degenerate repetition
+                    if txt.count("  ") > 0:
+                        continue
+                    jpg = _encode_rgb_jpeg(row.get("image"), max_side=896)
+                    if jpg is None:
+                        continue
+                    h = hashlib.sha256(f"synthdog:{shard}:{ridx}:{txt[:48]}".encode("utf-8")).hexdigest()[:14]
+                    mem = f"hf_synthdog_{h}.jpg"
+                    rec = {
+                        "id": f"stage105_hf_synthdog_{h}",
+                        "source_group": "stage105_hf_synthdog_train",
+                        "language": "en",
+                        "task": "stage105_direct_ocr_transcription",
+                        "visual_kind": "independent_image",
+                        "frames": [mem],
+                        "enable_thinking": False,
+                        "prompt": sd_prompts[sd_count % len(sd_prompts)],
+                        "answer": txt,
+                        "target": {"kind": "text", "text": txt},
+                        "metadata": {
+                            "source": "naver-clova-ix/synthdog-en",
+                            "license_spdx": "MIT",
+                            "split": "train",
+                            "real_document_scan": True,
+                            "pixel_indispensable": True,
+                        },
+                    }
+                    out_pairs.append((rec, {mem: jpg}))
+                    sd_count += 1
+        except Exception as exc:
+            emit("stage105_hf_synthdog_warning", error=str(exc)[:180])
+        emit("stage105_hf_synthdog_ready", count=sd_count)
+
+    rng.shuffle(out_pairs)
+    return out_pairs

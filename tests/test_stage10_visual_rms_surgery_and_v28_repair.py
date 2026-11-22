@@ -14,6 +14,7 @@ import torch
 from colab.final.frontier_stage9_corpus import (
     build_synthetic_scene_ocr_pairs,
     build_v28_grammar_repair_records,
+    convert_catalogue_row_to_direct_mode,
 )
 from colab.final.model import (
     RadioMultiLayerSwiGLUProjector,
@@ -88,6 +89,16 @@ def test_load_spark_native_safetensors_warmstarts_stage9_to_stage10_rms_match():
         assert abs(float(m_s10.vision_projector.out_scale.item()) - 0.035) < 1e-6
         assert abs(float(m_s10.vision_projector.meta_scale.item()) - 0.008) < 1e-6
 
+        # Stage-10.5 clean projector re-init: preserves `other` bit-exact while keeping fresh zero-bias `vision_projector`!
+        m_s105 = _MiniModel(rms_match=True)
+        fresh_w_gate = m_s105.vision_projector.w_gate.weight.detach().clone()
+        load_spark_native_safetensors(m_s105, sf, allow_missing_projector_reinit=True)
+        assert torch.allclose(m_s105.other.weight, m_s9.other.weight)
+        assert torch.allclose(m_s105.vision_projector.w_gate.weight, fresh_w_gate)
+        assert not torch.allclose(m_s105.vision_projector.w_gate.weight, m_s9.vision_projector.w_gate.weight)
+        assert float(m_s105.vision_projector.w_down.bias.abs().max().item()) == 0.0
+        assert float(m_s105.vision_projector.early_mid_proj.bias.abs().max().item()) == 0.0
+
 
 def test_stage10_six_mode_synthetic_ocr_and_v28_grammar_repair_corpus():
     # 1. 6-mode synthetic OCR including Bar-Chart VQA & Dense Table VQA (all full-color RGB chroma > 10!)
@@ -133,13 +144,23 @@ def test_stage10_six_mode_synthetic_ocr_and_v28_grammar_repair_corpus():
 }
 """
     mock_v28 = [{"id": "sample_v28_rig", "answer": f"<think>\nBuild clean rig.\n</think>\n```blockdsl\n{clean_dsl}\n```"}]
-    repairs = build_v28_grammar_repair_records(mock_v28, seed=20261150, max_items=16)
-    assert len(repairs) >= 6
+    repairs = build_v28_grammar_repair_records(mock_v28, seed=20261150, max_items=24)
+    assert len(repairs) >= 9
     mutations = {r["metadata"].get("mutation") for r in repairs if r["metadata"].get("mutation")}
-    assert {"texel_size", "root_keyword", "box_axis", "bone_and"}.issubset(mutations)
+    assert {"texel_size", "root_keyword", "box_axis", "bone_and", "palette_rgb", "meta_author", "size_step_025"}.issubset(mutations)
     for r in repairs:
         if r["metadata"].get("mutation"):
             assert r["metadata"]["parser_error"]
             repaired_dsl = _extract_dsl_candidate(r["answer"])
             assert repaired_dsl and "@rig" in repaired_dsl
             parse_program(repaired_dsl)
+
+    # 3. Direct-mode conversion preserves multi-line `document_ocr` transcriptions instead of cutting to line 1
+    doc_row = {
+        "task": "document_ocr",
+        "prompt": "Read all visible text in reading order.",
+        "answer": "Line One Header\n" + ("Line Two Body Content " * 14),
+    }
+    doc_direct = convert_catalogue_row_to_direct_mode(doc_row)
+    assert doc_direct["enable_thinking"] is False
+    assert "Line One Header\nLine Two Body Content" in doc_direct["answer"]
