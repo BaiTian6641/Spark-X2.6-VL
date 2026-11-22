@@ -52,6 +52,7 @@ from colab.final.frontier_stage9_corpus import (  # noqa: E402
 )
 from colab.final.inference import generate, visual_media  # noqa: E402
 from colab.final.model import SparkNative, load_spark_native_safetensors  # noqa: E402
+from colab.final.reasoning_agentic_corpus import check_generation_collapse_health  # noqa: E402
 from colab.final.spatial_3d_primitives_corpus import (  # noqa: E402
     build_nemotron_v3_spatial_records,
     build_shaded_3d_spatial_primitives_records,
@@ -238,7 +239,17 @@ def main() -> None:
     v28_records = build_aesthetic_v28_biomech_records(seed=args.seed, max_records=args.v28_max_records)
     v28_pixel_only = [r for r in v28_records if (r.get("metadata") or {}).get("pixel_indispensable") and r.get("images")]
     v28_repair_records = build_v28_grammar_repair_records(v28_records, seed=args.seed + 5, max_items=args.v28_repair_max)
-    spatial3d_pairs = build_shaded_3d_spatial_primitives_records(seed=args.seed + 11, panel_size=(384, 384), angles_per_asset=6)
+    raw_spatial3d_pairs = build_shaded_3d_spatial_primitives_records(seed=args.seed + 11, panel_size=(384, 384), angles_per_asset=6)
+    spatial3d_pairs = [
+        pair
+        for pair in raw_spatial3d_pairs
+        if check_generation_collapse_health(
+            str(pair[0].get("answer") or ""),
+            expect_thinking=bool(pair[0].get("enable_thinking", True)),
+            max_rep_4gram=0.140,
+            max_think_chars=4800,
+        )["healthy"]
+    ]
     hf_real_ocr_pairs = build_hf_real_ocr_pairs(
         token=hf_token,
         max_docvqa=args.hf_docvqa_max,
