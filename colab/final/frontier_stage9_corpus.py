@@ -1421,7 +1421,7 @@ def build_v28_grammar_repair_records(
                 "- **`size_step:0.5`**: Every `size:[x,y,z]` value must end in `.0` or `.5` (e.g. `[2.5, 4, 3.5]`, never `0.25` or `5.25`).\n"
                 "- **`@palette`**: Always use `ramp(base_lch=[L,C,H], steps=..., hue_shift=[...])`; never use `rgb(...)`.\n"
                 "- **`@meta`**: Only valid keys (`archetype`, `target_profile`, `texel_density`, `units_per_block`, `dsl_version`, `size_step`, `audit_profile`); never add `author`.\n"
-                "- **SyncCraft Gait Enum**: `pattern` in `propose_gait_from_style` JSON must be an exact canonical enum token such as `\"lateral_sequence\"`, `\"trot\"`, `\"gallop\"`, `\"bound\"`, `\"pace\"`, `\"stalk\"`, `\"biped_walk\"`, `\"biped_run\"`, `\"fly\"`, or `\"swim\"` — never a prose phrase."
+                "- **SyncCraft Gait Enum**: `pattern` in `propose_gait_from_style` JSON must be an exact canonical enum token from `GAIT_PATTERNS`: `\"lateral_sequence\"`, `\"diagonal_pairs\"`, `\"rotary_gallop\"`, `\"transverse_gallop\"`, `\"biped_alternate\"`, `\"sprawl_diagonal\"`, `\"hexapod_tripod\"`, `\"metachronal_wave\"`, `\"serpentine_wave\"`, or `\"swim_undulate\"` — never a prose phrase."
             ),
         ),
     )

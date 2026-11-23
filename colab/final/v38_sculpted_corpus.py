@@ -363,13 +363,13 @@ def _build_origami_flyer_v38(idx: int, *, v38: bool) -> dict[str, Any]:
 
 def _build_quadruped_pole_a_v38(idx: int, *, v38: bool) -> dict[str, Any]:
     specs = (
-        ("ochre_steppe_gazelle", 7.0, 6.0, 13.0, 5.5, 5.5, "trot", 0.30),
+        ("ochre_steppe_gazelle", 7.0, 6.0, 13.0, 5.5, 5.5, "diagonal_pairs", 0.30),
         ("slate_tundra_caribou", 8.5, 7.0, 15.0, 6.0, 6.0, "lateral_sequence", 0.22),
-        ("terracotta_mesa_hound", 7.0, 6.0, 12.5, 4.5, 4.5, "trot", 0.28),
+        ("terracotta_mesa_hound", 7.0, 6.0, 12.5, 4.5, 4.5, "diagonal_pairs", 0.28),
         ("ivory_orchard_ram", 8.0, 6.5, 13.5, 4.5, 4.5, "lateral_sequence", 0.20),
         ("moss_hollow_tapir", 8.5, 7.0, 14.0, 4.0, 4.0, "lateral_sequence", 0.18),
-        ("sandstone_dune_oryx", 7.5, 6.5, 14.0, 5.5, 5.5, "trot", 0.26),
-        ("indigo_highland_fox", 6.5, 5.5, 12.0, 4.0, 4.0, "trot", 0.30),
+        ("sandstone_dune_oryx", 7.5, 6.5, 14.0, 5.5, 5.5, "diagonal_pairs", 0.26),
+        ("indigo_highland_fox", 6.5, 5.5, 12.0, 4.0, 4.0, "diagonal_pairs", 0.30),
         ("cedar_grove_bear", 10.0, 8.0, 15.5, 5.0, 5.0, "lateral_sequence", 0.18),
     )
     name, bw, bh, bl, up_l, lo_l, gpat, fr = specs[idx]
