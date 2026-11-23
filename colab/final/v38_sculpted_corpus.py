@@ -50,6 +50,7 @@ from PIL import Image
 
 from .common import emit
 from .reasoning_agentic_corpus import check_generation_collapse_health
+from .sculpted_style_corpus import bake_sculpted_rgba_atlas
 from .spatial_3d_primitives_corpus import (
     STUDIO_LIGHTING_PRESETS,
     fmt_box,
@@ -1090,32 +1091,35 @@ def build_v38_64_archetype_corpus(
         angles = ((34.0, 18.0), (-36.0, 20.0), (145.0, 22.0))
         for r_i, spec in enumerate(picked):
             prog = parse_program(spec["dsl"])
+            baked = bake_sculpted_rgba_atlas(prog)
             az, el = angles[r_i % len(angles)]
-            preset = STUDIO_LIGHTING_PRESETS[r_i % len(STUDIO_LIGHTING_PRESETS)]
-            im, meta = render_shaded_3d_with_spatial_annotations(
+            meta = render_shaded_3d_with_spatial_annotations(
                 prog,
-                azimuth_deg=az,
-                elevation_deg=el,
-                size=(384, 384),
-                lighting_preset=preset,
+                baked,
+                az_deg=az,
+                el_deg=el,
+                panel_size=(384, 384),
+                studio_preset=r_i % len(STUDIO_LIGHTING_PRESETS),
             )
-            arr = np.asarray(im.convert("RGB"), dtype=np.float32)
+            arr = meta["rgb_array"].astype(np.float32)
             chroma = float(np.abs(arr[:, :, 0] - arr[:, :, 1]).mean() + np.abs(arr[:, :, 1] - arr[:, :, 2]).mean())
             if chroma < 10.5:
                 continue
-            pts = meta.get("bone_points") or {}
-            boxes_2d = meta.get("bone_boxes") or {}
+            bones_info = meta.get("bones") or {}
+            edges = meta.get("kinematic_edges") or []
             prim_lines: list[str] = []
-            for bn, info in list(pts.items())[:5]:
-                prim_lines.append(fmt_point(info["x"], info["y"], info.get("z_tier", "mid"), bn))
-            for bn, bb in list(boxes_2d.items())[:3]:
+            for bn, info in list(bones_info.items())[:5]:
+                prim_lines.append(fmt_point(info["cx"], info["cy"], info.get("depth_tier", "mid"), bn))
+            for bn, info in list(bones_info.items())[:3]:
+                bb = info["box"]
                 prim_lines.append(fmt_box(bb[0], bb[1], bb[2], bb[3], bn))
-            pt_list = list(pts.items())
-            if len(pt_list) >= 2:
-                b0, p0 = pt_list[0]
-                b1, p1 = pt_list[1]
-                prim_lines.append(fmt_dash(p0["x"], p0["y"], p1["x"], p1["y"], f"{b0}_to_{b1}"))
-                prim_lines.append(fmt_circle(p0["x"], p0["y"], 38, f"pivot_{b0}"))
+            if edges:
+                e0 = edges[0]
+                prim_lines.append(fmt_dash(e0["x1"], e0["y1"], e0["x2"], e0["y2"], f"{e0['parent']}_to_{e0['child']}"))
+            if bones_info:
+                b0, p0 = next(iter(bones_info.items()))
+                px, py = p0["pivot_xy"]
+                prim_lines.append(fmt_circle(px, py, max(20.0, min(90.0, p0["radius"])), f"pivot_{b0}"))
             prims_str = " ".join(prim_lines)
             think = (
                 f"Inspecting the full-color sculpted 3D render ({spec['domain']}/{spec['mood']}, {spec['polarity']}): "
@@ -1125,8 +1129,6 @@ def build_v38_64_archetype_corpus(
             ans = f"<think>\n{think}\n</think>\n```blockdsl\n{spec['dsl']}\n```"
             if not check_generation_collapse_health(ans, expect_thinking=True, max_rep_4gram=0.140)["healthy"]:
                 continue
-            buf = io.BytesIO()
-            im.save(buf, format="PNG")
             mem = f"v38_render_{spec['asset_id']}.png"
             vrow = {
                 "id": f"stage11_v38_vis_{spec['asset_id']}",
@@ -1150,7 +1152,7 @@ def build_v38_64_archetype_corpus(
                     "chroma": round(chroma, 2),
                 },
             }
-            visual_pairs.append((vrow, {mem: buf.getvalue()}))
+            visual_pairs.append((vrow, {mem: meta["png_bytes"]}))
 
     # 14-Mutator Solver-Verified v38.8 Grammar & Punctuation Self-Repair Records
     def _mut_texel_size(s: str) -> tuple[str, str]:
