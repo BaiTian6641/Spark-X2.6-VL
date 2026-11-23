@@ -2046,7 +2046,7 @@ class SparkNative(nn.Module):
                         pre_res = None
                     features = bridge.forward(
                         {'pixel_values': batch['pixel_values']},
-                        training_mode=self.training,
+                        training_mode=bool(self.training and torch.is_grad_enabled()),
                         out_device=self.device,
                         out_dtype=vis_dtype,
                         prefetched_result=pre_res,
@@ -2076,7 +2076,7 @@ class SparkNative(nn.Module):
                         pre_res = None
                     features = bridge.forward(
                         batch,
-                        training_mode=self.training,
+                        training_mode=bool(self.training and torch.is_grad_enabled()),
                         out_device=self.device,
                         out_dtype=vis_dtype,
                         prefetched_result=pre_res,
@@ -2764,11 +2764,47 @@ class SparkNative(nn.Module):
             return ids_t, ids_t, max(1, int(ids_t.numel()))
         return ids_t, lbl_t, sup_cnt
 
+    def _visual_decorrelation_loss(self, vis_tokens: torch.Tensor | None) -> torch.Tensor | None:
+        """Differentiable anti-DC-collapse & spatial-diversity penalty on projected visual tokens.
+
+        Prevents `vision_projector` from collapsing spatially distinct `C-RADIOv4-H` patches into a
+        rank-1 constant DC stub (`mean_norm >> std_norm`, pairwise cosine -> 0.93) while staying
+        strictly zero once visual tokens maintain healthy spatial contrast (`dc_ratio <= target`
+        and `mean_off_diag_cos <= target_cos`).
+        """
+        w = float(self.policy.get('visual_decorr_loss_weight', 0.0) or 0.0)
+        if w <= 0.0 or vis_tokens is None or not self.training or not torch.is_grad_enabled():
+            return None
+        if vis_tokens.ndim != 3 or vis_tokens.shape[1] < 4:
+            return None
+        v = vis_tokens.float()
+        v_mean = v.mean(dim=1)
+        v_std = v.std(dim=1, unbiased=False)
+        dc_ratio = v_mean.norm(dim=-1) / (v_std.norm(dim=-1) + 1e-4)
+        target_dc = float(self.policy.get('visual_decorr_target_dc_ratio', 0.65))
+        loss_dc = F.relu(dc_ratio - target_dc).pow(2).mean()
+
+        # Strided spatial subsample (<= 64 tokens) for O(1) pairwise off-diagonal cosine diversity penalty
+        toks = v[0]
+        n_tok = int(toks.shape[0])
+        stride = max(1, n_tok // 64)
+        sub = F.normalize(toks[::stride][:64], dim=-1, eps=1e-6)
+        k = int(sub.shape[0])
+        if k >= 2:
+            gram = sub @ sub.transpose(0, 1)
+            off_cos = (gram.sum() - gram.diagonal().sum()) / float(k * (k - 1))
+            target_cos = float(self.policy.get('visual_decorr_target_cos', 0.35))
+            loss_cos = F.relu(off_cos - target_cos).pow(2)
+        else:
+            loss_cos = loss_dc.new_zeros(())
+        return w * (loss_dc + loss_cos)
+
     def text_loss(self,row,media):
         sup_row=self._effective_supervised_row(row)
         bot_close=self.chat.layouts[bool(sup_row.get('enable_thinking',False))]['bot_close']
         ids,labels,sup_cnt=self._encode_answer_ids_and_labels(sup_row['answer']+bot_close)
         router_z_loss=None
+        vis_decorr_loss=None
         if not has_multimodal_context(media):
             pre,post=self.prompt_ids_for_row(sup_row,for_generation=False)
             prefix_ids=torch.tensor(pre+post,device=self.device,dtype=torch.long)[None]
@@ -2790,6 +2826,7 @@ class SparkNative(nn.Module):
                     hidden=self.spark.model(input_ids=full_ids,attention_mask=torch.ones_like(full_ids),use_cache=False,return_dict=True).last_hidden_state[:,prefix_ids.shape[1]-1:-1]
         else:
             prefix,vis_ctx,pref_ids,pref_tmask=self.prefix_with_visual_context_and_ids(sup_row,media,for_generation=False)
+            vis_decorr_loss=self._visual_decorrelation_loss(vis_ctx)
             if ids.shape[1]>self.policy['max_answer_tokens'] or prefix.shape[1]+ids.shape[1]>self.policy['max_sequence']:
                 raise ValueError('Supervision would be truncated; revise a versioned context policy')
             embeds=torch.cat([prefix,self.get_input_embeddings()(ids)],dim=1)
@@ -2822,6 +2859,8 @@ class SparkNative(nn.Module):
         loss_val=total/sup_cnt
         if router_z_loss is not None and self.training and torch.is_grad_enabled():
             loss_val=loss_val+float(self.policy.get('router_z_loss_weight',1e-4))*router_z_loss
+        if vis_decorr_loss is not None:
+            loss_val=loss_val+vis_decorr_loss.to(dtype=loss_val.dtype)
         return loss_val,sup_cnt
 
     def text_batch_loss(self,examples):
@@ -2899,10 +2938,12 @@ class SparkNative(nn.Module):
 
         prepared=[]
         single_vis_ctx=None
+        decorr_losses=[]
         for row,media in examples:
             sup_row=self._effective_supervised_row(row)
             prefix,vis_ctx,pref_ids,pref_tmask=self.prefix_with_visual_context_and_ids(sup_row,media,for_generation=False)
             if vis_ctx is not None: single_vis_ctx=vis_ctx
+            decorr_losses.append(self._visual_decorrelation_loss(vis_ctx))
             bot_close=self.chat.layouts[bool(sup_row.get('enable_thinking',False))]['bot_close']
             ids,lbls,sup_cnt=self._encode_answer_ids_and_labels(sup_row['answer']+bot_close)
             if ids.shape[1]>self.policy['max_answer_tokens'] or prefix.shape[1]+ids.shape[1]>self.policy['max_sequence']:
@@ -2956,6 +2997,8 @@ class SparkNative(nn.Module):
             )
             l_i=total/sup_cnt
             if z_add is not None: l_i=l_i+z_add
+            if decorr_losses[i] is not None:
+                l_i=l_i+decorr_losses[i].to(dtype=l_i.dtype)
             losses.append(l_i); units.append(sup_cnt)
         return losses,units
 
@@ -3000,7 +3043,9 @@ class SparkNative(nn.Module):
         cur_ids = input_ids
         fed_tail_ids: torch.Tensor | None = None
         length = int(input_ids.shape[1])
-        max_seq = int(getattr(self, 'policy', {}).get('max_sequence', 8192))
+        policy_seq = int(getattr(self, 'policy', {}).get('max_sequence', 8192))
+        pos_limit = int(getattr(getattr(self, 'spark', None), 'config', None).max_position_embeddings) if hasattr(getattr(getattr(self, 'spark', None), 'config', None), 'max_position_embeddings') else max(policy_seq, 32768)
+        max_seq = min(pos_limit, max(policy_seq, length + int(max_new_tokens) + 1))
         eos_id = self.tokenizer.eos_token_id
         think_budget_checked = False
         use_loop = bool(getattr(self, 'enable_loop_engram', False))
@@ -3171,10 +3216,13 @@ class SparkNative(nn.Module):
         cur_tok: torch.Tensor | None = None
         fed_tail_ids: torch.Tensor | None = None
         length = embeds.shape[1]
+        policy_seq = int(getattr(self, 'policy', {}).get('max_sequence', 8192))
+        pos_limit = int(getattr(getattr(self, 'spark', None), 'config', None).max_position_embeddings) if hasattr(getattr(getattr(self, 'spark', None), 'config', None), 'max_position_embeddings') else max(policy_seq, 32768)
+        eval_max_seq = min(pos_limit, max(policy_seq, length + int(max_new_tokens) + 1))
         think_budget_checked = False
         with self._visual_cross_attn_scope(vis_ctx):
             for _ in range(max_new_tokens):
-                if length + len(generated) >= self.policy['max_sequence']:
+                if length + len(generated) >= eval_max_seq:
                     break
                 if (
                     eff_max_think is not None
@@ -3188,7 +3236,7 @@ class SparkNative(nn.Module):
                     cur_txt = self.tokenizer.decode(generated, skip_special_tokens=False)
                     if '</think>' not in cur_txt:
                         close_ids = list(self.tokenizer.encode('\n</think>\n', add_special_tokens=False))
-                        if close_ids and length + len(generated) + len(close_ids) < self.policy['max_sequence']:
+                        if close_ids and length + len(generated) + len(close_ids) < eval_max_seq:
                             bridge_toks = torch.tensor(
                                 [[int(generated[-1]), *close_ids[:-1]]],
                                 device=self.device,

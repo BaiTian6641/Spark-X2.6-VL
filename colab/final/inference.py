@@ -99,7 +99,11 @@ def generate(
     eff_max_think=(
         max_think_tokens
         if max_think_tokens is not None
-        else (min(768, max(64, int(max_new_tokens * 0.55))) if (enable_thinking and max_new_tokens >= 128) else None)
+        else (
+            max(64, int(max_new_tokens) - min(512, max(96, int(max_new_tokens * 0.15))))
+            if (enable_thinking and max_new_tokens >= 128)
+            else None
+        )
     )
     row={
         '_family':fam,

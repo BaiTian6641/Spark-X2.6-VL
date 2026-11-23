@@ -186,6 +186,7 @@ def _gen(
     *,
     enable_thinking: bool = True,
     max_new_tokens: int = 1024,
+    max_think_tokens: int | None = None,
     do_sample: bool = False,
     temperature: float = 0.55,
 ) -> str:
@@ -196,6 +197,7 @@ def _gen(
         media=media,
         enable_thinking=enable_thinking,
         max_new_tokens=max_new_tokens,
+        max_think_tokens=max_think_tokens,
         do_sample=do_sample,
         temperature=temperature,
         top_p=0.92,
@@ -357,7 +359,14 @@ def _decode_pil_field(val: Any) -> Image.Image | None:
     return None
 
 
-def eval_hle_frontier(model: Any, token: str | None, *, limit: int = 80, seed: int = 20261121) -> dict[str, Any]:
+def eval_hle_frontier(
+    model: Any,
+    token: str | None,
+    *,
+    limit: int = 80,
+    seed: int = 20261121,
+    max_new_tokens: int = 2048,
+) -> dict[str, Any]:
     """Evaluate `cais/hle-diamond` (preferred) -> `cais/hle-rolling` -> untouched 20% `cais/hle` holdout (`0%` train overlap)."""
     t0 = time.monotonic()
     source_repo = HLE_DIAMOND_REPO_ID
@@ -434,7 +443,14 @@ def eval_hle_frontier(model: Any, token: str | None, *, limit: int = 80, seed: i
         prompt = (
             f"{q}\n\nReason carefully inside `<think>...</think>` and end with `Final Answer: <answer>`."
         )
-        out = _gen(model, prompt, imgs, enable_thinking=True, max_new_tokens=960)
+        out = _gen(
+            model,
+            prompt,
+            imgs,
+            enable_thinking=True,
+            max_new_tokens=max_new_tokens,
+            max_think_tokens=max(512, max_new_tokens - 256),
+        )
         if check_generation_collapse_health(out, expect_thinking=True, max_rep_4gram=0.14)["healthy"]:
             healthy += 1
         _, body = strip_think_block(out)
@@ -481,7 +497,14 @@ def eval_hle_frontier(model: Any, token: str | None, *, limit: int = 80, seed: i
     }
 
 
-def eval_gpqa_diamond(model: Any, token: str | None, *, limit: int = 198, seed: int = 20261121) -> dict[str, Any]:
+def eval_gpqa_diamond(
+    model: Any,
+    token: str | None,
+    *,
+    limit: int = 198,
+    seed: int = 20261121,
+    max_new_tokens: int = 2048,
+) -> dict[str, Any]:
     """Evaluate `100%` held-out `GPQA-Diamond` (`Idavidrein/gpqa/gpqa_diamond.csv`, `CC-BY-4.0`)."""
     t0 = time.monotonic()
     csv_path = _hf_file(GPQA_REPO_ID, "gpqa_diamond.csv", revision=GPQA_REVISION, token=token)
@@ -511,7 +534,13 @@ def eval_gpqa_diamond(model: Any, token: str | None, *, limit: int = 198, seed: 
             f"{q}\n\nOptions:\n{opts_fmt}\n\n"
             "Derive the answer step by step inside `<think>...</think>` and conclude with `Answer: (<letter>)`."
         )
-        out = _gen(model, prompt, enable_thinking=True, max_new_tokens=960)
+        out = _gen(
+            model,
+            prompt,
+            enable_thinking=True,
+            max_new_tokens=max_new_tokens,
+            max_think_tokens=max(512, max_new_tokens - 256),
+        )
         _, body = strip_think_block(out)
         pred = _extract_choice_letter(body, "ABCD")
         hit = pred == gt_let
@@ -765,14 +794,25 @@ def eval_simpleqa_verified(model: Any, token: str | None, *, limit: int = 120, s
     }
 
 
-def eval_aime_2026(model: Any, token: str | None, *, limit: int = 30) -> dict[str, Any]:
-    """Evaluate `MathArena/aime_2026` (`30` official competition math problems; strictly eval-only, exact `000..999`)."""
+def eval_aime_2026(
+    model: Any,
+    token: str | None,
+    *,
+    limit: int = 30,
+    max_new_tokens: int = 8192,
+) -> dict[str, Any]:
+    """Evaluate `MathArena/aime_2026` (`30` official competition math problems; strictly eval-only, exact `000..999`).
+
+    Uses full reasoning token budget (`default=8192`, `max_think_tokens=max_new_tokens-384`) so Loop48 deep math
+    derivations are never prematurely truncated at 768/1400 tokens.
+    """
     t0 = time.monotonic()
     pq_path = _hf_file(AIME_2026_REPO_ID, "data/train-00000-of-00001.parquet", revision=AIME_2026_REVISION, token=token)
     rows = pq.read_table(pq_path).to_pylist()[:limit]
 
     correct = 0
     healthy = 0
+    gen_chars_sum = 0
     for r in rows:
         prob = str(r.get("problem") or "").strip()
         gt_int = re.sub(r"[^0-9]", "", str(r.get("answer") or "")).lstrip("0") or "0"
@@ -780,15 +820,29 @@ def eval_aime_2026(model: Any, token: str | None, *, limit: int = 30) -> dict[st
             f"{prob}\n\nSolve step by step inside `<think>...</think>`. The answer is an integer from 0 to 999. "
             "End with `Final Answer: \\boxed{<integer>}`."
         )
-        out = _gen(model, prompt, enable_thinking=True, max_new_tokens=1400)
-        if check_generation_collapse_health(out, expect_thinking=True, max_rep_4gram=0.14)["healthy"]:
+        out = _gen(
+            model,
+            prompt,
+            enable_thinking=True,
+            max_new_tokens=max_new_tokens,
+            max_think_tokens=max(512, max_new_tokens - 384),
+        )
+        gen_chars_sum += len(out)
+        if check_generation_collapse_health(
+            out,
+            expect_thinking=True,
+            max_rep_4gram=0.14,
+            max_think_chars=max(6000, max_new_tokens * 5),
+        )["healthy"]:
             healthy += 1
         _, body = strip_think_block(out)
         m_box = re.search(r"\\boxed\{\s*0*(\d{1,4})\s*\}", body)
+        if not m_box:
+            m_box = re.search(r"Final\s+Answer\s*[:=]\s*\$?0*(\d{1,4})\$?", body, flags=re.IGNORECASE)
         if m_box:
             pred_int = m_box.group(1).lstrip("0") or "0"
         else:
-            nums = re.findall(r"\b0*(\d{1,3})\b", body[-120:])
+            nums = re.findall(r"\b0*(\d{1,3})\b", body[-160:])
             pred_int = (nums[-1].lstrip("0") or "0") if nums else ""
         if pred_int == gt_int:
             correct += 1
@@ -802,6 +856,8 @@ def eval_aime_2026(model: Any, token: str | None, *, limit: int = 30) -> dict[st
         "correct": correct,
         "accuracy": round(correct / n, 4),
         "healthy_think_rate": round(healthy / n, 4),
+        "max_new_tokens": int(max_new_tokens),
+        "mean_gen_chars": round(gen_chars_sum / n, 1),
         "zero_train_overlap_verified": True,
         "elapsed_s": round(time.monotonic() - t0, 2),
     }
@@ -930,27 +986,29 @@ def eval_v28_sculpted_and_gate_d(model: Any, export_dir: Path) -> dict[str, Any]
         last_err = ""
         item_one_shot_compiled = False
         item_one_shot_strict = False
-        for attempt in range(2):
+        for attempt in range(4):
             if attempt == 0:
                 cur_prompt = item["prompt"]
             else:
-                # Deterministic SyncCraft parser/compiler feedback ONLY (zero ground truth!)
+                # Deterministic SyncCraft parser/compiler feedback ONLY (<= 3 re-audits per SyncCraft AGENTS.md; zero ground truth!)
                 cur_prompt = (
-                    f"[SyncCraft Block-DSL v4.1 Compiler Repair]\n"
+                    f"[SyncCraft Block-DSL v4.1 Compiler Repair — Attempt {attempt}/3]\n"
                     f"Your previous Block-DSL v4.1 draft failed SyncCraft verification with:\n"
                     f"  Error: {last_err or 'no valid @rig block emitted'}\n\n"
                     f"Previous draft:\n```blockdsl\n{last_cand[:4200]}\n```\n\n"
                     f"Original brief:\n{item['prompt']}\n\n"
                     "Diagnose the exact Block-DSL v4.1 grammar/structural violation inside `<think>...</think>` "
-                    "(use valid `@meta` keys `texel_density`/`units_per_block`, `root bone <name>`, valid `box` keys only) "
+                    "(valid `@meta` keys only, `ramp(base_lch=...)` in `@palette`, `size_step:0.5` multiples, `root bone <name>`, "
+                    "valid `box` keys including `sculpt_group`/`inset_carve`/`uv_scale`, no stray punctuation) "
                     "and output ONLY the repaired, compilable ```blockdsl ... ``` program."
                 )
             out = _gen(
                 model,
                 cur_prompt,
-                max_new_tokens=1600,
+                max_new_tokens=2048,
+                max_think_tokens=640,
                 do_sample=(attempt > 0),
-                temperature=0.45,
+                temperature=0.35 if attempt == 1 else 0.50,
             )
             if attempt > 0:
                 total_repair_tokens += max(1, len(out) // 4)
@@ -1056,6 +1114,9 @@ def main() -> None:
     ap.add_argument("--gpqa-limit", type=int, default=198)
     ap.add_argument("--simpleqa-limit", type=int, default=120)
     ap.add_argument("--aime-limit", type=int, default=30)
+    ap.add_argument("--aime-max-new-tokens", type=int, default=8192)
+    ap.add_argument("--hle-max-new-tokens", type=int, default=2048)
+    ap.add_argument("--gpqa-max-new-tokens", type=int, default=2048)
     ap.add_argument("--cvbench-limit", type=int, default=120)
     ap.add_argument("--sr3d-limit", type=int, default=120)
     ap.add_argument("--mmmu-pro-limit", type=int, default=120)
@@ -1100,12 +1161,20 @@ def main() -> None:
                 write(report_path, report)
             if "hle" in wanted:
                 m_res["benchmarks"]["hle_frontier"] = eval_hle_frontier(
-                    model, token, limit=args.hle_limit, seed=args.seed
+                    model,
+                    token,
+                    limit=args.hle_limit,
+                    seed=args.seed,
+                    max_new_tokens=args.hle_max_new_tokens,
                 )
                 write(report_path, report)
             if "gpqa" in wanted:
                 m_res["benchmarks"]["gpqa_diamond"] = eval_gpqa_diamond(
-                    model, token, limit=args.gpqa_limit, seed=args.seed
+                    model,
+                    token,
+                    limit=args.gpqa_limit,
+                    seed=args.seed,
+                    max_new_tokens=args.gpqa_max_new_tokens,
                 )
                 write(report_path, report)
             if "simpleqa" in wanted:
@@ -1114,7 +1183,12 @@ def main() -> None:
                 )
                 write(report_path, report)
             if "aime2026" in wanted:
-                m_res["benchmarks"]["aime_2026"] = eval_aime_2026(model, token, limit=args.aime_limit)
+                m_res["benchmarks"]["aime_2026"] = eval_aime_2026(
+                    model,
+                    token,
+                    limit=args.aime_limit,
+                    max_new_tokens=args.aime_max_new_tokens,
+                )
                 write(report_path, report)
             if "cvbench3d" in wanted:
                 m_res["benchmarks"]["cv_bench_3d"] = eval_cv_bench_3d(

@@ -148,6 +148,17 @@ def _run_stage8_phase(
         "defrost_loop_engram",
     )
     eff_cfg = {**base_cfg, **stage_cfg}
+    prev_decorr_keys = {
+        k: model.policy.get(k)
+        for k in ("visual_decorr_loss_weight", "visual_decorr_target_dc_ratio", "visual_decorr_target_cos")
+        if k in model.policy
+    }
+    for k in ("visual_decorr_loss_weight", "visual_decorr_target_dc_ratio", "visual_decorr_target_cos"):
+        if k in stage_cfg:
+            model.policy[k] = stage_cfg[k]
+    vis_margin_every_n = int(stage_cfg.get("visual_margin_every_n", 0) or 0)
+    vis_margin_target = float(stage_cfg.get("visual_margin_target", 0.25))
+    vis_margin_boost = float(stage_cfg.get("visual_margin_boost", 1.25))
     model._intel_vision_base_lr = _lr_for_group_and_name("vision", "vision.radio_model", eff_cfg)
     model.set_stage(
         alignment_only=is_frozen_spark,
@@ -230,6 +241,10 @@ def _run_stage8_phase(
     stratum_loss: dict[str, list[float]] = defaultdict(lambda: [0.0, 0.0])
     prefetched_ex: tuple[dict[str, Any], dict[str, Any]] | None = None
     prefetch_fut = None
+    vis_items_seen = 0
+    margin_adv_sum = 0.0
+    margin_hard_cnt = 0
+    margin_probe_cnt = 0
 
     try:
         for idx, (kind, payload) in enumerate(order_items):
@@ -242,12 +257,24 @@ def _run_stage8_phase(
             else:
                 ex = _materialize(idx, kind, payload)
 
-            if prefetch_pool is not None and (window_records + 1) < grad_accum and (idx + 1) < len(order_items):
+            row, media = ex
+            has_vis_imgs = row.get("_family") == "image" and bool(media.get("images"))
+            do_blank_margin = False
+            if has_vis_imgs:
+                vis_items_seen += 1
+                if vis_margin_every_n > 0 and (vis_items_seen % vis_margin_every_n == 0):
+                    do_blank_margin = True
+
+            if (
+                prefetch_pool is not None
+                and not do_blank_margin
+                and (window_records + 1) < grad_accum
+                and (idx + 1) < len(order_items)
+            ):
                 nk, npay = order_items[idx + 1]
                 prefetched_ex = _materialize(idx + 1, nk, npay)
                 prefetch_fut = prefetch_pool.submit(model.prefetch_examples_vision, [prefetched_ex])
 
-            row, media = ex
             is_long = use_cuda_amp and (len(str(row.get("prompt", ""))) + len(str(row.get("answer", ""))) > 8000)
             if is_long:
                 torch.cuda.empty_cache()
@@ -266,6 +293,27 @@ def _run_stage8_phase(
                 continue
 
             loss_f = float(loss_val.detach().item())
+            mb_weight = 1.0
+            if do_blank_margin:
+                blank_imgs = [Image.new("RGB", im.size, (128, 128, 128)) for im in media["images"]]
+                blank_media = visual_media(
+                    blank_imgs,
+                    visual_kind=str(media.get("visual_kind") or "independent_image"),
+                    visual_units=media.get("visual_units"),
+                )
+                with torch.no_grad(), amp_ctx():
+                    b_res = model(examples=[(row, blank_media)])
+                    loss_blank_f = float(b_res["per_example_loss"][0].detach().item())
+                if math.isfinite(loss_blank_f):
+                    adv = loss_blank_f - loss_f
+                    margin_adv_sum += adv
+                    margin_probe_cnt += 1
+                    if adv < vis_margin_target:
+                        margin_hard_cnt += 1
+                        deficit = min(1.0, max(0.0, (vis_margin_target - adv) / max(1e-4, vis_margin_target)))
+                        mb_weight = 1.0 + vis_margin_boost * deficit
+                b_res = None
+
             key = f"{row['_family']}:{row['language']}"
             stratum_loss[key][0] += loss_f
             stratum_loss[key][1] += 1.0
@@ -273,7 +321,7 @@ def _run_stage8_phase(
             mb_units = max(1, int(result.get("supervised_units", 1)))
             window_records += 1
 
-            with accumulator.microbatch(weight=1.0, supervised_units=mb_units):
+            with accumulator.microbatch(weight=mb_weight, supervised_units=mb_units):
                 if loss_val.requires_grad:
                     loss_val.backward()
             result = per = loss_val = None
@@ -312,6 +360,9 @@ def _run_stage8_phase(
                 recent = loss_hist[-min(len(loss_hist), grad_accum * 10) :]
                 mean_recent = sum(recent) / max(1, len(recent))
                 extra: dict[str, Any] = {}
+                if margin_probe_cnt > 0:
+                    extra["vis_adv_mean"] = round(margin_adv_sum / margin_probe_cnt, 4)
+                    extra["vis_hard_frac"] = round(margin_hard_cnt / margin_probe_cnt, 4)
                 if hasattr(model, "has_intel_vision_bridge") and model.has_intel_vision_bridge():
                     tel = model.intel_vision_telemetry()
                     lst = tel.get("last_step") or {}
@@ -334,6 +385,11 @@ def _run_stage8_phase(
                     **extra,
                 )
     finally:
+        for k in ("visual_decorr_loss_weight", "visual_decorr_target_dc_ratio", "visual_decorr_target_cos"):
+            if k in prev_decorr_keys:
+                model.policy[k] = prev_decorr_keys[k]
+            else:
+                model.policy.pop(k, None)
         if prefetch_pool is not None:
             prefetch_pool.shutdown(wait=True)
         accumulator.close()
@@ -356,6 +412,13 @@ def _run_stage8_phase(
         "updates_per_hour": round(step_index / max(1e-4, elapsed_s / 3600.0), 1),
         "mean_loss": round(sum(loss_hist) / max(1, len(loss_hist)), 4),
         "stratum_loss": {k: round(v[0] / max(1.0, v[1]), 4) for k, v in sorted(stratum_loss.items())},
+        "visual_margin_summary": {
+            "probes": margin_probe_cnt,
+            "mean_adv": round(margin_adv_sum / max(1, margin_probe_cnt), 4),
+            "hard_frac": round(margin_hard_cnt / max(1, margin_probe_cnt), 4),
+        }
+        if margin_probe_cnt > 0
+        else None,
         "param_partition": param_audit,
         "checkpoint": str(checkpoint_dir / "model.safetensors"),
     }

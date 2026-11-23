@@ -252,6 +252,8 @@ def build_apollo_param_groups(
         config.get("engram_lr", config.get("engram_learning_rate", base_connector_lr))
     )
     base_output_lr = float(config.get("output_lr", config.get("audio_output_learning_rate", 5e-6)))
+    early_spark_layers = int(config.get("early_spark_layers", 0) or 0)
+    early_spark_lr = float(config.get("early_spark_lr", base_backbone_lr))
     apollo_scale = float(
         config.get("apollo_scale", 128.0 if scale_kind == "tensor" and rank_val == 1 else 1.0)
     )
@@ -281,6 +283,11 @@ def build_apollo_param_groups(
         )
         is_vision = group_tag in ("vision", "motion", "speech_in", "sound_in")
         is_audio_out = group_tag in ("speech_output", "sound_output")
+        is_early_spark = False
+        if early_spark_layers > 0 and name.startswith("spark.model.layers."):
+            parts = name.split(".")
+            if len(parts) > 3 and parts[3].isdigit() and int(parts[3]) < early_spark_layers:
+                is_early_spark = True
         no_decay = param.ndim < 2 or name.endswith(".bias") or "norm" in name.lower() or "gate" in name.lower()
         wd = 0.0 if no_decay else weight_decay
 
@@ -290,7 +297,11 @@ def build_apollo_param_groups(
             else (
                 base_connector_lr
                 if is_connector
-                else (base_output_lr if is_audio_out else (base_vision_lr if is_vision else base_backbone_lr))
+                else (
+                    base_output_lr
+                    if is_audio_out
+                    else (base_vision_lr if is_vision else (early_spark_lr if is_early_spark else base_backbone_lr))
+                )
             )
         )
 

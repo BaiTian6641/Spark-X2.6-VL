@@ -52,6 +52,8 @@ def _lr_for_group_and_name(group:str,name:str,config:dict)->float:
     engram_lr=float(config.get('engram_lr',config.get('engram_learning_rate',conn_lr)))
     vis_lr=float(config.get('vision_lr',config.get('vision_learning_rate',base_lr*0.5)))
     out_lr=float(config.get('output_lr',config.get('audio_output_learning_rate',base_lr)))
+    early_n=int(config.get('early_spark_layers',0) or 0)
+    early_lr=float(config.get('early_spark_lr',base_lr))
     if group=='engram_mhc' or name.startswith(('engram_anchors.','loop_controllers.')):
         return engram_lr
     if group in ('connectors','visual_adapters') or '.bridge.' in name or 'default_voice' in name or 'visual_cross_attn' in name:
@@ -60,6 +62,10 @@ def _lr_for_group_and_name(group:str,name:str,config:dict)->float:
         return out_lr
     if group in ('vision','motion','speech_in','sound_in'):
         return vis_lr
+    if early_n>0 and name.startswith('spark.model.layers.'):
+        parts=name.split('.')
+        if len(parts)>3 and parts[3].isdigit() and int(parts[3])<early_n:
+            return early_lr
     return base_lr
 
 def optimizer_for(model,config,alignment=False):
