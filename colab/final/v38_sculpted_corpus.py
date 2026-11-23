@@ -91,7 +91,7 @@ def _ground_dsl_pivot_y(dsl: str) -> str:
 
     prog = parse_program(dsl)
     sc = compile_geometry(prog, validate=False)
-    min_y = min(float(b.corners_world[:, 1].min()) for b in sc.boxes)
+    min_y = min(float(b.corners()[:, 1].min()) for b in sc.boxes)
     if abs(min_y) < 0.05:
         return dsl
     m = re.search(r"pivot_local\s*:\s*\[\s*([-0-9.]+)\s*,\s*([-0-9.]+)\s*,\s*([-0-9.]+)\s*\]", dsl)
