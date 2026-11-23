@@ -25,9 +25,52 @@ import numpy as np
 from PIL import Image
 
 
+class _CompatFaceKey(tuple):
+    """Tuple-compatible FaceKey shim for SyncCraft 4d4f0b8..6031e58 `compiler.py:87` (`fk.box_name` on tuple key)."""
+
+    @property
+    def box_name(self) -> str:
+        return str(self[0])
+
+    @property
+    def face_name(self) -> str:
+        return str(self[1])
+
+
+def _install_synccraft_compiler_compat_shim() -> None:
+    try:
+        import inspect
+        import synccraft.shading.compiler as _sc_comp
+    except Exception:
+        return
+    orig = getattr(_sc_comp, "downsample_optical_fields", None)
+    if orig is None or getattr(orig, "_spark_facekey_compat", False):
+        return
+    try:
+        src = inspect.getsource(orig)
+    except Exception:
+        src = ""
+    if "fk.box_name" not in src:
+        return
+
+    def _wrapped_downsample(optical_fields, domain, texel_density, *args, **kwargs):
+        patches = getattr(optical_fields, "patches", None)
+        if isinstance(patches, dict) and any(isinstance(k, tuple) and not hasattr(k, "box_name") for k in patches):
+            patched_map = {
+                (_CompatFaceKey(k) if isinstance(k, tuple) and not hasattr(k, "box_name") else k): v
+                for k, v in patches.items()
+            }
+            optical_fields = replace(optical_fields, patches=patched_map)
+        return orig(optical_fields, domain, texel_density, *args, **kwargs)
+
+    _wrapped_downsample._spark_facekey_compat = True  # type: ignore[attr-defined]
+    _sc_comp.downsample_optical_fields = _wrapped_downsample
+
+
 def _ensure_synccraft_importable() -> None:
     try:
         import synccraft  # noqa: F401
+        _install_synccraft_compiler_compat_shim()
         return
     except ImportError:
         pass
@@ -38,6 +81,7 @@ def _ensure_synccraft_importable() -> None:
     for candidate in candidates:
         if (candidate / "synccraft" / "__init__.py").is_file():
             sys.path.insert(0, str(candidate))
+            _install_synccraft_compiler_compat_shim()
             return
 
 
