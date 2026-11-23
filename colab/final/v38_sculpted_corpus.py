@@ -544,8 +544,8 @@ def _build_boss_pole_b_v38(idx: int, *, v38: bool) -> dict[str, Any]:
           rest_euler: [0, 0, 0]
           box mandible {{ size: [4, 1.5, 5], material: secondary }}
         }}
-        bone horn_l attach(parent_box=skull, anchor=[-0.85, 0.95, -0.25], align=[0.4, -0.4, 0.85]) mirror_x(horn_r) {{
-          box horn_shaft {{ size: [2, 2, 7.5], material: dark, rotate: [26, -24, 0] }}
+        bone horn_l attach(parent_box=skull, anchor=[-0.9, 1.0, 0.1], align=[0.4, -0.6, 0.85]) mirror_x(horn_r) {{
+          box horn_shaft {{ size: [2, 2, 7.5], material: dark, rotate: [36, -28, 0] }}
         }}
       }}
     }}
@@ -629,17 +629,19 @@ def _build_vehicle_d5_v38(idx: int, *, v38: bool) -> dict[str, Any]:
         if v38
         else f"box windshield place(base_box=cab_hull, anchor=[0, 0.35, 1], align=[0, 0, -1]) {{ size: [{_fmt_num(_snap05(cw*0.85, 6.0))}, 3, 1], material: eye_glow }}"
     )
+    cab_l = _snap05(cl * 0.34, 6.0)
+    cargo_l = _snap05(cl * 0.38, 6.5)
     dsl = f"""{hdr}
 @rig {{
   root bone chassis_root {{
     pivot_local: [0, 6, 0]{sg_root}
     box chassis_frame {{ size: [{_fmt_num(cw)}, 3, {_fmt_num(cl)}], material: primary }}
-    bone cab_module attach(parent_box=chassis_frame, anchor=[0, 1, 0.4], align=[0, -1, 0]) {{{sg_cab}
-      box cab_hull {{ size: [{_fmt_num(cw)}, 5.5, 8], material: primary }}
+    bone cab_module attach(parent_box=chassis_frame, anchor=[0, 1, 0.48], align=[0, -1, 0]) {{{sg_cab}
+      box cab_hull {{ size: [{_fmt_num(cw)}, 5.5, {_fmt_num(cab_l)}], material: primary }}
       {windshield}
     }}
-    bone cargo_module attach(parent_box=chassis_frame, anchor=[0, 1, -0.45], align=[0, -1, 0]) {{
-      box cargo_bed {{ size: [{_fmt_num(cw)}, 4.5, 9], material: secondary }}
+    bone cargo_module attach(parent_box=chassis_frame, anchor=[0, 1, -0.50], align=[0, -1, 0]) {{
+      box cargo_bed {{ size: [{_fmt_num(cw)}, 4.5, {_fmt_num(cargo_l)}], material: secondary }}
       bone turret_yaw attach(parent_box=cargo_bed, anchor=[0, 1, 0], align=[0, -1, 0]) {{
         joint_limits: [[-2, 2], [-180, 180], [-2, 2]]
         box turret_head {{ size: [4.5, 2.5, 5], material: dark }}
