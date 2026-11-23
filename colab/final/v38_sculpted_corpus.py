@@ -353,7 +353,7 @@ def _build_origami_flyer_v38(idx: int, *, v38: bool) -> dict[str, Any]:
             f"Design an original Blockbench_sculpted_style-v38.8 winged creature in `Block-DSL v4.1` "
             f"(`dsl_version: \"4.1\"`, `audit_profile: sculpted`, `size_step: 0.5`): **{name.replace('_', ' ').title()}** "
             f"({ptag} palette). Build compound-packed thorax (`sculpt_group`), `inset_carve` sternum crest and focal eyes "
-            f"(`uv_scale: 2.0`), 2-stage mirrored origami wings (`0.5u` zero-blink outer membrane slab), fan tail, and "
+            f"(`uv_scale: 2.0`), 2-stage mirrored origami wings (`0.5u` solid dual-sided outer membrane slab), fan tail, and "
             f"`@behavior` `flight` (`mode: {fmode}`, `in_place: true`, `head_stabilize: 0.85`)."
         ),
         "dsl": dsl.strip(),
