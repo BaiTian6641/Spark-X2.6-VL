@@ -168,9 +168,9 @@ def _build_aquatic_swim_v38(idx: int, *, v38: bool) -> dict[str, Any]:
   muscle flank_myomere {
     origin_bone: pelvis_root,
     insertion_bone: tail_1,
-    belly_box: pelvis,
     action_axis: y,
     moment_arm_deg: 2.0,
+    belly_box: pelvis,
     scale_bulge: 0.03
   }
 }"""
@@ -513,9 +513,9 @@ def _build_boss_pole_b_v38(idx: int, *, v38: bool) -> dict[str, Any]:
   muscle chest_deltoid {
     origin_bone: pelvis,
     insertion_bone: front_leg_l,
-    belly_box: chest_core,
     action_axis: x,
     moment_arm_deg: 2.5,
+    belly_box: chest_core,
     scale_bulge: 0.04
   }
 }"""

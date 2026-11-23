@@ -891,6 +891,7 @@ def build_synthetic_scene_ocr_pairs(
     seed: int = 20261141,
     max_items: int = 240,
     include_charts_and_tables: bool = False,
+    include_posters: bool = False,
 ) -> list[tuple[dict[str, Any], dict[str, bytes]]]:
     """Generate clean, full-color, multi-font synthetic Scene-Text, KIE Receipt, Doc-Line, Math-Formula,
     and (when `include_charts_and_tables=True`) Colored Bar-Chart & Dense Table VQA OCR pairs
@@ -951,7 +952,7 @@ def build_synthetic_scene_ocr_pairs(
         ((58, 44, 78), (250, 242, 224), (210, 148, 86)),    # twilight storefront
     )
 
-    n_modes = 7 if include_charts_and_tables else 4
+    n_modes = (7 if include_posters else 6) if include_charts_and_tables else 4
     banner_phrases = (
         "HELLO 2026", "METRO LINE 7", "SECTOR 4B", "OPEN 24 HOURS", "SOLAR LAB 12",
         "WEST GATE 9", "CAFE AURORA", "TRACK 14 NORTH", "EXIT ONLY", "SCIENCE HALL",

@@ -189,7 +189,7 @@ def main() -> None:
         seed=args.seed + 15,
     )
     synth_ocr_pairs = build_synthetic_scene_ocr_pairs(
-        seed=args.seed + 17, max_items=args.synth_ocr_max, include_charts_and_tables=True
+        seed=args.seed + 17, max_items=args.synth_ocr_max, include_charts_and_tables=True, include_posters=True
     )
     nemotron_pairs = build_nemotron_v3_spatial_records(
         cache_dir=args.nemotron_cache_dir,

@@ -113,7 +113,9 @@ def test_v38_64_archetypes_compile_audit_and_zero_unseen_overlap() -> None:
 
 
 def test_mode7_poster_ocr_3d_mcq_and_extra_jsonl_loader(tmp_path: Path) -> None:
-    ocr_pairs = build_synthetic_scene_ocr_pairs(seed=99, max_items=14, include_charts_and_tables=True)
+    ocr_pairs = build_synthetic_scene_ocr_pairs(
+        seed=99, max_items=14, include_charts_and_tables=True, include_posters=True
+    )
     subtasks = {r["metadata"]["subtask"] for r, _ in ocr_pairs}
     assert "poster_banner_ocr" in subtasks
     assert "bar_chart_vqa" in subtasks
