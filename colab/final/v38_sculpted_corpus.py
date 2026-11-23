@@ -1109,7 +1109,7 @@ def build_v38_64_archetype_corpus(
             edges = meta.get("kinematic_edges") or []
             prim_lines: list[str] = []
             for bn, info in list(bones_info.items())[:5]:
-                prim_lines.append(fmt_point(info["cx"], info["cy"], info.get("depth_tier", "mid"), bn))
+                prim_lines.append(fmt_point(info["cx"], info["cy"], bn, z=info.get("depth_tier", "mid")))
             for bn, info in list(bones_info.items())[:3]:
                 bb = info["box"]
                 prim_lines.append(fmt_box(bb[0], bb[1], bb[2], bb[3], bn))
