@@ -813,19 +813,22 @@ def eval_aime_2026(
     correct = 0
     healthy = 0
     gen_chars_sum = 0
-    for r in rows:
+    for p_idx, r in enumerate(rows):
         prob = str(r.get("problem") or "").strip()
         gt_int = re.sub(r"[^0-9]", "", str(r.get("answer") or "")).lstrip("0") or "0"
         prompt = (
             f"{prob}\n\nSolve step by step inside `<think>...</think>`. The answer is an integer from 0 to 999. "
             "End with `Final Answer: \\boxed{<integer>}`."
         )
+        torch.manual_seed(20261121 + p_idx)
         out = _gen(
             model,
             prompt,
             enable_thinking=True,
             max_new_tokens=max_new_tokens,
             max_think_tokens=max(512, max_new_tokens - 384),
+            do_sample=True,
+            temperature=0.6,
         )
         gen_chars_sum += len(out)
         if check_generation_collapse_health(

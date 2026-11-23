@@ -1657,6 +1657,10 @@ def build_real_photo_pope_yesno_pairs(
         if isinstance(content, list):
             txts, im_ref = [], ""
             for item in content:
+                if isinstance(item, str):
+                    if item.strip():
+                        txts.append(item.strip())
+                    continue
                 if not isinstance(item, dict):
                     continue
                 if item.get("type") == "text":
@@ -1707,16 +1711,21 @@ def build_real_photo_pope_yesno_pairs(
                     elif role == "assistant" and pending_q:
                         body = txt.split("</think>")[-1].strip()
                         body = re.sub(r"^(?:Final\s+Answer|Answer)\s*[:=]\s*", "", body, flags=re.IGNORECASE).strip()
+                        first_tok = re.sub(r"[^a-z]", "", (body.split()[0].lower() if body.split() else ""))
                         b_clean = re.sub(r"[^a-z]", "", body.lower())
-                        q_clean = re.sub(r"\s+", " ", pending_q).strip()
-                        if img_ref and b_clean in ("yes", "no") and 10 <= len(q_clean) <= 180:
+                        yn_ans = "yes" if (b_clean == "yes" or (first_tok == "yes" and len(body) <= 64)) else (
+                            "no" if (b_clean == "no" or (first_tok == "no" and len(body) <= 64)) else ""
+                        )
+                        q_line = next((ln.strip() for ln in pending_q.splitlines() if ln.strip()), "")
+                        q_clean = re.sub(r"\s+", " ", q_line).strip()
+                        if img_ref and yn_ans in ("yes", "no") and 10 <= len(q_clean) <= 180:
                             ql = q_clean.lower()
-                            if ql.startswith(yn_prefixes):
+                            if ql.startswith(yn_prefixes) and " or " not in ql:
                                 stem = Path(img_ref).stem
                                 q_fmt = q_clean.rstrip(".?") + "? Please answer yes or no."
-                                if b_clean == "yes" and stem not in yes_by_img:
+                                if yn_ans == "yes" and stem not in yes_by_img:
                                     yes_by_img[stem] = (q_fmt, "Yes")
-                                elif b_clean == "no" and stem not in no_by_img:
+                                elif yn_ans == "no" and stem not in no_by_img:
                                     no_by_img[stem] = (q_fmt, "No")
                         pending_q = None
 
