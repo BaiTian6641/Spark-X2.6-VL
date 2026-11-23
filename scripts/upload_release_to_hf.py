@@ -256,25 +256,33 @@ def main() -> None:
             commit_message=f"{cmsg} (model card & benchmarks)",
         )
 
+    def _upload_release_subdir(local_dir: Path, subdir_name: str, label: str) -> None:
+        # Exclude top-level `README.md` during `upload_folder` so `huggingface_hub` doesn't run root-card
+        # YAML validation on the nested legacy release README, then upload that exact `README.md` file
+        # verbatim so `MODEL_RELEASE.json` SHA-256 verification remains 100% bit-exact after download.
+        api.upload_folder(
+            folder_path=str(local_dir),
+            path_in_repo=subdir_name,
+            repo_id=args.repo_id,
+            repo_type="model",
+            ignore_patterns=["README.md", "__pycache__/**", "*.pyc"],
+            commit_message=f"{cmsg} ({label})",
+        )
+        nested_readme = local_dir / "README.md"
+        if nested_readme.is_file():
+            api.upload_file(
+                path_or_fileobj=str(nested_readme),
+                path_in_repo=f"{subdir_name}/README.md",
+                repo_id=args.repo_id,
+                repo_type="model",
+                commit_message=f"{cmsg} ({label} manifest README)",
+            )
+
     print(f"[2/3] Uploading fp8/ ({args.fp8_dir}) -> {args.repo_id}/fp8", flush=True)
-    api.upload_folder(
-        folder_path=str(args.fp8_dir),
-        path_in_repo="fp8",
-        repo_id=args.repo_id,
-        repo_type="model",
-        ignore_patterns=["__pycache__/**", "*.pyc"],
-        commit_message=f"{cmsg} (fp8+q4g128 release)",
-    )
+    _upload_release_subdir(args.fp8_dir, "fp8", "fp8+q4g128 release")
 
     print(f"[3/3] Uploading bf16/ ({args.bf16_dir}) -> {args.repo_id}/bf16", flush=True)
-    api.upload_folder(
-        folder_path=str(args.bf16_dir),
-        path_in_repo="bf16",
-        repo_id=args.repo_id,
-        repo_type="model",
-        ignore_patterns=["__pycache__/**", "*.pyc"],
-        commit_message=f"{cmsg} (bf16 release)",
-    )
+    _upload_release_subdir(args.bf16_dir, "bf16", "bf16 release")
 
     print(f"HF_UPLOAD_COMPLETE_OK -> https://huggingface.co/{args.repo_id}", flush=True)
 
