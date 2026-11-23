@@ -544,8 +544,8 @@ def _build_boss_pole_b_v38(idx: int, *, v38: bool) -> dict[str, Any]:
           rest_euler: [0, 0, 0]
           box mandible {{ size: [4, 1.5, 5], material: secondary }}
         }}
-        bone horn_l attach(parent_box=skull, anchor=[-0.85, 0.85, -0.6], align=[0.4, -0.6, 1]) mirror_x(horn_r) {{
-          box horn_shaft {{ size: [2, 2, 7.5], material: dark, rotate: [32, -16, 0] }}
+        bone horn_l attach(parent_box=skull, anchor=[-0.95, 1.0, -0.25], align=[0.8, -1.0, 1]) mirror_x(horn_r) {{
+          box horn_shaft {{ size: [2, 2, 7.5], material: dark, rotate: [26, -24, 0] }}
         }}
       }}
     }}
