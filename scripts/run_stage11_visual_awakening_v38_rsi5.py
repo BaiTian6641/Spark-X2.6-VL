@@ -482,7 +482,7 @@ def main() -> None:
             prealign_cfg = {
                 "stage_mode": "frozen_spark_connector",
                 "unfreeze_vision_last_n_layers": 0,
-                "optimizer_profile": "adamw",
+                "optimizer_profile": "apollo_coat",
                 "learning_rate": float(args.prealign_lr),
                 "backbone_lr": 0.0,
                 "connector_learning_rate": float(args.prealign_lr),
