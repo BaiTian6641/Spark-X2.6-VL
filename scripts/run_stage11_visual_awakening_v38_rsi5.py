@@ -41,11 +41,13 @@ from colab.final.frontier_stage9_corpus import (  # noqa: E402
     build_3d_spatial_mcq_pairs,
     build_dapo_math_rsi3_pool,
     build_hf_real_ocr_pairs,
+    build_open_vocab_ocr_pairs,
     build_real_photo_pope_yesno_pairs,
     build_stage9_frontier_training_records,
     build_synthetic_scene_ocr_pairs,
     build_v28_grammar_repair_records,
     load_extra_user_dataset_records,
+    select_stage115_visual_alignment_rids,
     select_stage9_direct_ocr_and_yesno_rids,
 )
 from colab.final.model import SparkNative, load_spark_native_safetensors  # noqa: E402
@@ -100,9 +102,14 @@ def main() -> None:
         type=Path,
         default=Path("work/spark-x26-4b-loop48-en1b-vl-stage8-radiov4/nemotron_v3_cache"),
     )
+    ap.add_argument("--prealign-updates", type=int, default=0, help="Optional frozen-Spark FP32-AdamW pure-visual projector alignment phase before full_spark.")
+    ap.add_argument("--prealign-lr", type=float, default=5.0e-4)
+    ap.add_argument("--prealign-clip-norm", type=float, default=2.0)
     ap.add_argument("--stage11a-updates", type=int, default=960)
     ap.add_argument("--rsi5-updates", type=int, default=140)
     ap.add_argument("--grad-accum", type=int, default=12)
+    ap.add_argument("--clip-norm", type=float, default=1.2)
+    ap.add_argument("--release-tag", type=str, default="stage11")
     ap.add_argument("--early-spark-layers", type=int, default=12)
     ap.add_argument("--early-spark-lr", type=float, default=2.2e-5)
     ap.add_argument("--backbone-lr", type=float, default=7.5e-6)
@@ -121,6 +128,7 @@ def main() -> None:
     ap.add_argument("--hf-docvqa-max", type=int, default=3600)
     ap.add_argument("--hf-synthdog-max", type=int, default=3000)
     ap.add_argument("--real-pope-max", type=int, default=1400)
+    ap.add_argument("--open-vocab-ocr-max", type=int, default=0)
     ap.add_argument("--synth-ocr-max", type=int, default=1200)
     ap.add_argument("--s3d-mcq-max", type=int, default=480)
     ap.add_argument("--v38-visual-renders", type=int, default=16)
@@ -188,6 +196,9 @@ def main() -> None:
         max_pairs=args.real_pope_max,
         seed=args.seed + 15,
     )
+    open_vocab_ocr_pairs = build_open_vocab_ocr_pairs(
+        seed=args.seed + 16, max_items=args.open_vocab_ocr_max
+    )
     synth_ocr_pairs = build_synthetic_scene_ocr_pairs(
         seed=args.seed + 17, max_items=args.synth_ocr_max, include_charts_and_tables=True, include_posters=True
     )
@@ -229,6 +240,7 @@ def main() -> None:
         + list(s3d_mcq_pairs)
         + list(hf_real_ocr_pairs)
         + list(real_pope_pairs)
+        + list(open_vocab_ocr_pairs)
         + list(synth_ocr_pairs)
         + list(nemotron_pairs)
         + list(v38_vis_pairs)
@@ -258,15 +270,66 @@ def main() -> None:
 
     rng = random.Random(args.seed)
 
-    # 2. Construct Phase 11A Joint Visual-Awakening Mix (`11,520` samples)
+    # 2A. Optional Frozen-Spark Open-Vocab High-Scale Pure-Visual Projector Pre-Alignment Mix (Stage-11.5A)
+    order_prealign: list[tuple[str, Any]] = []
+    prealign_cat_summary: dict[str, int] = {}
+    prealign_breakdown: dict[str, int] = {}
+    if args.prealign_updates > 0:
+        total_pre = args.prealign_updates * args.grad_accum
+        n_p_ov_ocr = min(int(total_pre * 0.22), len(open_vocab_ocr_pairs) * 2) if open_vocab_ocr_pairs else 0
+        n_p_hf_ocr = min(int(total_pre * 0.22), len(hf_real_ocr_pairs)) if hf_real_ocr_pairs else 0
+        n_p_pope = min(int(total_pre * 0.14), len(real_pope_pairs) * 2) if real_pope_pairs else 0
+        n_p_nem = min(int(total_pre * 0.13), len(nemotron_pairs)) if nemotron_pairs else 0
+        n_p_s3d = min(int(total_pre * 0.04), len(spatial3d_pairs)) if spatial3d_pairs else 0
+        n_p_s3d_mcq = min(int(total_pre * 0.04), len(s3d_mcq_pairs) * 2) if s3d_mcq_pairs else 0
+        n_p_v38_vis = min(int(total_pre * 0.01), len(v38_vis_pairs) * 12) if v38_vis_pairs else 0
+        n_p_extra_v = min(int(total_pre * 0.04), len(extra_vis_pairs)) if extra_vis_pairs else 0
+        used_pre = n_p_ov_ocr + n_p_hf_ocr + n_p_pope + n_p_nem + n_p_s3d + n_p_s3d_mcq + n_p_v38_vis + n_p_extra_v
+        n_p_cat_vis = max(1, total_pre - used_pre)
+        cat_vis_items, prealign_cat_summary = select_stage115_visual_alignment_rids(
+            db_path, target_samples=n_p_cat_vis, seed=args.seed + 91
+        )
+        order_prealign.extend(cat_vis_items)
+        for i in range(n_p_ov_ocr):
+            order_prealign.append(("pair", open_vocab_ocr_pairs[i % len(open_vocab_ocr_pairs)]))
+        for i in range(n_p_hf_ocr):
+            order_prealign.append(("pair", hf_real_ocr_pairs[i % len(hf_real_ocr_pairs)]))
+        for i in range(n_p_pope):
+            order_prealign.append(("pair", real_pope_pairs[i % len(real_pope_pairs)]))
+        for i in range(n_p_nem):
+            order_prealign.append(("pair", nemotron_pairs[i % len(nemotron_pairs)]))
+        for i in range(n_p_s3d):
+            order_prealign.append(("pair", spatial3d_pairs[i % len(spatial3d_pairs)]))
+        for i in range(n_p_s3d_mcq):
+            order_prealign.append(("pair", s3d_mcq_pairs[i % len(s3d_mcq_pairs)]))
+        for i in range(n_p_v38_vis):
+            order_prealign.append(("pair", v38_vis_pairs[i % len(v38_vis_pairs)]))
+        for i in range(n_p_extra_v):
+            order_prealign.append(("pair", extra_vis_pairs[i % len(extra_vis_pairs)]))
+        rng.shuffle(order_prealign)
+        order_prealign = order_prealign[:total_pre]
+        prealign_breakdown = {
+            "open_vocab_ocr": n_p_ov_ocr,
+            "hf_real_ocr": n_p_hf_ocr,
+            "real_photo_pope_yesno": n_p_pope,
+            "nemotron_v3": n_p_nem,
+            "spatial3d": n_p_s3d,
+            "spatial3d_mcq": n_p_s3d_mcq,
+            "v38_visual_renders": n_p_v38_vis,
+            "extra_user_vis": n_p_extra_v,
+            "catalogue_visual_align": len(cat_vis_items),
+        }
+
+    # 2B. Construct Phase 11A/11.5B Joint Visual-Awakening Mix
     total_a = args.stage11a_updates * args.grad_accum
-    n_a_hf_ocr = min(int(total_a * 0.22), len(hf_real_ocr_pairs))
-    n_a_direct_cat = int(total_a * 0.13)
+    n_a_hf_ocr = min(int(total_a * 0.20), len(hf_real_ocr_pairs)) if hf_real_ocr_pairs else 0
+    n_a_ov_ocr = min(int(total_a * 0.10), len(open_vocab_ocr_pairs)) if open_vocab_ocr_pairs else 0
+    n_a_direct_cat = int(total_a * 0.12)
     n_a_pope = min(int(total_a * 0.12), len(real_pope_pairs) * 2) if real_pope_pairs else 0
-    n_a_synth_ocr = min(int(total_a * 0.08), len(synth_ocr_pairs))
+    n_a_synth_ocr = min(int(total_a * 0.04), len(synth_ocr_pairs)) if synth_ocr_pairs else 0
     n_a_s3d = min(int(total_a * 0.05), len(spatial3d_pairs))
     n_a_s3d_mcq = min(int(total_a * 0.05), len(s3d_mcq_pairs) * 2) if s3d_mcq_pairs else 0
-    n_a_nem = min(int(total_a * 0.09), len(nemotron_pairs))
+    n_a_nem = min(int(total_a * 0.08), len(nemotron_pairs))
     n_a_v38_dsl = min(int(total_a * 0.04), len(v38_text_recs) * 8)
     n_a_v38_vis = min(int(total_a * 0.02), len(v38_vis_pairs) * 16) if v38_vis_pairs else 0
     n_a_v38_rep = min(int(total_a * 0.03), len(v38_repair_recs) * 3) if v38_repair_recs else 0
@@ -276,7 +339,7 @@ def main() -> None:
     n_a_extra_v = min(int(total_a * 0.06), len(extra_vis_pairs)) if extra_vis_pairs else 0
     n_a_front = min(int(total_a * 0.10), len(frontier_records))
     used_a = (
-        n_a_hf_ocr + n_a_direct_cat + n_a_pope + n_a_synth_ocr + n_a_s3d + n_a_s3d_mcq
+        n_a_hf_ocr + n_a_ov_ocr + n_a_direct_cat + n_a_pope + n_a_synth_ocr + n_a_s3d + n_a_s3d_mcq
         + n_a_nem + n_a_v38_dsl + n_a_v38_vis + n_a_v38_rep + n_a_v28 + n_a_v28_rep
         + n_a_extra_t + n_a_extra_v + n_a_front
     )
@@ -293,6 +356,8 @@ def main() -> None:
     order_a.extend(("cat", rid) for rid in cat_a_rids)
     for i in range(n_a_hf_ocr):
         order_a.append(("pair", hf_real_ocr_pairs[i % len(hf_real_ocr_pairs)]))
+    for i in range(n_a_ov_ocr):
+        order_a.append(("pair", open_vocab_ocr_pairs[i % len(open_vocab_ocr_pairs)]))
     for i in range(n_a_pope):
         order_a.append(("pair", real_pope_pairs[i % len(real_pope_pairs)]))
     for i in range(n_a_synth_ocr):
@@ -328,9 +393,13 @@ def main() -> None:
                 {
                     "dry_run": True,
                     "audit": audit_rep,
+                    "order_prealign": len(order_prealign),
+                    "breakdown_prealign": prealign_breakdown,
+                    "prealign_cat_summary": prealign_cat_summary,
                     "order_11a": len(order_a),
                     "breakdown_11a": {
                         "hf_real_ocr": n_a_hf_ocr,
+                        "open_vocab_ocr": n_a_ov_ocr,
                         "direct_ocr_yesno_cat": len(direct_a_rids),
                         "real_photo_pope_yesno": n_a_pope,
                         "synth_ocr_7mode": n_a_synth_ocr,
@@ -359,7 +428,7 @@ def main() -> None:
     cfg = dict(src_cfg)
     cfg.update(
         {
-            "campaign_id": "spark-x26-4b-loop48-en1b-vl-stage11-visual-awakening-v38",
+            "campaign_id": str(args.output_root.name),
             "init_from_release_dir": str(args.init_release_dir.resolve()),
             "allow_warmstart_vision_swap": False,
             "allow_warmstart_missing_loop_engram": False,
@@ -403,7 +472,50 @@ def main() -> None:
         )
         emit("stage11_pre_calibration", **cal_pre)
 
-        # Phase 11A: Joint Visual-Attention Awakening (Split Early-Layer LR + L_decorr + Visual-Margin Hard-Mining + B50 muon8bit!)
+        res_prealign: dict[str, Any] | None = None
+        rms_post_prealign: dict[str, Any] | None = None
+        xray_post_prealign: dict[str, Any] | None = None
+        cal_post_prealign: dict[str, Any] | None = None
+        if args.prealign_updates > 0 and order_prealign:
+            # Phase 11.5A: High-Scale Frozen-Spark FP32-AdamW Pure-Visual Projector Alignment
+            # (Zero LM memorization possible; aligns `vision_projector` across open-vocab OCR, 50/50 POPE, captions, VQA, 3D)
+            prealign_cfg = {
+                "stage_mode": "frozen_spark_connector",
+                "unfreeze_vision_last_n_layers": 0,
+                "optimizer_profile": "adamw",
+                "learning_rate": float(args.prealign_lr),
+                "backbone_lr": 0.0,
+                "connector_learning_rate": float(args.prealign_lr),
+                "adapter_lr": float(args.prealign_lr),
+                "apollo_connector_learning_rate": float(args.prealign_lr),
+                "vision_lr": 0.0,
+                "visual_decorr_loss_weight": float(args.decorr_weight),
+                "visual_decorr_target_dc_ratio": float(args.decorr_target_dc),
+                "visual_decorr_target_cos": float(args.decorr_target_cos),
+                "warmup_ratio": 0.06,
+                "clip_norm": float(args.prealign_clip_norm),
+                "weight_decay": 0.01,
+            }
+            res_prealign = _run_stage8_phase(
+                stage_name="stage115a_frozen_spark_open_vocab_align",
+                model=model,
+                base_cfg=cfg,
+                stage_cfg=prealign_cfg,
+                order_items=order_prealign,
+                catalogue=catalogue,
+                reader=reader,
+                grad_accum=args.grad_accum,
+                checkpoint_dir=args.output_root / "ckpt-stage115a-prealign",
+                seed=args.seed + 250,
+            )
+            rms_post_prealign = measure_layerwise_visual_text_rms(model, sample_im, tag="post_prealign")
+            xray_post_prealign = measure_visual_grounding_xray(model, tag="post_prealign")
+            cal_post_prealign = measure_visual_alignment_diagnostics(
+                model, catalogue=catalogue, reader=reader, config=cfg, eval_rids=eval_rids, v25_probe_example=probe_ex, tag="post_prealign"
+            )
+            emit("stage11_post_prealign_calibration", **cal_post_prealign)
+
+        # Phase 11A / 11.5B: Joint Visual-Attention Awakening (FP32-AdamW vision_projector + Split Early-Layer LR + L_decorr + B50 muon8bit!)
         stage11a_cfg = {
             "stage_mode": "full_spark",
             "unfreeze_vision_last_n_layers": int(args.unfreeze_vision_layers),
@@ -425,7 +537,7 @@ def main() -> None:
             "visual_margin_target": float(args.visual_margin_target),
             "visual_margin_boost": float(args.visual_margin_boost),
             "warmup_ratio": 0.10,
-            "clip_norm": 0.6,
+            "clip_norm": float(args.clip_norm),
             "weight_decay": 0.01,
         }
         res_a = _run_stage8_phase(
@@ -502,7 +614,7 @@ def main() -> None:
             "visual_decorr_target_dc_ratio": float(args.decorr_target_dc),
             "visual_decorr_target_cos": float(args.decorr_target_cos),
             "warmup_ratio": 0.12,
-            "clip_norm": 0.5,
+            "clip_norm": max(0.8, float(args.clip_norm) * 0.75),
             "weight_decay": 0.01,
         }
         res_rsi = _run_stage8_phase(
@@ -539,34 +651,44 @@ def main() -> None:
 
         report = {
             "stage11_architecture": {
+                "release_tag": str(args.release_tag),
                 "warmstart": str(args.init_release_dir),
+                "prealign_updates": int(args.prealign_updates),
+                "prealign_lr": float(args.prealign_lr),
                 "early_spark_layers": args.early_spark_layers,
                 "early_spark_lr": args.early_spark_lr,
                 "backbone_lr": args.backbone_lr,
                 "connector_lr": args.connector_lr,
+                "clip_norm": float(args.clip_norm),
                 "decorr_weight": args.decorr_weight,
                 "visual_margin_every_n": args.visual_margin_every_n,
                 "vision_optimizer_b50": args.vision_optimizer,
                 "selected_phase": selected_phase,
             },
             "dataset_audit": audit_rep,
+            "prealign_breakdown": prealign_breakdown,
+            "prealign_cat_summary": prealign_cat_summary,
             "direct_11a_summary": direct_a_summary,
             "stage11a_cat_summary": cat_a_summary,
             "layerwise_rms": {
                 "pre_11a": rms_pre,
+                "post_prealign": rms_post_prealign,
                 "post_11a": rms_post_a,
                 "post_rsi5": rms_post_rsi,
             },
             "visual_grounding_xray": {
                 "pre_11a": xray_pre,
+                "post_prealign": xray_post_prealign,
                 "post_11a": xray_post_a,
                 "post_rsi5": xray_post_rsi,
             },
             "calibration": {
                 "pre_11a": cal_pre,
+                "post_prealign": cal_post_prealign,
                 "post_11a": cal_post_a,
                 "post_rsi5": cal_post_rsi,
             },
+            "stage115a_prealign": res_prealign,
             "stage11a": res_a,
             "rsi5_mining": rsi_mining_summary,
             "stage11b_rsi5": res_rsi,
@@ -575,8 +697,9 @@ def main() -> None:
         }
         write(args.output_root / "STAGE11_VISUAL_AWAKENING_V38_REPORT.json", report)
 
-        out_bf16 = args.output_root / "final-model-stage11-bf16"
-        out_fp8 = args.output_root / "final-model-stage11-fp8"
+        tag = str(args.release_tag).strip() or "stage11"
+        out_bf16 = args.output_root / f"final-model-{tag}-bf16"
+        out_fp8 = args.output_root / f"final-model-{tag}-fp8"
         _export_stage8_releases(
             model,
             src_release_dir=args.init_release_dir,
@@ -593,7 +716,7 @@ def main() -> None:
             and (out_bf16 / "model.safetensors").is_file()
             and (out_fp8 / "model.safetensors").is_file()
         ):
-            for ck in ("ckpt-stage11a", "ckpt-stage11b-rsi5"):
+            for ck in ("ckpt-stage115a-prealign", "ckpt-stage11a", "ckpt-stage11b-rsi5"):
                 ck_p = args.output_root / ck
                 if ck_p.is_dir():
                     shutil.rmtree(ck_p, ignore_errors=True)

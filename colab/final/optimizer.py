@@ -215,6 +215,7 @@ def is_high_precision_small_or_sensitive_param(
         "spatial_clock",
         "audio_clock",
         "alpha_projector",
+        "vision_projector",
         "view_embedding",
         "modality",
         "default_voice",
@@ -1162,7 +1163,14 @@ class MergedGradientAccumulator:
         # into `total_sq`, avoiding 1,000+ per-tensor `isfinite().all()` host-device pipeline stalls!
         norm_dev = self.params[0].device if self.params else torch.device("cpu")
         total_sq = torch.zeros((), device=norm_dev, dtype=torch.float32)
-        for buf in self.buffers.values():
+        scalar_gate_cap = 1.0
+        for pid, buf in self.buffers.items():
+            # Cap 1-element scalar residual gates (e.g. `visual_cross_attn.*.gate_attn`) so their
+            # high sensitivity at small residual scales cannot hijack global gradient clipping across 4.8B params.
+            if buf.numel() == 1 and post_scale > 0.0 and "gate" in self.param_names.get(pid, "").lower():
+                if torch.isfinite(buf).all():
+                    cap_raw = scalar_gate_cap / float(post_scale)
+                    buf.clamp_(-cap_raw, cap_raw)
             b_fast = buf.to(device=norm_dev, non_blocking=True) if buf.device != norm_dev else buf
             bf = b_fast.float()
             if post_scale != 1.0:

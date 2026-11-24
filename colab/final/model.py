@@ -37,7 +37,8 @@ def install_spark_sdpa(spark):
         key=module.repeat_kv(key,attention.num_key_value_groups)
         value=module.repeat_kv(value,attention.num_key_value_groups)
         mask=attention_mask[:,:,:,:key.shape[-2]] if attention_mask is not None else None
-        result=F.scaled_dot_product_attention(query,key,value,attn_mask=mask,dropout_p=dropout if attention.training else 0.,is_causal=False,scale=scaling)
+        use_causal=(mask is None) and (query.shape[-2]>1) and (query.shape[-2]==key.shape[-2])
+        result=F.scaled_dot_product_attention(query,key,value,attn_mask=mask,dropout_p=dropout if attention.training else 0.,is_causal=use_causal,scale=scaling)
         return result,None
     sdpa._spark_native_sdpa=True; sdpa._spark_reference=reference
     module.eager_attention_forward=sdpa

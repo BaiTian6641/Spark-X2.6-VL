@@ -189,6 +189,8 @@ def _gen(
     max_think_tokens: int | None = None,
     do_sample: bool = False,
     temperature: float = 0.55,
+    top_p: float = 0.92,
+    repetition_penalty: float = 1.04,
 ) -> str:
     media = visual_media(images) if images else empty_media()
     return generate(
@@ -200,9 +202,17 @@ def _gen(
         max_think_tokens=max_think_tokens,
         do_sample=do_sample,
         temperature=temperature,
-        top_p=0.92,
-        repetition_penalty=1.04,
+        top_p=top_p,
+        repetition_penalty=repetition_penalty,
     )
+
+
+def _extract_answer_body(out: str) -> tuple[str | None, str]:
+    """Split `<think>...</think>` while preserving valid answers when EOS is reached without closing `</think>`."""
+    th, body = strip_think_block(out)
+    if body.strip():
+        return th, body
+    return th, (th or out).strip()
 
 
 def _extract_choice_letter(body: str, valid_letters: str = "ABCDEFGHIJ") -> str:
@@ -320,7 +330,7 @@ def eval_terminal_bench_41(model: Any, token: str | None, *, limit: int = 30) ->
         h = check_generation_collapse_health(out, expect_thinking=True, max_rep_4gram=0.14, max_think_chars=4500)
         if h["healthy"]:
             healthy_think += 1
-        _, body = strip_think_block(out)
+        _, body = _extract_answer_body(out)
         ok_syn, n_chars, _ = _validate_terminal_blocks(body, tid)
         if ok_syn:
             syntax_ok += 1
@@ -453,7 +463,7 @@ def eval_hle_frontier(
         )
         if check_generation_collapse_health(out, expect_thinking=True, max_rep_4gram=0.14)["healthy"]:
             healthy += 1
-        _, body = strip_think_block(out)
+        _, body = _extract_answer_body(out)
 
         if atype == "multiplechoice" or (len(gt) == 1 and gt.upper() in "ABCDEFGHIJ"):
             pred_norm = _extract_choice_letter(body, "ABCDEFGHIJ")
@@ -541,7 +551,7 @@ def eval_gpqa_diamond(
             max_new_tokens=max_new_tokens,
             max_think_tokens=max(512, max_new_tokens - 256),
         )
-        _, body = strip_think_block(out)
+        _, body = _extract_answer_body(out)
         pred = _extract_choice_letter(body, "ABCD")
         hit = pred == gt_let
         by_domain[dom][1] += 1
@@ -655,7 +665,7 @@ def eval_3dsrbench(
             "to reason about 3D positions and orientation, then end with `Answer: (<letter>)`."
         )
         out = _gen(model, prompt, [im], enable_thinking=True, max_new_tokens=512)
-        th, body = strip_think_block(out)
+        th, body = _extract_answer_body(out)
         if th and any(tag in th for tag in ("<point ", "<box ", "<dash ", "<circle ")):
             used_4prim += 1
         pred = _extract_choice_letter(body, valid_letters or "ABCD")
@@ -708,7 +718,7 @@ def eval_cv_bench_3d(model: Any, token: str | None, *, limit: int = 120, seed: i
             "to compare 3D depth/distance, then conclude with `Answer: (<letter>)`."
         )
         out = _gen(model, prompt, [im], enable_thinking=True, max_new_tokens=512)
-        th, body = strip_think_block(out)
+        th, body = _extract_answer_body(out)
         if th and any(tag in th for tag in ("<point ", "<box ", "<dash ", "<circle ")):
             used_4prim += 1
         pred = _extract_choice_letter(body, "ABCD")
@@ -763,7 +773,7 @@ def eval_simpleqa_verified(model: Any, token: str | None, *, limit: int = 120, s
             "End with `Final Answer: <answer>`."
         )
         out = _gen(model, prompt, enable_thinking=False, max_new_tokens=160)
-        _, body = strip_think_block(out)
+        _, body = _extract_answer_body(out)
         m_fa = re.search(r"Final\s+Answer\s*:\s*(.+)$", body, flags=re.IGNORECASE | re.MULTILINE)
         cand = m_fa.group(1).strip() if m_fa else body.strip()
         cand_norm = _normalize_exact_answer(cand)
@@ -829,6 +839,8 @@ def eval_aime_2026(
             max_think_tokens=max(512, max_new_tokens - 384),
             do_sample=True,
             temperature=0.6,
+            top_p=0.95,
+            repetition_penalty=1.0,
         )
         gen_chars_sum += len(out)
         if check_generation_collapse_health(
@@ -838,7 +850,7 @@ def eval_aime_2026(
             max_think_chars=max(6000, max_new_tokens * 5),
         )["healthy"]:
             healthy += 1
-        _, body = strip_think_block(out)
+        _, body = _extract_answer_body(out)
         m_box = re.search(r"\\boxed\{\s*0*(\d{1,4})\s*\}", body)
         if not m_box:
             m_box = re.search(r"Final\s+Answer\s*[:=]\s*\$?0*(\d{1,4})\$?", body, flags=re.IGNORECASE)
@@ -914,7 +926,7 @@ def eval_mmmu_pro_10opt(model: Any, token: str | None, *, limit: int = 120, seed
             "Analyze the image(s) carefully inside `<think>...</think>` and conclude with `Answer: (<letter>)`."
         )
         out = _gen(model, prompt, imgs[:4], enable_thinking=True, max_new_tokens=640)
-        _, body = strip_think_block(out)
+        _, body = _extract_answer_body(out)
         pred = _extract_choice_letter(body, letters[: len(opts)])
         evaluated += 1
         by_subj[subj][1] += 1

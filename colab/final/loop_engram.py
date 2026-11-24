@@ -1508,6 +1508,19 @@ def build_spark_loop_context(
 
     if past_key_values is not None and q_len == 1 and attention_mask is None:
         masks = {lt: None for lt in layer_types}
+        if "sliding_attention" in layer_types or getattr(spark_model, "has_sliding_layers", False):
+            sw = int(getattr(cfg, "sliding_window", 512) or 512)
+            k_len = int(cache_position[-1].item()) + 1 if cache_position.numel() > 0 else 1
+            if k_len > sw:
+                q_idx = cache_position.view(1, 1, 1, 1)
+                k_idx = torch.arange(k_len, device=device).view(1, 1, 1, k_len)
+                sw_ok = (k_idx <= q_idx) & ((q_idx - k_idx) < sw)
+                if using_sdpa:
+                    masks["sliding_attention"] = sw_ok
+                else:
+                    min_val = torch.finfo(embeds.dtype).min
+                    zero_val = torch.tensor(0.0, dtype=embeds.dtype, device=device)
+                    masks["sliding_attention"] = torch.where(sw_ok, zero_val, min_val)
     elif not custom_cache_pos and past_key_values is None and hasattr(spark_model, "make_loop_context"):
         m_ctx, r_ctx = spark_model.make_loop_context(embeds, attention_mask)
         return m_ctx, r_ctx, cache_position
