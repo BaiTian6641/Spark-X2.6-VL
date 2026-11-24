@@ -105,6 +105,7 @@ def main() -> None:
     ap.add_argument("--prealign-updates", type=int, default=0, help="Optional frozen-Spark FP32-AdamW pure-visual projector alignment phase before full_spark.")
     ap.add_argument("--prealign-lr", type=float, default=5.0e-4)
     ap.add_argument("--prealign-clip-norm", type=float, default=2.0)
+    ap.add_argument("--resume-stage11a-ckpt", type=Path, default=None, help="Optional completed ckpt-stage11a/model.safetensors to resume directly into RSI-5.5 + export.")
     ap.add_argument("--stage11a-updates", type=int, default=960)
     ap.add_argument("--rsi5-updates", type=int, default=140)
     ap.add_argument("--grad-accum", type=int, default=12)
@@ -476,82 +477,89 @@ def main() -> None:
         rms_post_prealign: dict[str, Any] | None = None
         xray_post_prealign: dict[str, Any] | None = None
         cal_post_prealign: dict[str, Any] | None = None
-        if args.prealign_updates > 0 and order_prealign:
-            # Phase 11.5A: High-Scale Frozen-Spark FP32-AdamW Pure-Visual Projector Alignment
-            # (Zero LM memorization possible; aligns `vision_projector` across open-vocab OCR, 50/50 POPE, captions, VQA, 3D)
-            prealign_cfg = {
-                "stage_mode": "frozen_spark_connector",
-                "unfreeze_vision_last_n_layers": 0,
+        if args.resume_stage11a_ckpt is not None and args.resume_stage11a_ckpt.is_file():
+            load_spark_native_safetensors(model, args.resume_stage11a_ckpt)
+            if getattr(model, "_intel_vision_bridge", None) is not None:
+                model._intel_vision_bridge.sync_from_host(model.vision)
+            emit("stage11_resumed_from_stage11a_ckpt", ckpt=str(args.resume_stage11a_ckpt))
+            res_a = {"resumed_from": str(args.resume_stage11a_ckpt), "skipped_already_completed": True}
+        else:
+            if args.prealign_updates > 0 and order_prealign:
+                # Phase 11.5A: High-Scale Frozen-Spark FP32-AdamW Pure-Visual Projector Alignment
+                # (Zero LM memorization possible; aligns `vision_projector` across open-vocab OCR, 50/50 POPE, captions, VQA, 3D)
+                prealign_cfg = {
+                    "stage_mode": "frozen_spark_connector",
+                    "unfreeze_vision_last_n_layers": 0,
+                    "optimizer_profile": "apollo_coat",
+                    "learning_rate": float(args.prealign_lr),
+                    "backbone_lr": 0.0,
+                    "connector_learning_rate": float(args.prealign_lr),
+                    "adapter_lr": float(args.prealign_lr),
+                    "apollo_connector_learning_rate": float(args.prealign_lr),
+                    "vision_lr": 0.0,
+                    "visual_decorr_loss_weight": float(args.decorr_weight),
+                    "visual_decorr_target_dc_ratio": float(args.decorr_target_dc),
+                    "visual_decorr_target_cos": float(args.decorr_target_cos),
+                    "warmup_ratio": 0.06,
+                    "clip_norm": float(args.prealign_clip_norm),
+                    "weight_decay": 0.01,
+                }
+                res_prealign = _run_stage8_phase(
+                    stage_name="stage115a_frozen_spark_open_vocab_align",
+                    model=model,
+                    base_cfg=cfg,
+                    stage_cfg=prealign_cfg,
+                    order_items=order_prealign,
+                    catalogue=catalogue,
+                    reader=reader,
+                    grad_accum=args.grad_accum,
+                    checkpoint_dir=args.output_root / "ckpt-stage115a-prealign",
+                    seed=args.seed + 250,
+                )
+                rms_post_prealign = measure_layerwise_visual_text_rms(model, sample_im, tag="post_prealign")
+                xray_post_prealign = measure_visual_grounding_xray(model, tag="post_prealign")
+                cal_post_prealign = measure_visual_alignment_diagnostics(
+                    model, catalogue=catalogue, reader=reader, config=cfg, eval_rids=eval_rids, v25_probe_example=probe_ex, tag="post_prealign"
+                )
+                emit("stage11_post_prealign_calibration", **cal_post_prealign)
+
+            # Phase 11A / 11.5B: Joint Visual-Attention Awakening (FP32-AdamW vision_projector + Split Early-Layer LR + L_decorr + B50 muon8bit!)
+            stage11a_cfg = {
+                "stage_mode": "full_spark",
+                "unfreeze_vision_last_n_layers": int(args.unfreeze_vision_layers),
                 "optimizer_profile": "apollo_coat",
-                "learning_rate": float(args.prealign_lr),
-                "backbone_lr": 0.0,
-                "connector_learning_rate": float(args.prealign_lr),
-                "adapter_lr": float(args.prealign_lr),
-                "apollo_connector_learning_rate": float(args.prealign_lr),
-                "vision_lr": 0.0,
+                "early_spark_layers": int(args.early_spark_layers),
+                "early_spark_lr": float(args.early_spark_lr),
+                "learning_rate": float(args.backbone_lr),
+                "backbone_lr": float(args.backbone_lr),
+                "apollo_learning_rate": float(args.backbone_lr),
+                "connector_learning_rate": float(args.connector_lr),
+                "adapter_lr": float(args.connector_lr),
+                "apollo_connector_learning_rate": float(args.connector_lr),
+                "engram_lr": float(args.engram_lr),
+                "vision_lr": float(args.vision_lr),
                 "visual_decorr_loss_weight": float(args.decorr_weight),
                 "visual_decorr_target_dc_ratio": float(args.decorr_target_dc),
                 "visual_decorr_target_cos": float(args.decorr_target_cos),
-                "warmup_ratio": 0.06,
-                "clip_norm": float(args.prealign_clip_norm),
+                "visual_margin_every_n": int(args.visual_margin_every_n),
+                "visual_margin_target": float(args.visual_margin_target),
+                "visual_margin_boost": float(args.visual_margin_boost),
+                "warmup_ratio": 0.10,
+                "clip_norm": float(args.clip_norm),
                 "weight_decay": 0.01,
             }
-            res_prealign = _run_stage8_phase(
-                stage_name="stage115a_frozen_spark_open_vocab_align",
+            res_a = _run_stage8_phase(
+                stage_name="stage11a_visual_awakening_decorr_v38",
                 model=model,
                 base_cfg=cfg,
-                stage_cfg=prealign_cfg,
-                order_items=order_prealign,
+                stage_cfg=stage11a_cfg,
+                order_items=order_a,
                 catalogue=catalogue,
                 reader=reader,
                 grad_accum=args.grad_accum,
-                checkpoint_dir=args.output_root / "ckpt-stage115a-prealign",
-                seed=args.seed + 250,
+                checkpoint_dir=args.output_root / "ckpt-stage11a",
+                seed=args.seed + 300,
             )
-            rms_post_prealign = measure_layerwise_visual_text_rms(model, sample_im, tag="post_prealign")
-            xray_post_prealign = measure_visual_grounding_xray(model, tag="post_prealign")
-            cal_post_prealign = measure_visual_alignment_diagnostics(
-                model, catalogue=catalogue, reader=reader, config=cfg, eval_rids=eval_rids, v25_probe_example=probe_ex, tag="post_prealign"
-            )
-            emit("stage11_post_prealign_calibration", **cal_post_prealign)
-
-        # Phase 11A / 11.5B: Joint Visual-Attention Awakening (FP32-AdamW vision_projector + Split Early-Layer LR + L_decorr + B50 muon8bit!)
-        stage11a_cfg = {
-            "stage_mode": "full_spark",
-            "unfreeze_vision_last_n_layers": int(args.unfreeze_vision_layers),
-            "optimizer_profile": "apollo_coat",
-            "early_spark_layers": int(args.early_spark_layers),
-            "early_spark_lr": float(args.early_spark_lr),
-            "learning_rate": float(args.backbone_lr),
-            "backbone_lr": float(args.backbone_lr),
-            "apollo_learning_rate": float(args.backbone_lr),
-            "connector_learning_rate": float(args.connector_lr),
-            "adapter_lr": float(args.connector_lr),
-            "apollo_connector_learning_rate": float(args.connector_lr),
-            "engram_lr": float(args.engram_lr),
-            "vision_lr": float(args.vision_lr),
-            "visual_decorr_loss_weight": float(args.decorr_weight),
-            "visual_decorr_target_dc_ratio": float(args.decorr_target_dc),
-            "visual_decorr_target_cos": float(args.decorr_target_cos),
-            "visual_margin_every_n": int(args.visual_margin_every_n),
-            "visual_margin_target": float(args.visual_margin_target),
-            "visual_margin_boost": float(args.visual_margin_boost),
-            "warmup_ratio": 0.10,
-            "clip_norm": float(args.clip_norm),
-            "weight_decay": 0.01,
-        }
-        res_a = _run_stage8_phase(
-            stage_name="stage11a_visual_awakening_decorr_v38",
-            model=model,
-            base_cfg=cfg,
-            stage_cfg=stage11a_cfg,
-            order_items=order_a,
-            catalogue=catalogue,
-            reader=reader,
-            grad_accum=args.grad_accum,
-            checkpoint_dir=args.output_root / "ckpt-stage11a",
-            seed=args.seed + 300,
-        )
         rms_post_a = measure_layerwise_visual_text_rms(model, sample_im, tag="post_stage11a")
         xray_post_a = measure_visual_grounding_xray(model, tag="post_stage11a")
         cal_post_a = measure_visual_alignment_diagnostics(
@@ -599,6 +607,7 @@ def main() -> None:
         rsi_cfg = {
             "stage_mode": "full_spark",
             "unfreeze_vision_last_n_layers": 0,
+            "freeze_vision_projector": True,
             "optimizer_profile": "apollo_coat",
             "early_spark_layers": int(args.early_spark_layers),
             "early_spark_lr": min(args.early_spark_lr * 0.45, 1.0e-5),
@@ -610,9 +619,7 @@ def main() -> None:
             "apollo_connector_learning_rate": min(args.connector_lr * 0.35, 2.8e-5),
             "engram_lr": max(min(args.engram_lr * 0.75, 2.2e-5), rsi_bb_lr * 3.0),
             "vision_lr": 0.0,
-            "visual_decorr_loss_weight": float(args.decorr_weight) * 0.5,
-            "visual_decorr_target_dc_ratio": float(args.decorr_target_dc),
-            "visual_decorr_target_cos": float(args.decorr_target_cos),
+            "visual_decorr_loss_weight": 0.0,
             "warmup_ratio": 0.12,
             "clip_norm": max(0.8, float(args.clip_norm) * 0.75),
             "weight_decay": 0.01,

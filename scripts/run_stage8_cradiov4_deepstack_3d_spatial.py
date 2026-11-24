@@ -165,6 +165,8 @@ def _run_stage8_phase(
         stage_mode=stage_mode,
         unfreeze_vision_last_n_layers=unfreeze_vis,
     )
+    if bool(stage_cfg.get("freeze_vision_projector", False)) and getattr(model, "vision_projector", None) is not None:
+        model.vision_projector.requires_grad_(False)
     model.train()
 
     param_audit = partition_stage75_trainable_parameters(model)
@@ -275,7 +277,7 @@ def _run_stage8_phase(
                 prefetched_ex = _materialize(idx + 1, nk, npay)
                 prefetch_fut = prefetch_pool.submit(model.prefetch_examples_vision, [prefetched_ex])
 
-            is_long = use_cuda_amp and (len(str(row.get("prompt", ""))) + len(str(row.get("answer", ""))) > 8000)
+            is_long = use_cuda_amp and (len(str(row.get("prompt", ""))) + len(str(row.get("answer", ""))) > 4000)
             if is_long:
                 torch.cuda.empty_cache()
 
