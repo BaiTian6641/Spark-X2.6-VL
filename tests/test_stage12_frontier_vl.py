@@ -229,24 +229,11 @@ def test_realistic_scene_word_ocr_pairs_quality_and_chroma():
 
 
 def test_v28_grammar_repair_covers_stage115_unseen_syntax_slips():
-    # Use a real minimal valid v4.1 sculpted program with child bone attach(...)
-    sample_dsl = """@meta { archetype: entity, target_profile: bedrock_entity, texel_density: 16, units_per_block: 16, dsl_version: "4.1", size_step: 0.5, audit_profile: sculpted }
-@palette {
-  body: ramp(base_lch=[45, 22, 220], steps=4, hue_shift=[-4, 4])
-}
-@rig {
-  root bone pelvis {
-    box core { size:[6.0, 5.0, 8.0], material:body }
-    bone chest attach(parent_box=core, anchor=[0, 0, 1], align=[0, 0, -1]) {
-      box chest_box { size:[5.0, 4.5, 6.0], material:body }
-    }
-  }
-}"""
-    recs = build_v28_grammar_repair_records(
-        [{"id": "test_v28_slip", "answer": f"```blockdsl\n{sample_dsl}\n```"}],
-        seed=12,
-        max_items=20,
-    )
+    from colab.final.aesthetic_v28_biomech_corpus import build_aesthetic_v28_biomech_records
+
+    v28_recs = build_aesthetic_v28_biomech_records(seed=42, max_records=2)
+    assert len(v28_recs) >= 1
+    recs = build_v28_grammar_repair_records(v28_recs, seed=12, max_items=32)
     muts = {r["metadata"]["mutator"] for r in recs}
     assert "missing_bone_attach" in muts, f"Missing missing_bone_attach in {muts}"
     assert "meta_chain_field" in muts, f"Missing meta_chain_field in {muts}"

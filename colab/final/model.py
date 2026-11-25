@@ -883,9 +883,10 @@ class RadioMultiLayerGELUProjector(nn.Module):
         self.pre_norm = nn.RMSNorm(in_dim, eps=1e-6)
         self.fc1 = nn.Linear(in_dim, inter)
         self.fc2 = nn.Linear(inter, self.hidden_size)
-        nn.init.normal_(self.fc1.weight, mean=0.0, std=0.02)
+        # Dimension-invariant He/GELU init: pre_norm RMS=1.0 -> fc1 RMS=1.0 -> GELU RMS~0.65 -> fc2 RMS=target_rms
+        nn.init.normal_(self.fc1.weight, mean=0.0, std=1.0 / math.sqrt(max(1.0, float(in_dim))))
         nn.init.zeros_(self.fc1.bias)
-        nn.init.normal_(self.fc2.weight, mean=0.0, std=float(target_rms) / math.sqrt(max(1.0, inter * 0.5)))
+        nn.init.normal_(self.fc2.weight, mean=0.0, std=float(target_rms) / (0.65 * math.sqrt(max(1.0, float(inter)))))
         nn.init.zeros_(self.fc2.bias)
         self.early_mid_proj = nn.Linear(self.vis_dim * 4, self.hidden_size)
         nn.init.normal_(self.early_mid_proj.weight, mean=0.0, std=float(target_rms) / math.sqrt(max(1.0, self.vis_dim * 4.0)))
