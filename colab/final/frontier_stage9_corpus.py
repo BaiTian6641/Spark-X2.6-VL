@@ -2936,7 +2936,10 @@ def build_stage12_real_vl_alignment_pairs(
                             elif isinstance(content, list):
                                 parts = []
                                 for it in content:
-                                    if isinstance(it, dict):
+                                    if isinstance(it, str):
+                                        if it.strip():
+                                            parts.append(it.strip())
+                                    elif isinstance(it, dict):
                                         if it.get("type") == "text":
                                             parts.append(str(it.get("text") or "").strip())
                                         elif it.get("type") in ("image", "image_url") and not m_im:
@@ -2950,10 +2953,10 @@ def build_stage12_real_vl_alignment_pairs(
                             elif role == "assistant" and pending_q and img_ref:
                                 body = txt.split("</think>")[-1].strip()
                                 body = re.sub(r"^(?:Final\s+Answer|Answer)\s*[:=]\s*", "", body, flags=re.IGNORECASE).strip()
-                                bl = body.lower().strip(".!? ")
-                                if bl not in ("yes", "no", "") and 2 <= len(body) <= 120:
+                                bl = re.sub(r"[^a-z]", "", body.lower())
+                                if bl not in ("yes", "no", "") and 2 <= len(body) <= 220:
                                     q_line = next((ln.strip() for ln in pending_q.splitlines() if ln.strip()), "")
-                                    if 10 <= len(q_line) <= 180 and not _is_contaminated(q_line + " " + body):
+                                    if 10 <= len(q_line) <= 220 and not _is_contaminated(q_line + " " + body):
                                         stem = Path(img_ref).stem
                                         qa_by_img.setdefault(stem, (q_line, body))
                                 pending_q = None

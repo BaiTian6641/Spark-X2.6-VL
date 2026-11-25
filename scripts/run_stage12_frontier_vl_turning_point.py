@@ -659,30 +659,28 @@ def main() -> None:
     )
     nemotron_vl_pairs = build_nemotron_v3_spatial_records(
         cache_dir=args.nemotron_cache_dir,
-        token=hf_token,
+        hf_token=hf_token,
         max_gqa=args.nemotron_max_gqa,
-        max_geo=args.nemotron_max_geo,
+        max_geometry3k=args.nemotron_max_geo,
         max_aokvqa=args.nemotron_max_aokvqa,
         max_clevr=args.nemotron_max_clevr,
         max_zhwiki=args.nemotron_max_zhwiki,
         max_plotqa=args.nemotron_max_plotqa,
         seed=args.seed + 19,
     )
-    frontier_records, frontier_summary = build_stage9_frontier_training_records(
+    frontier_records = build_stage9_frontier_training_records(
         token=hf_token,
         max_nemotron_terminal=args.max_nemotron_terminal,
-        max_ot_agent=args.max_ot_agent,
+        max_openthoughts_agent=args.max_ot_agent,
         max_terminal_pivot=args.max_terminal_pivot,
-        max_ot3_stem=args.max_ot3_stem,
+        max_openthoughts3_stem=args.max_ot3_stem,
         max_nemotron_science=args.max_nemotron_science,
-        excluded_tb41_tasks=tb41_excluded,
         seed=args.seed + 23,
+        excluded_tb_task_ids=tb41_excluded,
     )
-    extra_text_recs, extra_vis_pairs, extra_summary = load_extra_user_dataset_records(
+    extra_text_recs, extra_vis_pairs = load_extra_user_dataset_records(
         jsonl_paths=args.extra_jsonl,
         dataset_dirs=args.extra_dataset_dir,
-        excluded_tb41_tasks=tb41_excluded,
-        seed=args.seed + 29,
     )
 
     all_vis_pairs_for_audit = (
@@ -704,10 +702,10 @@ def main() -> None:
         + list(extra_text_recs)
     )
     audit_rep = audit_stage9_records_strict(
-        v28_records=v28_records,
-        frontier_records=all_text_recs_for_audit,
-        spatial3d_pairs=all_vis_pairs_for_audit,
-        excluded_tb41_tasks=tb41_excluded,
+        all_text_recs_for_audit,
+        v28_records,
+        all_vis_pairs_for_audit,
+        excluded_tb41_ids=tb41_excluded,
     )
     audit_rep["stage12_counts"] = {
         "word_ocr_pairs": len(word_ocr_pairs),
@@ -723,7 +721,8 @@ def main() -> None:
         "v28_records": len(v28_records),
         "v28_repair_records": len(v28_repair_records),
         "frontier_records": len(frontier_records),
-        "extra_summary": extra_summary,
+        "extra_text_recs": len(extra_text_recs),
+        "extra_vis_pairs": len(extra_vis_pairs),
     }
     write(args.output_root / "STAGE12_DATASET_AUDIT.json", audit_rep)
     emit("stage12_dataset_audit_complete", **audit_rep)
