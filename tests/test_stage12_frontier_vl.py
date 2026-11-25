@@ -229,12 +229,27 @@ def test_realistic_scene_word_ocr_pairs_quality_and_chroma():
 
 
 def test_v28_grammar_repair_covers_stage115_unseen_syntax_slips():
-    from colab.final.aesthetic_v28_biomech_corpus import build_aesthetic_v28_biomech_records
-
-    v28_recs = build_aesthetic_v28_biomech_records(seed=42, max_records=2)
-    assert len(v28_recs) >= 1
-    recs = build_v28_grammar_repair_records(v28_recs, seed=12, max_items=32)
-    muts = {r["metadata"]["mutator"] for r in recs}
+    clean_dsl = """@meta { archetype:entity, target_profile:bedrock_entity, texel_density:16, units_per_block:16, dsl_version:"4.1", size_step:0.5, audit_profile:sculpted }
+@palette {
+  hide: ramp(base_lch=[0.46,0.12,42], steps=5, hue_shift=[-16,18])
+}
+@rig {
+  root bone torso {
+    pivot_local:[0,9.5,0]
+    box chest { size:[5,4.5,7], material:hide, prism_group:"ch" }
+    bone leg_l attach(parent_box=chest, anchor=[-1,-0.65,0], align=[1,1,0]) mirror_x(leg_r) {
+      joint_limits:[[-60,60],[-25,25],[-25,25]]
+      box femur { size:[1.5,4,2], material:hide }
+    }
+  }
+}
+"""
+    recs = build_v28_grammar_repair_records(
+        [{"id": "test_v28_slip", "answer": f"<think>\nBuild rig.\n</think>\n```blockdsl\n{clean_dsl}\n```"}],
+        seed=12,
+        max_items=32,
+    )
+    muts = {r["metadata"].get("mutation") for r in recs if r["metadata"].get("mutation")}
     assert "missing_bone_attach" in muts, f"Missing missing_bone_attach in {muts}"
     assert "meta_chain_field" in muts, f"Missing meta_chain_field in {muts}"
     assert "illegal_bone_statement" in muts, f"Missing illegal_bone_statement in {muts}"
