@@ -583,56 +583,27 @@ def _run_stage12a_two_stage_vl_awakening(
                 "final_ema_ce": round(float(ema1), 4) if ema1 is not None else None,
                 "elapsed_s": round(time.time() - t1, 1),
             }
+            ckpt_12a1_dir = output_root / "ckpt-stage12a1"
+            ckpt_12a1_dir.mkdir(parents=True, exist_ok=True)
+            _save_model_safetensors(model, ckpt_12a1_dir / "model.safetensors")
             probe_12a1 = _run_stage12_quick_vl_probe(model, tag="post_stage12a1_ocr")
             write(output_root / "STAGE12A1_PROBE.json", probe_12a1)
 
         # ------------------------------------------------------------------
         # Phase 12A-2: Early-12L Spark Self-Attention + Projector Joint VL Awakening
+        # (Chunked 100-step feature precomputation -> <= 2.5 GiB peak Host RAM on 64 GB machines!)
         # ------------------------------------------------------------------
         if stage12a2_updates > 0:
-            pool_specs: list[tuple[str, list[tuple[dict[str, Any], dict[str, bytes]]]]] = [
-                ("coco_yes", [p for p in coco_pairs if p[0].get("task") == "stage12_coco_pope_yes"]),
-                ("coco_no", [p for p in coco_pairs if p[0].get("task") == "stage12_coco_pope_no"]),
-                ("coco_rich", [p for p in coco_pairs if p[0].get("task") in ("stage12_coco_object_list", "stage12_coco_count")]),
-                ("aokvqa", [p for p in real_vl_pairs if str(p[0].get("task") or "").startswith("stage12_aokvqa")]),
-                ("tv_gqa", [p for p in real_vl_pairs if p[0].get("task") in ("stage12_direct_textvqa_real", "stage12_gqa_open_semantic")]),
-                ("doc_latex", list(hf_ocr_pairs[:2400]) + [p for p in real_vl_pairs if p[0].get("task") == "stage12_direct_latex_ocr"]),
-                ("word_ocr", list(word_ocr_pairs[:2800])),
-            ]
-            combined_pairs: list[tuple[dict[str, Any], dict[str, bytes]]] = []
-            pool_ranges: dict[str, tuple[int, int]] = {}
-            for pname, plist in pool_specs:
-                s0 = len(combined_pairs)
-                combined_pairs.extend(plist)
-                pool_ranges[pname] = (s0, len(combined_pairs))
-
-            t_f2 = time.time()
-            mix_items, mix_fmap, mix_hmap = _precompute_radio_features_fast(model, combined_pairs, bsz=24)
-            # Rebuild bucket lists on valid encoded items
-            buckets: dict[str, list[tuple[dict[str, Any], str]]] = {k: [] for k, _ in pool_specs}
-            for rec, key in mix_items:
-                tname = str(rec.get("task") or "")
-                if tname == "stage12_coco_pope_yes":
-                    buckets["coco_yes"].append((rec, key))
-                elif tname == "stage12_coco_pope_no":
-                    buckets["coco_no"].append((rec, key))
-                elif tname in ("stage12_coco_object_list", "stage12_coco_count"):
-                    buckets["coco_rich"].append((rec, key))
-                elif tname.startswith("stage12_aokvqa"):
-                    buckets["aokvqa"].append((rec, key))
-                elif tname in ("stage12_direct_textvqa_real", "stage12_gqa_open_semantic"):
-                    buckets["tv_gqa"].append((rec, key))
-                elif tname == "stage12_realistic_word_ocr":
-                    buckets["word_ocr"].append((rec, key))
-                else:
-                    buckets["doc_latex"].append((rec, key))
-            emit(
-                "stage12a2_features_ready",
-                total_items=len(mix_items),
-                unique_images=len(mix_fmap),
-                bucket_counts={k: len(v) for k, v in buckets.items()},
-                elapsed_s=round(time.time() - t_f2, 1),
-            )
+            raw_pools: dict[str, list[tuple[dict[str, Any], dict[str, bytes]]]] = {
+                "coco_yes": [p for p in coco_pairs if p[0].get("task") == "stage12_coco_pope_yes"],
+                "coco_no": [p for p in coco_pairs if p[0].get("task") == "stage12_coco_pope_no"],
+                "coco_rich": [p for p in coco_pairs if p[0].get("task") in ("stage12_coco_object_list", "stage12_coco_count")],
+                "aokvqa": [p for p in real_vl_pairs if str(p[0].get("task") or "").startswith("stage12_aokvqa")],
+                "tv_gqa": [p for p in real_vl_pairs if p[0].get("task") in ("stage12_direct_textvqa_real", "stage12_gqa_open_semantic")],
+                "doc_latex": list(hf_ocr_pairs[:2400]) + [p for p in real_vl_pairs if p[0].get("task") == "stage12_direct_latex_ocr"],
+                "word_ocr": list(word_ocr_pairs[:3200]),
+            }
+            non_empty_fallback = [k for k, v in raw_pools.items() if v]
 
             for p in model.parameters():
                 p.requires_grad_(False)
@@ -652,6 +623,7 @@ def _run_stage12a_two_stage_vl_awakening(
                 early_attn_layers=n_early,
                 attn_params=sum(p.numel() for p in attn_params),
                 proj_params=sum(p.numel() for p in proj_all_params),
+                pool_counts={k: len(v) for k, v in raw_pools.items()},
             )
 
             opt2 = torch.optim.AdamW(
@@ -672,53 +644,87 @@ def _run_stage12a_two_stage_vl_awakening(
             # Strictly balanced per-step micro-composition (8 items):
             # 1 COCO-Yes + 1 COCO-Adv-No + 1 COCO-List/Count + 1 A-OKVQA + 1 TextVQA/GQA + 1 DocVQA/LaTeX + 2 Word-OCR!
             slot_recipe = ("coco_yes", "coco_no", "coco_rich", "aokvqa", "tv_gqa", "doc_latex", "word_ocr", "word_ocr")
-            non_empty_fallback = [k for k, v in buckets.items() if v]
 
             t2 = time.time()
             ema2: float | None = None
-            for step in range(1, stage12a2_updates + 1):
-                model.train()
-                for mod in model.modules():
-                    if isinstance(mod, nn.Dropout):
-                        mod.eval()
-                batch: list[tuple[dict[str, Any], str]] = []
-                for bi in range(stage12a2_batch_size):
-                    bname = slot_recipe[bi % len(slot_recipe)]
-                    pool = buckets.get(bname) or buckets[rng.choice(non_empty_fallback)]
-                    batch.append(pool[rng.randrange(len(pool))])
-                loss, ce_v, rms_v = _batched_precomputed_step(
-                    model,
-                    batch_items=batch,
-                    feat_map=mix_fmap,
-                    hw_map=mix_hmap,
-                    nl_emb=nl_emb,
-                    rms_cap=rms_cap,
-                    rms_weight=rms_weight,
-                    max_ans_tokens=64,
+            chunk_steps = 100
+            step = 0
+            while step < stage12a2_updates:
+                cur_n = min(chunk_steps, stage12a2_updates - step)
+                chunk_raw_batches: list[list[tuple[dict[str, Any], dict[str, bytes]]]] = []
+                flat_chunk_pairs: list[tuple[dict[str, Any], dict[str, bytes]]] = []
+                for _ in range(cur_n):
+                    rb: list[tuple[dict[str, Any], dict[str, bytes]]] = []
+                    for bi in range(stage12a2_batch_size):
+                        bname = slot_recipe[bi % len(slot_recipe)]
+                        pool = raw_pools.get(bname) or raw_pools[rng.choice(non_empty_fallback)]
+                        pair = pool[rng.randrange(len(pool))]
+                        rb.append(pair)
+                        flat_chunk_pairs.append(pair)
+                    chunk_raw_batches.append(rb)
+
+                t_cf = time.time()
+                c_items, c_fmap, c_hmap = _precompute_radio_features_fast(model, flat_chunk_pairs, bsz=24)
+                emit(
+                    "stage12a2_chunk_features_ready",
+                    step_start=step + 1,
+                    step_end=step + cur_n,
+                    items=len(c_items),
+                    unique_images=len(c_fmap),
+                    elapsed_s=round(time.time() - t_cf, 1),
                 )
-                if not torch.isfinite(loss):
-                    opt2.zero_grad(set_to_none=True)
-                    emit("stage12a2_nonfinite_skip", step=step)
-                    continue
-                opt2.zero_grad(set_to_none=True)
-                loss.backward()
-                gn = float(torch.nn.utils.clip_grad_norm_(all_12a2_params, 1.0))
-                opt2.step()
-                sched2.step()
-                ema2 = ce_v if ema2 is None else (0.93 * ema2 + 0.07 * ce_v)
-                if step == 1 or step % 50 == 0 or step == stage12a2_updates:
-                    emit(
-                        "stage12a2_vl_step",
-                        step=step,
-                        max_updates=stage12a2_updates,
-                        ce=round(ce_v, 4),
-                        ema_ce=round(float(ema2), 4),
-                        vrms=round(rms_v, 4),
-                        grad_norm=round(gn, 3),
-                        lr_attn=round(float(sched2.get_last_lr()[2]), 7),
-                        elapsed_s=round(time.time() - t2, 1),
+
+                # Index encoded items back by (id(rec), sha1)
+                idx_cursor = 0
+                for _ in range(cur_n):
+                    step += 1
+                    batch = c_items[idx_cursor : idx_cursor + stage12a2_batch_size]
+                    idx_cursor += stage12a2_batch_size
+                    if not batch:
+                        continue
+                    model.train()
+                    for mod in model.modules():
+                        if isinstance(mod, nn.Dropout):
+                            mod.eval()
+                    loss, ce_v, rms_v = _batched_precomputed_step(
+                        model,
+                        batch_items=batch,
+                        feat_map=c_fmap,
+                        hw_map=c_hmap,
+                        nl_emb=nl_emb,
+                        rms_cap=rms_cap,
+                        rms_weight=rms_weight,
+                        max_ans_tokens=64,
                     )
-            del opt2, sched2, mix_fmap, mix_hmap, buckets
+                    if not torch.isfinite(loss):
+                        opt2.zero_grad(set_to_none=True)
+                        emit("stage12a2_nonfinite_skip", step=step)
+                        continue
+                    opt2.zero_grad(set_to_none=True)
+                    loss.backward()
+                    gn = float(torch.nn.utils.clip_grad_norm_(all_12a2_params, 1.0))
+                    opt2.step()
+                    sched2.step()
+                    ema2 = ce_v if ema2 is None else (0.93 * ema2 + 0.07 * ce_v)
+                    if step == 1 or step % 50 == 0 or step == stage12a2_updates:
+                        emit(
+                            "stage12a2_vl_step",
+                            step=step,
+                            max_updates=stage12a2_updates,
+                            ce=round(ce_v, 4),
+                            ema_ce=round(float(ema2), 4),
+                            vrms=round(rms_v, 4),
+                            grad_norm=round(gn, 3),
+                            lr_attn=round(float(sched2.get_last_lr()[2]), 7),
+                            elapsed_s=round(time.time() - t2, 1),
+                        )
+
+                del c_items, c_fmap, c_hmap, chunk_raw_batches, flat_chunk_pairs
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            del opt2, sched2
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -1380,7 +1386,7 @@ def main() -> None:
             and (out_bf16 / "model.safetensors").is_file()
             and (out_fp8 / "model.safetensors").is_file()
         ):
-            for ck in ("ckpt-stage12a", "ckpt-stage12b", "ckpt-stage12c-rsi6"):
+            for ck in ("ckpt-stage12a1", "ckpt-stage12a", "ckpt-stage12b", "ckpt-stage12c-rsi6"):
                 ck_p = args.output_root / ck
                 if ck_p.is_dir():
                     shutil.rmtree(ck_p, ignore_errors=True)
