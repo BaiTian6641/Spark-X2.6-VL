@@ -1233,7 +1233,31 @@ def build_v28_grammar_repair_records(
                 return m.group(0)
         return re.sub(r"size:\s*\[\s*([0-9]+(?:\.[0-9]+)?)\s*,\s*([0-9]+(?:\.[0-9]+)?)\s*,\s*([0-9]+(?:\.[0-9]+)?)\s*\]", _bump, s, count=1), "Quantize every `box` `size:[x,y,z]` component to an exact multiple of `meta.size_step` (`0.5`, e.g., `2.0`, `2.5`, `3.0` — never `.25` or `.75`)."
 
+    def _mutate_missing_bone_attach(s: str) -> tuple[str, str]:
+        return re.sub(
+            r"(\bbone\s+[a-zA-Z0-9_]+)\s+attach\([^)]*\)",
+            r"\1",
+            s,
+            count=1,
+        ), "Every non-root child `bone <name>` inside `@rig` MUST specify `attach(parent_box=..., anchor=[...], align=[...])` immediately before `{` (never `bone <name> {`)."
+
+    def _mutate_meta_chain_field(s: str) -> tuple[str, str]:
+        if "audit_profile:" in s:
+            return re.sub(r"(audit_profile\s*:\s*[a-zA-Z0-9_]+)", r"\1, chain:tail_chain", s, count=1), "Remove illegal `chain` key from `@meta { ... }`; `chain` declarations belong inside `@rig { ... }`, never `@meta`."
+        return re.sub(r"(@meta\s*\{[^}]*)", r"\1, chain:tail_chain", s, count=1), "Remove illegal `chain` key from `@meta { ... }`; `chain` declarations belong inside `@rig { ... }`, never `@meta`."
+
+    def _mutate_illegal_bone_statement(s: str) -> tuple[str, str]:
+        return re.sub(
+            r"(\bbone\s+[a-zA-Z0-9_]+\s+attach\([^)]*\)[^{]*\{\s*)",
+            r"\1offset:[0, 1, 0];\n      ",
+            s,
+            count=1,
+        ), "Remove illegal `offset:` statement inside a `bone { ... }` body; valid bone statements are strictly `box`, `plane`, `locator`, `bone`, `use`, `chain`, or `}`."
+
     mutators = (
+        ("missing_bone_attach", _mutate_missing_bone_attach),
+        ("meta_chain_field", _mutate_meta_chain_field),
+        ("illegal_bone_statement", _mutate_illegal_bone_statement),
         ("texel_size", _mutate_texel_size),
         ("root_keyword", _mutate_root_keyword),
         ("box_axis", _mutate_box_axis),
@@ -1632,6 +1656,7 @@ def build_real_photo_pope_yesno_pairs(
     token: str | None = None,
     max_pairs: int = 1400,
     seed: int = 20261171,
+    existence_priority: bool = True,
 ) -> list[tuple[dict[str, Any], dict[str, bytes]]]:
     """Mine strictly `50% Yes / 50% No` real-photograph object existence & attribute pairs from
     `nvidia/Nemotron-Image-Training-v3` (`gqa_1`, `gqa_2`, `CC-BY-4.0`) joined onto `lmms-lab/GQA`
@@ -1674,9 +1699,12 @@ def build_real_photo_pope_yesno_pairs(
             return "\n".join(t for t in txts if t).strip(), im_ref
         return "", ""
 
-    yes_by_img: dict[str, tuple[str, str]] = {}
-    no_by_img: dict[str, tuple[str, str]] = {}
-    yn_prefixes = ("is there", "are there", "do you see", "can you see", "does the", "is the", "is this", "are the", "is that")
+    yes_exist_by_img: dict[str, tuple[str, str]] = {}
+    no_exist_by_img: dict[str, tuple[str, str]] = {}
+    yes_attr_by_img: dict[str, tuple[str, str]] = {}
+    no_attr_by_img: dict[str, tuple[str, str]] = {}
+    exist_prefixes = ("is there", "are there", "do you see", "can you see")
+    yn_prefixes = exist_prefixes + ("does the", "is the", "is this", "are the", "is that")
 
     for gqa_sub in ("gqa_1", "gqa_2"):
         try:
@@ -1723,11 +1751,32 @@ def build_real_photo_pope_yesno_pairs(
                             if ql.startswith(yn_prefixes) and " or " not in ql:
                                 stem = Path(img_ref).stem
                                 q_fmt = q_clean.rstrip(".?") + "? Please answer yes or no."
-                                if yn_ans == "yes" and stem not in yes_by_img:
-                                    yes_by_img[stem] = (q_fmt, "Yes")
-                                elif yn_ans == "no" and stem not in no_by_img:
-                                    no_by_img[stem] = (q_fmt, "No")
+                                is_exist = ql.startswith(exist_prefixes)
+                                if yn_ans == "yes":
+                                    if is_exist and stem not in yes_exist_by_img:
+                                        yes_exist_by_img[stem] = (q_fmt, "Yes")
+                                    elif not is_exist and stem not in yes_attr_by_img:
+                                        yes_attr_by_img[stem] = (q_fmt, "Yes")
+                                else:
+                                    if is_exist and stem not in no_exist_by_img:
+                                        no_exist_by_img[stem] = (q_fmt, "No")
+                                    elif not is_exist and stem not in no_attr_by_img:
+                                        no_attr_by_img[stem] = (q_fmt, "No")
                         pending_q = None
+
+    if existence_priority:
+        yes_by_img = dict(yes_exist_by_img)
+        no_by_img = dict(no_exist_by_img)
+        # Only fall back to relational attribute questions if pure object-existence pool is smaller than needed
+        if len(yes_by_img) < half_target * 2:
+            for k, v in yes_attr_by_img.items():
+                yes_by_img.setdefault(k, v)
+        if len(no_by_img) < half_target * 2:
+            for k, v in no_attr_by_img.items():
+                no_by_img.setdefault(k, v)
+    else:
+        yes_by_img = {**yes_attr_by_img, **yes_exist_by_img}
+        no_by_img = {**no_attr_by_img, **no_exist_by_img}
 
     yes_pairs: list[tuple[dict[str, Any], dict[str, bytes]]] = []
     no_pairs: list[tuple[dict[str, Any], dict[str, bytes]]] = []
@@ -2459,3 +2508,498 @@ def select_stage115_visual_alignment_rids(
 
     rng.shuffle(chosen)
     return chosen[:target_samples], counts
+
+
+def build_realistic_scene_word_ocr_pairs(
+    *,
+    max_items: int = 4000,
+    seed: int = 20261201,
+) -> list[tuple[dict[str, Any], dict[str, bytes]]]:
+    """Stage-12 realistic scene-text word, alphanumeric code, and short sign-phrase OCR crops.
+
+    Proven in Blackwell ablations (`task-9404`: 60.0% exact 4-char match on unseen fonts;
+    `task-9499`: 0.0% -> 17.5% real `OCRBench` Text Recognition in 250 frozen-LLM steps).
+    Combines:
+      - 25% 2-6 char random alphanumeric codes (fast single-character phase-transition catalyst),
+      - 55% realistic single open-vocab dictionary words (UPPER, Title, lower, digits) with
+        gradient/noise photo-like backgrounds, drop shadows, slight rotation (+/-7 deg), and blur,
+      - 20% 2-3 word sign/storefront/price phrases (`EXIT 24`, `OPEN DAILY`, `$19.95`, etc.).
+    Strictly verifies every font renders readable Latin glyphs and every image has vivid chroma > 10.
+    """
+    import io
+    import string
+    import numpy as np
+    from PIL import Image, ImageDraw, ImageFilter, ImageFont
+
+    if max_items <= 0:
+        return []
+    rng = random.Random(seed)
+    np_rng = np.random.default_rng(seed)
+    words = _load_open_vocab_words()
+    latin_fonts, _ = _discover_open_vocab_fonts()
+    good_fonts: list[str] = []
+    for fp in latin_fonts[:80]:
+        try:
+            im_t = Image.new("L", (72, 32), 255)
+            dr_t = ImageDraw.Draw(im_t)
+            dr_t.text((4, 4), "ABC7", fill=0, font=ImageFont.truetype(fp, 20))
+            if float(np.asarray(im_t).mean()) < 248.0:
+                good_fonts.append(fp)
+        except Exception:
+            continue
+    if not good_fonts:
+        good_fonts = latin_fonts[:16]
+    if not good_fonts:
+        return []
+
+    alph = string.ascii_uppercase + string.digits
+    prompts = (
+        "What is written in the image?",
+        "Read the exact text in this image.",
+        "What word or code is shown in the image? Answer concisely.",
+        "Transcribe the text shown in this image directly.",
+    )
+    out: list[tuple[dict[str, Any], dict[str, bytes]]] = []
+    for i in range(max_items):
+        bucket = i % 20
+        if bucket < 5:
+            # 25%: 2-6 char random alphanumeric code (character-level phase-transition catalyst)
+            k = rng.choice((3, 4, 4, 5, 6))
+            text = "".join(rng.choice(alph) for _ in range(k))
+            W, H = 384, 96
+            submode = "alnum_code"
+        elif bucket < 16:
+            # 55%: realistic single open-vocab word / number
+            w = rng.choice(words)
+            if len(w) > 13:
+                w = w[:13]
+            m = i % 5
+            if m == 0:
+                text = w.upper()
+            elif m == 1:
+                text = w.capitalize()
+            elif m == 2:
+                text = w.lower()
+            elif m == 3:
+                text = w.upper() if rng.random() < 0.6 else f"{rng.randint(10, 99999)}"
+            else:
+                text = f"{w.capitalize()}{rng.randint(1, 99)}" if rng.random() < 0.3 else w.upper()
+            W, H = (384, 96) if rng.random() < 0.7 else (384, 128)
+            submode = "scene_word"
+        else:
+            # 20%: 2-3 word street/sign/price phrase
+            w1 = rng.choice(words)[:8]
+            w2 = rng.choice(words)[:8]
+            pm = i % 4
+            if pm == 0:
+                text = f"{w1.upper()} {w2.upper()}"
+            elif pm == 1:
+                text = f"{w1.capitalize()} {w2.capitalize()}"
+            elif pm == 2:
+                text = f"{w1.upper()} {rng.randint(1, 999)}"
+            else:
+                text = f"${rng.randint(1, 499)}.{rng.randint(0, 99):02d}"
+            W, H = 448, 128
+            submode = "sign_phrase"
+
+        # Vivid photo-like gradient + subtle Gaussian noise background (guarantees chroma > 10)
+        hue_pick = rng.randint(0, 5)
+        vivid_bases = (
+            (235, 205, 165), (175, 220, 245), (240, 185, 195),
+            (185, 235, 195), (32, 58, 108), (110, 38, 42),
+        )
+        b0 = vivid_bases[hue_pick]
+        c1 = np.array(
+            [
+                max(10, min(250, b0[0] + rng.randint(-28, 28))),
+                max(10, min(250, b0[1] + rng.randint(-28, 28))),
+                max(10, min(250, b0[2] + rng.randint(-28, 28))),
+            ],
+            dtype=np.float32,
+        )
+        c2 = np.clip(c1 + np.array([rng.randint(-45, 45), rng.randint(-45, 45), rng.randint(-45, 45)], dtype=np.float32), 5, 252)
+        grad = np.linspace(0.0, 1.0, W, dtype=np.float32)[None, :, None]
+        bg_arr = (c1 * (1.0 - grad) + c2 * grad).repeat(H, axis=0)
+        bg_arr += rng.uniform(2.0, 11.0) * np_rng.normal(0.0, 1.0, (H, W, 3)).astype(np.float32)
+        bg_arr = np.clip(bg_arr, 0, 255).astype(np.uint8)
+        bg_lum = float(c1.mean())
+        if bg_lum > 128.0:
+            fg = (rng.randint(0, 55), rng.randint(0, 55), rng.randint(10, 95))
+            shadow = (225, 225, 230)
+        else:
+            fg = (rng.randint(215, 255), rng.randint(210, 255), rng.randint(175, 245))
+            shadow = (15, 18, 28)
+
+        im = Image.fromarray(bg_arr, mode="RGB")
+        dr = ImageDraw.Draw(im)
+        fp = rng.choice(good_fonts)
+        fsize = rng.randint(40, 68)
+        f = ImageFont.truetype(fp, fsize)
+        bb = dr.textbbox((0, 0), text, font=f)
+        tw, th = bb[2] - bb[0], bb[3] - bb[1]
+        while (tw > W - 20 or th > H - 14) and fsize > 18:
+            fsize = max(16, int(fsize * 0.85))
+            f = ImageFont.truetype(fp, fsize)
+            bb = dr.textbbox((0, 0), text, font=f)
+            tw, th = bb[2] - bb[0], bb[3] - bb[1]
+        x = max(6, min(W - 6 - tw, (W - tw) // 2 + rng.randint(-20, 20)))
+        y = max(4, min(H - 4 - th, (H - th) // 2 + rng.randint(-8, 8)))
+        if rng.random() < 0.28:
+            dr.text((x - bb[0] + 2, y - bb[1] + 2), text, fill=shadow, font=f)
+        dr.text((x - bb[0], y - bb[1]), text, fill=fg, font=f)
+        if rng.random() < 0.22:
+            im = im.rotate(rng.uniform(-6.5, 6.5), resample=Image.Resampling.BICUBIC, fillcolor=tuple(int(v) for v in c1))
+        if rng.random() < 0.20:
+            im = im.filter(ImageFilter.GaussianBlur(radius=rng.uniform(0.35, 0.95)))
+
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=92)
+        jpg = buf.getvalue()
+        h = hashlib.sha256(f"s12_word:{seed}:{i}:{text}".encode("utf-8")).hexdigest()[:14]
+        mem = f"s12_word_ocr_{h}.jpg"
+        rec = {
+            "id": f"stage12_word_ocr_{h}",
+            "source_group": f"stage12_word_ocr_{submode}",
+            "language": "en",
+            "task": "stage12_realistic_word_ocr",
+            "visual_kind": "independent_image",
+            "frames": [mem],
+            "enable_thinking": False,
+            "prompt": prompts[i % len(prompts)],
+            "answer": text,
+            "target": {"kind": "text", "text": text},
+            "metadata": {
+                "source": "spark_stage12_realistic_scene_word_ocr",
+                "license_spdx": "CC0-1.0",
+                "submode": submode,
+                "pixel_indispensable": True,
+            },
+        }
+        out.append((rec, {mem: jpg}))
+
+    emit("stage12_realistic_word_ocr_ready", count=len(out), fonts=len(good_fonts), vocab=len(words))
+    return out
+
+
+def build_stage12_real_vl_alignment_pairs(
+    *,
+    token: str | None = None,
+    max_textvqa: int = 2200,
+    max_aokvqa: int = 2600,
+    max_latex: int = 800,
+    max_gqa_open: int = 2000,
+    seed: int = 20261205,
+) -> list[tuple[dict[str, Any], dict[str, bytes]]]:
+    """Stream commercial-permissive, train-split-only real VL datasets cached on disk:
+      1. `lmms-lab/TextVQA` (`train`, CC-BY-4.0) — real scene-text photos (signs, labels, books).
+      2. `HuggingFaceM4/A-OKVQA` (`train`, Apache-2.0, COCO train2017, 0% POPE overlap) — MCQ + rich
+         scene-grounded object rationales (directly strengthens `RealWorldQA`, `MMStar`, and `POPE`).
+      3. `oleehyO/latex-formulas` (`cleaned_formulas/train`, MIT) — LaTeX formula OCR (`OCRBench` HMER).
+      4. `nvidia/Nemotron-Image-Training-v3` (`gqa_1`/`gqa_2` non-Yes/No) joined onto `lmms-lab/GQA`
+         `train_all_images` (`CC-BY-4.0`/`MIT`) — open-ended natural-photo object/color/spatial QA.
+    """
+    import collections
+    import io
+    import numpy as np
+    from PIL import Image
+    from huggingface_hub import HfApi, hf_hub_download
+    import pyarrow.parquet as pq
+
+    rng = random.Random(seed)
+    api = HfApi(token=token)
+    out: list[tuple[dict[str, Any], dict[str, bytes]]] = []
+
+    def _encode_rgb_jpeg(raw_img: Any, *, max_side: int = 896, min_chroma: float = 0.0) -> bytes | None:
+        try:
+            if isinstance(raw_img, Image.Image):
+                im = raw_img.convert("RGB")
+            elif isinstance(raw_img, dict) and raw_img.get("bytes"):
+                im = Image.open(io.BytesIO(raw_img["bytes"])).convert("RGB")
+            elif isinstance(raw_img, (bytes, bytearray)):
+                im = Image.open(io.BytesIO(raw_img)).convert("RGB")
+            else:
+                return None
+            w, h = im.size
+            if min(w, h) < 24:
+                return None
+            if max(w, h) > max_side:
+                sc = max_side / float(max(w, h))
+                im = im.resize((max(32, int(round(w * sc))), max(32, int(round(h * sc)))), Image.Resampling.BICUBIC)
+            if min_chroma > 0.0:
+                arr = np.asarray(im, dtype=np.float32)
+                chroma = float(np.abs(arr[:, :, 0] - arr[:, :, 1]).mean() + np.abs(arr[:, :, 1] - arr[:, :, 2]).mean())
+                if chroma < min_chroma:
+                    return None
+            buf = io.BytesIO()
+            im.save(buf, format="JPEG", quality=90)
+            return buf.getvalue()
+        except Exception:
+            return None
+
+    # 1. `lmms-lab/TextVQA` (train split ONLY)
+    if max_textvqa > 0:
+        tv_cnt = 0
+        try:
+            files = sorted(
+                f for f in api.list_repo_files("lmms-lab/TextVQA", repo_type="dataset")
+                if f.startswith("data/train-") and f.endswith(".parquet")
+            )
+            for pf in files[:3]:
+                if tv_cnt >= max_textvqa:
+                    break
+                lp = Path(hf_hub_download("lmms-lab/TextVQA", pf, repo_type="dataset", token=token))
+                tbl = pq.read_table(lp, columns=["question_id", "question", "answers", "image"])
+                idxs = list(range(tbl.num_rows))
+                rng.shuffle(idxs)
+                for ri in idxs:
+                    if tv_cnt >= max_textvqa:
+                        break
+                    row = tbl.slice(ri, 1).to_pylist()[0]
+                    q = str(row.get("question") or "").strip()
+                    ans_list = [str(a).strip() for a in (row.get("answers") or []) if str(a).strip() and str(a).strip().lower() != "unanswerable"]
+                    if not q or not ans_list:
+                        continue
+                    ans = collections.Counter(ans_list).most_common(1)[0][0]
+                    if not (1 <= len(ans) <= 100) or _is_contaminated(q + " " + ans):
+                        continue
+                    jpg = _encode_rgb_jpeg(row.get("image"), max_side=896, min_chroma=5.0)
+                    if jpg is None:
+                        continue
+                    qid = str(row.get("question_id") or f"{pf}_{ri}")
+                    h = hashlib.sha256(f"s12_textvqa:{qid}:{q}".encode("utf-8")).hexdigest()[:14]
+                    mem = f"s12_textvqa_{h}.jpg"
+                    rec = {
+                        "id": f"stage12_textvqa_{h}",
+                        "source_group": "stage12_textvqa_train",
+                        "language": "en",
+                        "task": "stage12_direct_textvqa_real",
+                        "visual_kind": "independent_image",
+                        "frames": [mem],
+                        "enable_thinking": False,
+                        "prompt": f"{q}\nRead any visible text in the image and answer concisely.",
+                        "answer": ans,
+                        "target": {"kind": "text", "text": ans},
+                        "metadata": {"source": "lmms-lab/TextVQA", "license_spdx": "CC-BY-4.0", "split": "train", "pixel_indispensable": True},
+                    }
+                    out.append((rec, {mem: jpg}))
+                    tv_cnt += 1
+        except Exception as exc:
+            emit("stage12_textvqa_warning", error=str(exc)[:180])
+        emit("stage12_textvqa_ready", count=tv_cnt)
+
+    # 2. `HuggingFaceM4/A-OKVQA` (train split ONLY — COCO train2017, 0% POPE overlap)
+    if max_aokvqa > 0:
+        aok_cnt = 0
+        letters = ("A", "B", "C", "D")
+        try:
+            files = sorted(
+                f for f in api.list_repo_files("HuggingFaceM4/A-OKVQA", repo_type="dataset")
+                if f.startswith("data/train-") and f.endswith(".parquet")
+            )
+            for pf in files[:2]:
+                if aok_cnt >= max_aokvqa:
+                    break
+                lp = Path(hf_hub_download("HuggingFaceM4/A-OKVQA", pf, repo_type="dataset", token=token))
+                tbl = pq.read_table(lp, columns=["question_id", "question", "choices", "correct_choice_idx", "rationales", "image"])
+                idxs = list(range(tbl.num_rows))
+                rng.shuffle(idxs)
+                for ri in idxs:
+                    if aok_cnt >= max_aokvqa:
+                        break
+                    row = tbl.slice(ri, 1).to_pylist()[0]
+                    q = str(row.get("question") or "").strip()
+                    choices = [str(c).strip() for c in (row.get("choices") or [])]
+                    cidx = row.get("correct_choice_idx")
+                    if not q or len(choices) != 4 or not isinstance(cidx, int) or not (0 <= cidx < 4):
+                        continue
+                    if _is_contaminated(q + " " + " ".join(choices)):
+                        continue
+                    jpg = _encode_rgb_jpeg(row.get("image"), max_side=768, min_chroma=6.0)
+                    if jpg is None:
+                        continue
+                    qid = str(row.get("question_id") or f"{pf}_{ri}")
+                    rats = [str(r).strip() for r in (row.get("rationales") or []) if str(r).strip()]
+                    # Alternate between crisp RealWorldQA-style MCQ and rich visual-rationale grounding!
+                    if aok_cnt % 3 == 0 and rats:
+                        rat = max(rats, key=len)[:240]
+                        prm = f"{q}\nDescribe what you observe in the image and answer concisely."
+                        ans = f"{choices[cidx]}. {rat}"
+                        tname = "stage12_aokvqa_rationale"
+                    else:
+                        opts = "\n".join(f"{letters[k]}. {choices[k]}" for k in range(4))
+                        prm = f"{q}\n{opts}\nPlease answer directly with only the letter of the correct option."
+                        ans = letters[cidx]
+                        tname = "stage12_aokvqa_mcq"
+                    h = hashlib.sha256(f"s12_aok:{qid}:{tname}".encode("utf-8")).hexdigest()[:14]
+                    mem = f"s12_aok_{h}.jpg"
+                    rec = {
+                        "id": f"stage12_aokvqa_{h}",
+                        "source_group": tname,
+                        "language": "en",
+                        "task": tname,
+                        "visual_kind": "independent_image",
+                        "frames": [mem],
+                        "enable_thinking": False,
+                        "prompt": prm,
+                        "answer": ans,
+                        "target": {"kind": "text", "text": ans},
+                        "metadata": {"source": "HuggingFaceM4/A-OKVQA", "license_spdx": "Apache-2.0", "split": "train", "pixel_indispensable": True},
+                    }
+                    out.append((rec, {mem: jpg}))
+                    aok_cnt += 1
+        except Exception as exc:
+            emit("stage12_aokvqa_warning", error=str(exc)[:180])
+        emit("stage12_aokvqa_ready", count=aok_cnt)
+
+    # 3. `oleehyO/latex-formulas` (`cleaned_formulas/train`, MIT — powers OCRBench HMER)
+    if max_latex > 0:
+        lx_cnt = 0
+        try:
+            files = sorted(
+                f for f in api.list_repo_files("oleehyO/latex-formulas", repo_type="dataset")
+                if f.startswith("cleaned_formulas/train-") and f.endswith(".parquet")
+            )
+            for pf in files[:1]:
+                if lx_cnt >= max_latex:
+                    break
+                lp = Path(hf_hub_download("oleehyO/latex-formulas", pf, repo_type="dataset", token=token))
+                tbl = pq.read_table(lp, columns=["image", "latex_formula"])
+                idxs = list(range(tbl.num_rows))
+                rng.shuffle(idxs)
+                for ri in idxs:
+                    if lx_cnt >= max_latex:
+                        break
+                    row = tbl.slice(ri, 1).to_pylist()[0]
+                    tex = str(row.get("latex_formula") or "").strip()
+                    if not (6 <= len(tex) <= 140):
+                        continue
+                    jpg = _encode_rgb_jpeg(row.get("image"), max_side=640, min_chroma=0.0)
+                    if jpg is None:
+                        continue
+                    h = hashlib.sha256(f"s12_latex:{ri}:{tex}".encode("utf-8")).hexdigest()[:14]
+                    mem = f"s12_latex_{h}.jpg"
+                    rec = {
+                        "id": f"stage12_latex_{h}",
+                        "source_group": "stage12_latex_ocr_train",
+                        "language": "en",
+                        "task": "stage12_direct_latex_ocr",
+                        "visual_kind": "independent_image",
+                        "frames": [mem],
+                        "enable_thinking": False,
+                        "prompt": "Transcribe the mathematical expression in the image into LaTeX.",
+                        "answer": tex,
+                        "target": {"kind": "text", "text": tex},
+                        "metadata": {
+                            "source": "oleehyO/latex-formulas",
+                            "license_spdx": "MIT",
+                            "split": "train",
+                            "real_document_scan": True,
+                            "pixel_indispensable": True,
+                        },
+                    }
+                    out.append((rec, {mem: jpg}))
+                    lx_cnt += 1
+        except Exception as exc:
+            emit("stage12_latex_warning", error=str(exc)[:180])
+        emit("stage12_latex_ready", count=lx_cnt)
+
+    # 4. Open-ended real-photo GQA (non-Yes/No semantic object/attribute/location QA)
+    if max_gqa_open > 0:
+        gqa_oe_cnt = 0
+        try:
+            qa_by_img: dict[str, tuple[str, str]] = {}
+            for gqa_sub in ("gqa_1", "gqa_2"):
+                lp_j = Path(
+                    hf_hub_download(
+                        repo_id="nvidia/Nemotron-Image-Training-v3",
+                        filename=f"{gqa_sub}/{gqa_sub}.jsonl",
+                        repo_type="dataset",
+                        token=token,
+                    )
+                )
+                with lp_j.open("r", encoding="utf-8") as fh:
+                    for line in fh:
+                        if not line.strip():
+                            continue
+                        try:
+                            obj = json.loads(line)
+                        except Exception:
+                            continue
+                        msgs = obj.get("messages") or []
+                        img_ref, pending_q = "", None
+                        for m in msgs:
+                            role = m.get("role", "")
+                            content = m.get("content")
+                            txt, m_im = "", ""
+                            if isinstance(content, str):
+                                txt = content.strip()
+                            elif isinstance(content, list):
+                                parts = []
+                                for it in content:
+                                    if isinstance(it, dict):
+                                        if it.get("type") == "text":
+                                            parts.append(str(it.get("text") or "").strip())
+                                        elif it.get("type") in ("image", "image_url") and not m_im:
+                                            v = it.get("image") or it.get("image_url") or ""
+                                            m_im = str(v.get("url") if isinstance(v, dict) else v)
+                                txt = "\n".join(p for p in parts if p).strip()
+                            if m_im and not img_ref:
+                                img_ref = m_im
+                            if role == "user":
+                                pending_q = txt.replace("<image>", "").strip()
+                            elif role == "assistant" and pending_q and img_ref:
+                                body = txt.split("</think>")[-1].strip()
+                                body = re.sub(r"^(?:Final\s+Answer|Answer)\s*[:=]\s*", "", body, flags=re.IGNORECASE).strip()
+                                bl = body.lower().strip(".!? ")
+                                if bl not in ("yes", "no", "") and 2 <= len(body) <= 120:
+                                    q_line = next((ln.strip() for ln in pending_q.splitlines() if ln.strip()), "")
+                                    if 10 <= len(q_line) <= 180 and not _is_contaminated(q_line + " " + body):
+                                        stem = Path(img_ref).stem
+                                        qa_by_img.setdefault(stem, (q_line, body))
+                                pending_q = None
+            gqa_files = sorted(
+                f for f in api.list_repo_files("lmms-lab/GQA", repo_type="dataset")
+                if f.startswith("train_all_images/") and f.endswith(".parquet")
+            )
+            for pf in gqa_files[:12]:
+                if gqa_oe_cnt >= max_gqa_open:
+                    break
+                lp = Path(hf_hub_download("lmms-lab/GQA", pf, repo_type="dataset", token=token))
+                tbl = pq.read_table(lp)
+                cols = set(tbl.column_names)
+                id_col = "id" if "id" in cols else ("imageId" if "imageId" in cols else None)
+                if id_col is None or "image" not in cols:
+                    continue
+                for ri in range(tbl.num_rows):
+                    if gqa_oe_cnt >= max_gqa_open:
+                        break
+                    img_id = str(tbl[id_col][ri].as_py())
+                    if img_id not in qa_by_img:
+                        continue
+                    jpg = _encode_rgb_jpeg(tbl["image"][ri].as_py(), max_side=768, min_chroma=6.0)
+                    if jpg is None:
+                        continue
+                    q_txt, ans_txt = qa_by_img.pop(img_id)
+                    mem = f"s12_gqa_oe_{img_id}.jpg"
+                    rec = {
+                        "id": f"stage12_gqa_oe_{img_id}",
+                        "source_group": "stage12_gqa_open_ended",
+                        "language": "en",
+                        "task": "stage12_gqa_open_semantic",
+                        "visual_kind": "independent_image",
+                        "frames": [mem],
+                        "enable_thinking": False,
+                        "prompt": q_txt,
+                        "answer": ans_txt,
+                        "target": {"kind": "text", "text": ans_txt},
+                        "metadata": {"source": "nvidia/Nemotron-Image-Training-v3+lmms-lab/GQA", "license_spdx": "CC-BY-4.0", "split": "train", "pixel_indispensable": True},
+                    }
+                    out.append((rec, {mem: jpg}))
+                    gqa_oe_cnt += 1
+        except Exception as exc:
+            emit("stage12_gqa_open_warning", error=str(exc)[:180])
+        emit("stage12_gqa_open_ready", count=gqa_oe_cnt)
+
+    rng.shuffle(out)
+    emit("stage12_real_vl_alignment_total", count=len(out))
+    return out

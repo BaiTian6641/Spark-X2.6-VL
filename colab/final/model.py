@@ -850,6 +850,63 @@ class RadioMultiLayerSwiGLUProjector(nn.Module):
         return main_raw, early_raw
 
 
+class RadioMultiLayerGELUProjector(nn.Module):
+    """Stage-12 clean InternVL2.5/Qwen2.5-VL-style multi-layer C-RADIOv4 projector:
+    independent RMSNorm per tapped layer (`L24`, `L32`) -> channel concat (`2560`-dim) -> `2x2` pixel shuffle (`10240`-dim)
+    -> `RMSNorm(10240)` -> `Linear(10240 -> inter)` -> `GELU` -> `Linear(inter -> hidden_size)` initialized to `target_rms=0.025`.
+
+    Crucially omits scale-invariant exit `out_norm` (which combined with quadratic SwiGLU + `L_decorr` blew up positional
+    singular values 210x in Stage-11.5), while retaining normalized `meta_scale` (`normalize_meta_add=True`) so auxiliary
+    spatial/camera metadata (`RMS ~ 0.004`) never swamps projected visual content tokens (`RMS ~ 0.025-0.030`).
+    """
+
+    def __init__(
+        self,
+        vis_dim: int,
+        hidden_size: int,
+        *,
+        num_taps: int = 2,
+        intermediate_size: int | None = None,
+        target_rms: float = 0.025,
+        early_mid_gate_init: float = 0.25,
+        meta_scale_init: float = 0.004,
+    ) -> None:
+        super().__init__()
+        self.vis_dim = int(vis_dim)
+        self.num_taps = max(1, int(num_taps))
+        self.hidden_size = int(hidden_size)
+        self.output_rms_match = False
+        self.normalize_meta_add = True
+        self.layer_norms = nn.ModuleList([nn.RMSNorm(self.vis_dim, eps=1e-6) for _ in range(self.num_taps)])
+        in_dim = self.vis_dim * self.num_taps * 4
+        inter = int(intermediate_size) if intermediate_size is not None else max(int(hidden_size), 4096)
+        self.pre_norm = nn.RMSNorm(in_dim, eps=1e-6)
+        self.fc1 = nn.Linear(in_dim, inter)
+        self.fc2 = nn.Linear(inter, self.hidden_size)
+        nn.init.normal_(self.fc1.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.fc1.bias)
+        nn.init.normal_(self.fc2.weight, mean=0.0, std=float(target_rms) / math.sqrt(max(1.0, inter * 0.5)))
+        nn.init.zeros_(self.fc2.bias)
+        self.early_mid_proj = nn.Linear(self.vis_dim * 4, self.hidden_size)
+        nn.init.normal_(self.early_mid_proj.weight, mean=0.0, std=float(target_rms) / math.sqrt(max(1.0, self.vis_dim * 4.0)))
+        nn.init.zeros_(self.early_mid_proj.bias)
+        self.early_mid_gate = nn.Parameter(torch.tensor(float(early_mid_gate_init)))
+        self.meta_scale = nn.Parameter(torch.tensor(float(meta_scale_init)))
+
+    def forward(self, stacked_feats: torch.Tensor, hh: int, ww: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project `(B, K, N, D)` tapped spatial features into `(main_tokens, early_deepstack_tokens)`."""
+        dtype = self.fc1.weight.dtype
+        if stacked_feats.ndim == 3:
+            stacked_feats = stacked_feats.unsqueeze(1).expand(-1, self.num_taps, -1, -1)
+        normed = [self.layer_norms[i](stacked_feats[:, i].to(dtype)) for i in range(self.num_taps)]
+        fused_cat = torch.cat(normed, dim=-1)  # (B, N, K * D)
+        shuffled, _ = spatial_downshuffle(fused_cat, hh, ww)  # (B, N/4, K * D * 4)
+        main_tokens = self.fc2(F.gelu(self.fc1(self.pre_norm(shuffled))))
+        mid_shuffled, _ = spatial_downshuffle(normed[0], hh, ww)
+        early_tokens = main_tokens + self.early_mid_gate.to(dtype) * self.early_mid_proj(mid_shuffled)
+        return main_tokens, early_tokens
+
+
 class SparkNative(nn.Module):
     main_input_name='input_ids'
     supports_gradient_checkpointing=True
@@ -934,18 +991,35 @@ class SparkNative(nn.Module):
                 self.image_processor=AutoImageProcessor.from_pretrained(paths['vision'],local_files_only=True)
 
         h=self.config.hidden_size; self.hidden=h
+        self.radio_projector_type = str(policy.get('radio_projector_type', 'swiglu')).strip().lower()
+        self.radio_row_break_newline = bool(policy.get('radio_row_break_newline', False))
+        _nl_ids = self.tokenizer('\n', add_special_tokens=False).input_ids if hasattr(self, 'tokenizer') else []
+        self._row_break_nl_id: int | None = int(_nl_ids[0]) if _nl_ids else None
         if self.vision_backbone_type == 'c_radio_v4':
             vis_dim = int(self.vision.radio_model.embed_dim)
-            self.vision_projector = RadioMultiLayerSwiGLUProjector(
-                vis_dim,
-                h,
-                num_taps=len(self._radio_layer_indices),
-                intermediate_size=int(policy.get('radio_projector_intermediate_size', h)),
-                early_mid_gate_init=float(policy.get('radio_early_mid_gate_init', 0.35)),
-                output_rms_match=bool(policy.get('radio_output_rms_match', False)),
-                out_scale_init=float(policy.get('radio_out_scale_init', 0.035)),
-                meta_scale_init=float(policy.get('radio_meta_scale_init', 0.008)),
-            )
+            if self.radio_projector_type == 'gelu':
+                self.vision_projector = RadioMultiLayerGELUProjector(
+                    vis_dim,
+                    h,
+                    num_taps=len(self._radio_layer_indices),
+                    intermediate_size=int(policy.get('radio_projector_intermediate_size', max(h, 4096))),
+                    target_rms=float(policy.get('radio_projector_target_rms', 0.025)),
+                    early_mid_gate_init=float(policy.get('radio_early_mid_gate_init', 0.25)),
+                    meta_scale_init=float(policy.get('radio_meta_scale_init', 0.004)),
+                )
+            elif self.radio_projector_type == 'swiglu':
+                self.vision_projector = RadioMultiLayerSwiGLUProjector(
+                    vis_dim,
+                    h,
+                    num_taps=len(self._radio_layer_indices),
+                    intermediate_size=int(policy.get('radio_projector_intermediate_size', h)),
+                    early_mid_gate_init=float(policy.get('radio_early_mid_gate_init', 0.35)),
+                    output_rms_match=bool(policy.get('radio_output_rms_match', False)),
+                    out_scale_init=float(policy.get('radio_out_scale_init', 0.035)),
+                    meta_scale_init=float(policy.get('radio_meta_scale_init', 0.008)),
+                )
+            else:
+                raise ValueError(f'Unsupported radio_projector_type: {self.radio_projector_type!r}')
         else:
             self.vision_projector=nn.Sequential(nn.LayerNorm(self.vision.config.hidden_size*4),nn.Linear(self.vision.config.hidden_size*4,h),nn.GELU(),nn.Linear(h,h))
         # Zero-bias transparency projector: exact 0.0 on opaque RGB images, distinct on RGBA cutouts/translucency.
@@ -1938,7 +2012,10 @@ class SparkNative(nn.Module):
 
         def count(unit):
             hh, ww = (int(x) for x in unit['batch']['spatial_shapes'][0])
-            return ((hh + 1) // 2) * ((ww + 1) // 2)
+            gh, gw = (hh + 1) // 2, (ww + 1) // 2
+            if is_radio and getattr(self, 'radio_row_break_newline', False) and getattr(self, '_row_break_nl_id', None) is not None:
+                return gh * (gw + 1)
+            return gh * gw
 
         max_tok = int(self.policy['max_visual_tokens'])
         while sum(count(u) for u in units) > max_tok:
@@ -2029,7 +2106,11 @@ class SparkNative(nn.Module):
         proj_dtype = (
             self.vision_projector.w_gate.weight.dtype
             if isinstance(self.vision_projector, RadioMultiLayerSwiGLUProjector)
-            else self.vision_projector[0].weight.dtype
+            else (
+                self.vision_projector.fc1.weight.dtype
+                if isinstance(self.vision_projector, RadioMultiLayerGELUProjector)
+                else self.vision_projector[0].weight.dtype
+            )
         )
 
         bridge = getattr(self, '_intel_vision_bridge', None)
@@ -2172,16 +2253,31 @@ class SparkNative(nn.Module):
                     + self.view_id_embedding.weight[vid_idx].to(proj_dtype)
                     + self.modality.weight[0].to(proj_dtype)
                 )
-                if getattr(self.vision_projector, 'output_rms_match', False):
+                if (
+                    getattr(self.vision_projector, 'output_rms_match', False)
+                    or getattr(self.vision_projector, 'normalize_meta_add', False)
+                ):
                     m_f32 = meta_add.float()
                     m_rms = m_f32.pow(2).mean(dim=-1, keepdim=True).add(1e-6).sqrt()
                     meta_eff = (m_f32 / m_rms).to(proj_dtype) * self.vision_projector.meta_scale.to(proj_dtype)
                 else:
                     meta_eff = meta_add
-                token_out = self.visual_token_drop(tokens + meta_eff)
-                outputs[index] = token_out.to(self.embed_dtype)
-                if early_outputs is not None and early_tokens is not None:
-                    early_outputs[index] = self.visual_token_drop(early_tokens + meta_eff).to(self.embed_dtype)
+                token_out = self.visual_token_drop(tokens + meta_eff).to(self.embed_dtype)
+                early_out = (
+                    self.visual_token_drop(early_tokens + meta_eff).to(self.embed_dtype)
+                    if (early_outputs is not None and early_tokens is not None)
+                    else None
+                )
+                nl_id = getattr(self, '_row_break_nl_id', None)
+                if is_radio and getattr(self, 'radio_row_break_newline', False) and nl_id is not None and token_out.shape[1] == gh * gw:
+                    nl_tok = torch.tensor([nl_id], device=self.device, dtype=torch.long)
+                    nl_emb = self.get_input_embeddings()(nl_tok).detach().to(self.embed_dtype).view(1, 1, 1, -1).expand(1, gh, 1, -1)
+                    token_out = torch.cat([token_out.view(1, gh, gw, -1), nl_emb], dim=2).reshape(1, gh * (gw + 1), -1)
+                    if early_out is not None and early_out.shape[1] == gh * gw:
+                        early_out = torch.cat([early_out.view(1, gh, gw, -1), nl_emb], dim=2).reshape(1, gh * (gw + 1), -1)
+                outputs[index] = token_out
+                if early_outputs is not None and early_out is not None:
+                    early_outputs[index] = early_out
 
         if early_outputs is not None and all(e is not None for e in early_outputs):
             self._last_early_visual_context = torch.cat(early_outputs, dim=1)

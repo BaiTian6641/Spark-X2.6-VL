@@ -104,7 +104,11 @@ def export_and_upload(campaign,config):
         'kind':'SparkNativeLoop48En1BVL' if config.get('enable_loop_engram') else 'SparkNative',
         'inference_entrypoint':'runtime/colab/final/inference.py',
         'vision':(
-            'Unified Super-Encoder: NVIDIA C-RADIOv4-H (32L ViT-H/16, 651.6M, SigLIP2-g+DINOv3-7B+SAM3) + Multi-Layer RMSNorm(L24)||RMSNorm(L32) 2x2 Pixel-Shuffle SwiGLU DeepStack + Adaptive Native-Aspect 256-768px (High-Res Tier up to 1152px)'
+            (
+                'Unified Super-Encoder: NVIDIA C-RADIOv4-H (32L ViT-H/16, 651.6M, SigLIP2-g+DINOv3-7B+SAM3) + Clean Multi-Layer RMSNorm(L24)||RMSNorm(L32) 2x2 Pixel-Shuffle GELU Projector + 2D Row-Break Newline Tokens + Adaptive Native-Aspect 256-768px (High-Res Tier up to 1152px)'
+                if str(config.get('radio_projector_type', 'swiglu')).lower() == 'gelu'
+                else 'Unified Super-Encoder: NVIDIA C-RADIOv4-H (32L ViT-H/16, 651.6M, SigLIP2-g+DINOv3-7B+SAM3) + Multi-Layer RMSNorm(L24)||RMSNorm(L32) 2x2 Pixel-Shuffle SwiGLU DeepStack + Adaptive Native-Aspect 256-768px (High-Res Tier up to 1152px)'
+            )
             if (out/'reload-assets'/'vision'/'hf_model.py').is_file()
             else 'SigLIP2 So400m NaFlex + adaptive resolution-guarded 0/2/4 tiles + 2x2 spatial downshuffle + Visual Primitives (<point>/<box>)'
         ),
