@@ -148,12 +148,15 @@ def _run_stage8_phase(
         "defrost_loop_engram",
     )
     eff_cfg = {**base_cfg, **stage_cfg}
-    prev_decorr_keys = {
-        k: model.policy.get(k)
-        for k in ("visual_decorr_loss_weight", "visual_decorr_target_dc_ratio", "visual_decorr_target_cos")
-        if k in model.policy
-    }
-    for k in ("visual_decorr_loss_weight", "visual_decorr_target_dc_ratio", "visual_decorr_target_cos"):
+    _vis_reg_keys = (
+        "visual_decorr_loss_weight",
+        "visual_decorr_target_dc_ratio",
+        "visual_decorr_target_cos",
+        "visual_rms_ceiling_weight",
+        "visual_rms_ceiling_cap",
+    )
+    prev_decorr_keys = {k: model.policy.get(k) for k in _vis_reg_keys if k in model.policy}
+    for k in _vis_reg_keys:
         if k in stage_cfg:
             model.policy[k] = stage_cfg[k]
     vis_margin_every_n = int(stage_cfg.get("visual_margin_every_n", 0) or 0)
@@ -387,7 +390,7 @@ def _run_stage8_phase(
                     **extra,
                 )
     finally:
-        for k in ("visual_decorr_loss_weight", "visual_decorr_target_dc_ratio", "visual_decorr_target_cos"):
+        for k in _vis_reg_keys:
             if k in prev_decorr_keys:
                 model.policy[k] = prev_decorr_keys[k]
             else:

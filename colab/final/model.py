@@ -10,6 +10,7 @@ Key contracts:
   and explicit `visual_kind`, `view_id`, and orthographic camera basis conditioning.
 """
 from __future__ import annotations
+import contextlib
 from contextlib import contextmanager
 from contextvars import ContextVar
 import functools, hashlib, math, re, sys
@@ -883,10 +884,11 @@ class RadioMultiLayerGELUProjector(nn.Module):
         self.pre_norm = nn.RMSNorm(in_dim, eps=1e-6)
         self.fc1 = nn.Linear(in_dim, inter)
         self.fc2 = nn.Linear(inter, self.hidden_size)
-        # Dimension-invariant He/GELU init: pre_norm RMS=1.0 -> fc1 RMS=1.0 -> GELU RMS~0.65 -> fc2 RMS=target_rms
-        nn.init.normal_(self.fc1.weight, mean=0.0, std=1.0 / math.sqrt(max(1.0, float(in_dim))))
+        # Dimension-invariant active-GELU init: pre_norm RMS=1.0 -> fc1 RMS=2.0 (active GELU, ~0.02 at 10240-dim)
+        # -> GELU(N(0, 2^2)) RMS~1.38 -> fc2 RMS=target_rms across both real C-RADIOv4 (10240) and small test dims!
+        nn.init.normal_(self.fc1.weight, mean=0.0, std=2.0 / math.sqrt(max(1.0, float(in_dim))))
         nn.init.zeros_(self.fc1.bias)
-        nn.init.normal_(self.fc2.weight, mean=0.0, std=float(target_rms) / (0.65 * math.sqrt(max(1.0, float(inter)))))
+        nn.init.normal_(self.fc2.weight, mean=0.0, std=float(target_rms) / (1.38 * math.sqrt(max(1.0, float(inter)))))
         nn.init.zeros_(self.fc2.bias)
         self.early_mid_proj = nn.Linear(self.vis_dim * 4, self.hidden_size)
         nn.init.normal_(self.early_mid_proj.weight, mean=0.0, std=float(target_rms) / math.sqrt(max(1.0, self.vis_dim * 4.0)))
@@ -895,16 +897,19 @@ class RadioMultiLayerGELUProjector(nn.Module):
         self.meta_scale = nn.Parameter(torch.tensor(float(meta_scale_init)))
 
     def forward(self, stacked_feats: torch.Tensor, hh: int, ww: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Project `(B, K, N, D)` tapped spatial features into `(main_tokens, early_deepstack_tokens)`."""
+        """Project `(B, K, N, D)` tapped spatial features into `(main_tokens, early_deepstack_tokens)` in FP32."""
         dtype = self.fc1.weight.dtype
         if stacked_feats.ndim == 3:
             stacked_feats = stacked_feats.unsqueeze(1).expand(-1, self.num_taps, -1, -1)
-        normed = [self.layer_norms[i](stacked_feats[:, i].to(dtype)) for i in range(self.num_taps)]
-        fused_cat = torch.cat(normed, dim=-1)  # (B, N, K * D)
-        shuffled, _ = spatial_downshuffle(fused_cat, hh, ww)  # (B, N/4, K * D * 4)
-        main_tokens = self.fc2(F.gelu(self.fc1(self.pre_norm(shuffled))))
-        mid_shuffled, _ = spatial_downshuffle(normed[0], hh, ww)
-        early_tokens = main_tokens + self.early_mid_gate.to(dtype) * self.early_mid_proj(mid_shuffled)
+        use_fp32_guard = stacked_feats.is_cuda and dtype == torch.float32
+        ctx = torch.amp.autocast('cuda', enabled=False) if use_fp32_guard else contextlib.nullcontext()
+        with ctx:
+            normed = [self.layer_norms[i](stacked_feats[:, i].to(dtype)) for i in range(self.num_taps)]
+            fused_cat = torch.cat(normed, dim=-1)  # (B, N, K * D)
+            shuffled, _ = spatial_downshuffle(fused_cat, hh, ww)  # (B, N/4, K * D * 4)
+            main_tokens = self.fc2(F.gelu(self.fc1(self.pre_norm(shuffled))))
+            mid_shuffled, _ = spatial_downshuffle(normed[0], hh, ww)
+            early_tokens = main_tokens + self.early_mid_gate.to(dtype) * self.early_mid_proj(mid_shuffled)
         return main_tokens, early_tokens
 
 
@@ -1109,6 +1114,11 @@ class SparkNative(nn.Module):
                     ),
                 )
                 self._warm_started_from = str(init_sf)
+                if bool(policy.get('reinit_vision_projector', False)) and len(self.visual_cross_attn) > 0:
+                    # Reset stale cross-attention gates from previous projector geometry so they start as exact identity.
+                    for blk in self.visual_cross_attn:
+                        blk.gate_attn.data.zero_()
+                        blk.gate_ffn.data.zero_()
             # Move Spark + Vision preserving their configured dtypes; keep connectors/adapters in float32.
             self.spark.to(device=device,dtype=spark_dtype)
             if hasattr(self.spark,'tie_weights'): self.spark.tie_weights()
@@ -2897,6 +2907,17 @@ class SparkNative(nn.Module):
             loss_cos = loss_dc.new_zeros(())
         return w * (loss_dc + loss_cos)
 
+    def _visual_rms_ceiling_loss(self, vis_tokens: torch.Tensor | None) -> torch.Tensor | None:
+        """One-sided visual token RMS ceiling preventing rank-1 DC soft-prompt blowup without scale-invariant out_norm."""
+        w = float(self.policy.get('visual_rms_ceiling_weight', 0.0) or 0.0)
+        if w <= 0.0 or vis_tokens is None or not self.training or not torch.is_grad_enabled():
+            return None
+        if vis_tokens.ndim != 3 or vis_tokens.shape[1] < 1:
+            return None
+        cap = float(self.policy.get('visual_rms_ceiling_cap', 0.10))
+        v_rms = vis_tokens.float().pow(2).mean().add(1e-8).sqrt()
+        return w * F.relu(v_rms - cap).pow(2)
+
     def text_loss(self,row,media):
         sup_row=self._effective_supervised_row(row)
         bot_close=self.chat.layouts[bool(sup_row.get('enable_thinking',False))]['bot_close']
@@ -2925,6 +2946,9 @@ class SparkNative(nn.Module):
         else:
             prefix,vis_ctx,pref_ids,pref_tmask=self.prefix_with_visual_context_and_ids(sup_row,media,for_generation=False)
             vis_decorr_loss=self._visual_decorrelation_loss(vis_ctx)
+            vis_rms_loss=self._visual_rms_ceiling_loss(vis_ctx)
+            if vis_rms_loss is not None:
+                vis_decorr_loss = vis_rms_loss if vis_decorr_loss is None else (vis_decorr_loss + vis_rms_loss)
             if ids.shape[1]>self.policy['max_answer_tokens'] or prefix.shape[1]+ids.shape[1]>self.policy['max_sequence']:
                 raise ValueError('Supervision would be truncated; revise a versioned context policy')
             embeds=torch.cat([prefix,self.get_input_embeddings()(ids)],dim=1)

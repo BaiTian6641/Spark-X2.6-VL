@@ -253,3 +253,27 @@ def test_v28_grammar_repair_covers_stage115_unseen_syntax_slips():
     assert "missing_bone_attach" in muts, f"Missing missing_bone_attach in {muts}"
     assert "meta_chain_field" in muts, f"Missing meta_chain_field in {muts}"
     assert "illegal_bone_statement" in muts, f"Missing illegal_bone_statement in {muts}"
+
+
+def test_visual_rms_ceiling_regularizer_and_active_gelu_init():
+    torch.manual_seed(11)
+    # Real C-RADIOv4 dimensions: vis_dim=1280, num_taps=2 -> in_dim=10240 -> inter=4096 -> hidden=2560
+    proj_big = RadioMultiLayerGELUProjector(vis_dim=1280, hidden_size=2560, num_taps=2, intermediate_size=4096, target_rms=0.035)
+    feats = torch.randn(1, 2, 16, 1280)
+    main_tok, _ = proj_big(feats, hh=4, ww=4)
+    rms = float(main_tok.detach().float().pow(2).mean().sqrt().item())
+    assert 0.020 <= rms <= 0.055, f"Expected ~0.035 RMS at 10240-dim, got {rms}"
+
+    stub = SimpleNamespace(
+        policy={"visual_rms_ceiling_weight": 5.0, "visual_rms_ceiling_cap": 0.10},
+        training=True,
+    )
+    low_vis = torch.full((1, 8, 16), 0.05, requires_grad=True)
+    loss_low = SparkNative._visual_rms_ceiling_loss(stub, low_vis)
+    assert loss_low is not None and float(loss_low.item()) == 0.0
+
+    high_vis = torch.full((1, 8, 16), 0.50, requires_grad=True)
+    loss_high = SparkNative._visual_rms_ceiling_loss(stub, high_vis)
+    assert loss_high is not None and float(loss_high.item()) > 0.5
+    loss_high.backward()
+    assert high_vis.grad is not None and float(high_vis.grad.abs().mean().item()) > 0.0
