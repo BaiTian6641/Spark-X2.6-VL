@@ -798,7 +798,7 @@ def main() -> None:
     n_b_extra = len(extra_text_recs) + len(extra_vis_pairs)
 
     direct_b_rids, direct_b_summary = select_stage9_direct_ocr_and_yesno_rids(
-        db_path, max_items=max(200, int(total_12b * 0.04)), seed=args.seed + 105
+        db_path, target_samples=max(200, int(total_12b * 0.04)), seed=args.seed + 105
     )
     n_b_direct = len(direct_b_rids)
     used_12b = (
