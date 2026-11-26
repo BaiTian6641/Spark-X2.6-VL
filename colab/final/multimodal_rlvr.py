@@ -30,10 +30,10 @@ from PIL import Image
 import torch
 import torch.nn.functional as F
 
-from .coat_spark import ensure_coat_for_model
 from .common import emit
+from .engine import ensure_coat_for_model, optimizer_for
 from .inference import generate as spark_generate, visual_media
-from .optimizer import MergedGradientAccumulator, optimizer_for
+from .optimizer import MergedGradientAccumulator
 from .reasoning_agentic_corpus import check_generation_collapse_health
 from .synccraft_bridge import strip_think_block
 
