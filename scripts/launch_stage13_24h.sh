@@ -21,7 +21,7 @@ echo "=== [$(date -u +%Y-%m-%dT%H:%M:%SZ)] Stage-13 24h Multimodal + VC-GRPO Cam
   --init-release-dir work/spark-x26-4b-loop48-en1b-vl-stage12-frontier-vl/final-model-stage12-bf16 \
   --output-root "${OUT_ROOT}" \
   --release-tag stage13 \
-  --phase13a-updates 7500 \
+  --phase13a-updates 10500 \
   --phase13a-batch-size 8 \
   --phase13a-max-hours 9.0 \
   --phase13b-updates 950 \
@@ -30,7 +30,7 @@ echo "=== [$(date -u +%Y-%m-%dT%H:%M:%SZ)] Stage-13 24h Multimodal + VC-GRPO Cam
   --visual-margin-every-n 3 \
   --visual-margin-target 0.35 \
   --visual-margin-boost 1.6 \
-  --phase13c-max-prompts 750 \
+  --phase13c-max-prompts 1200 \
   --phase13c-group-size 4 \
   --phase13c-grad-accum-prompts 4 \
   --phase13c-max-hours 5.5 \
