@@ -35,6 +35,7 @@ from PIL import Image, ImageDraw
 
 from .common import emit
 from .frontier_stage9_corpus import _fetch_pope_val2014_image_ids
+from .reasoning_agentic_corpus import check_generation_collapse_health
 
 PRISM_OMNI_REPO = "TassP0lar/PRISM-Omni-Dataset-v1"
 PRISM_OMNI_REV = "8e5ac6197ba7beeaa9f7057182d87f025ad58442"
@@ -275,8 +276,19 @@ def build_prism_omni_visual_pairs(
             use_cot = (rng.random() < float(cot_fraction)) and bool(raw_cot)
             if use_cot:
                 norm_cot = normalize_prism_primitives(raw_cot)[:1400].strip()
-                ans_text = f"<think>\n{norm_cot}\n</think>\nAnswer: {raw_ans}"
-                en_think = True
+                cand_think = f"<think>\n{norm_cot}\n</think>\nAnswer: {raw_ans}"
+                h_chk = check_generation_collapse_health(
+                    cand_think,
+                    expect_thinking=True,
+                    max_rep_4gram=0.135,
+                    max_think_chars=1600,
+                )
+                if h_chk["healthy"]:
+                    ans_text = cand_think
+                    en_think = True
+                else:
+                    ans_text = raw_ans
+                    en_think = False
             else:
                 ans_text = raw_ans
                 en_think = False
@@ -836,12 +848,17 @@ def build_cached_real_dense_and_reasoning_pairs(
             rng.shuffle(rids)
             cat = Catalogue(db_path)
             handoff = read(handoff_path)
-            reader = MediaReader(stage7_work_root, handoff, {}, token=token, reserve=0)
+            mr_cfg = {
+                "initial_checkpoint_reservation_bytes": 0,
+                "cache_bytes_per_component": 20_000_000_000,
+                "local_free_floor_bytes": 10_000_000_000,
+            }
+            reader = MediaReader(stage7_work_root, handoff, mr_cfg, token=token, reserve=0)
             for rid in rids[: max_docci]:
                 try:
                     row, packet = cat.row(rid)
                     with reader.packet(packet) as get:
-                        media = prepare_media(row, get, {})
+                        media = prepare_media(row, get, mr_cfg)
                     imgs = media.get("images") or []
                     if not imgs:
                         continue
