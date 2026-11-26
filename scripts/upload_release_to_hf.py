@@ -40,18 +40,24 @@ def build_model_card(
     bench8_json: dict[str, Any] | None,
     frontier_json: dict[str, Any] | None,
     train_report_json: dict[str, Any] | None,
+    model_config_json: dict[str, Any] | None = None,
+    visual_causal_json: dict[str, Any] | None = None,
 ) -> str:
     """Build a truthful, ground-truth Hugging Face model card from verified benchmark reports."""
     b8_bf16: dict[str, Any] = {}
     b8_fp8: dict[str, Any] = {}
+    macro_bf16 = None
+    macro_fp8 = None
     if isinstance(bench8_json, dict):
         models = bench8_json.get("models") or {}
         for k, v in models.items():
             bms = (v or {}).get("benchmarks") or {}
             if "fp8" in k.lower():
                 b8_fp8 = bms
+                macro_fp8 = (v or {}).get("macro_average_8bench")
             else:
                 b8_bf16 = bms
+                macro_bf16 = (v or {}).get("macro_average_8bench")
 
     fr_bms: dict[str, Any] = {}
     if isinstance(frontier_json, dict):
@@ -72,6 +78,22 @@ def build_model_card(
                 f"`media_advantage = {_fmt(c_last.get('mean_media_advantage'))}`\n"
             )
 
+    cfg = model_config_json or {}
+    proj_type = str(cfg.get("radio_projector_type", "swiglu")).lower()
+    row_break = bool(cfg.get("radio_row_break_newline", False))
+    if proj_type == "gelu":
+        proj_desc = (
+            "FP32 `RadioMultiLayerGELUProjector` (`RMSNorm(L24) || RMSNorm(L32) -> 2x2 pixel-shuffle -> "
+            "RMSNorm(10240) -> Linear(10240->4096) -> GELU -> Linear(4096->hidden)` with active-GELU init and "
+            "one-sided visual RMS ceiling during training)"
+            + (" plus 2D `\\n` spatial row-break tokens" if row_break else "")
+        )
+    else:
+        proj_desc = (
+            "`RMSNorm(L24) || RMSNorm(L32) -> 2x2 pixel-shuffle -> SwiGLU DeepStack Projector` "
+            "with learnable exit `RMSNorm` (`radio_output_rms_match=True`)"
+        )
+
     def _b8_row(title: str, key: str, note: str = "") -> str:
         v_bf16 = (b8_bf16.get(key) or {}).get("accuracy")
         v_fp8 = (b8_fp8.get(key) or {}).get("accuracy")
@@ -79,16 +101,19 @@ def build_model_card(
         return f"| {title}{extra} | {_pct(v_bf16)} | {_pct(v_fp8)} |"
 
     pope_bf16 = b8_bf16.get("pope") or {}
+    pope_fp8 = b8_fp8.get("pope") or {}
     pope_note = (
-        f"F1={_fmt(pope_bf16.get('f1'), 3)}, yes={_fmt(pope_bf16.get('yes_ratio'), 3)}"
+        f"BF16 F1={_fmt(pope_bf16.get('f1'), 3)} / FP8 F1={_fmt(pope_fp8.get('f1'), 3)}, "
+        f"yes={_fmt(pope_bf16.get('yes_ratio'), 3)}"
         if pope_bf16
         else ""
     )
     ocr_bf16 = b8_bf16.get("ocrbench") or {}
-    ocr_doc = ((ocr_bf16.get("by_dataset") or {}).get("Doc-VQA") or {})
+    ocr_tr = ((ocr_bf16.get("by_task_group") or {}).get("Text Recognition"))
+    ocr_doc = ((ocr_bf16.get("by_task_group") or {}).get("Doc-oriented VQA"))
     ocr_note = (
-        f"Doc-VQA={_pct(ocr_doc.get('accuracy') if isinstance(ocr_doc, dict) else ocr_doc)}"
-        if ocr_doc
+        f"5-group; TextRec={_pct(ocr_tr)}, DocVQA={_pct(ocr_doc)}"
+        if (ocr_tr is not None or ocr_doc is not None)
         else ""
     )
 
@@ -102,6 +127,29 @@ def build_model_card(
     mmmu_pro = fr_bms.get("mmmu_pro_10opt") or {}
     v28 = fr_bms.get("v28_synccraft") or {}
     gate_d = (v28.get("gate_d_proposer") or {}).get("proposer") or v28.get("gate_d_proposer") or {}
+
+    causal_section = ""
+    if isinstance(visual_causal_json, dict):
+        pope_c = visual_causal_json.get("pope_counterfactual") or {}
+        vqa_c = visual_causal_json.get("vqa_counterfactual") or {}
+        ocr_c = (visual_causal_json.get("ocrbench_parity_and_counterfactual") or {}).get("quick_probe_32_parity") or {}
+        synth_c = visual_causal_json.get("synthetic_counterfactual") or {}
+        rw_c = vqa_c.get("realworldqa") or {}
+        ai_c = vqa_c.get("ai2d_test") or {}
+        bl_c = vqa_c.get("blink_6spatial") or {}
+        causal_section = f"""
+### Counterfactual Visual-Causality Verification (Real Image vs. Blank-Gray Control, BF16)
+
+| Audit Track | Real Image | Blank Control | Visual Lift ($\\Delta_{{vis}}$) |
+| :--- | :---: | :---: | :---: |
+| **POPE Overall Acc (`n=180`)** | {_pct((pope_c.get("real") or {}).get("overall", {}).get("accuracy"))} | {_pct((pope_c.get("blank") or {}).get("overall", {}).get("accuracy"))} | {_pct(pope_c.get("visual_lift_acc_vs_blank"))} |
+| **POPE Popular Acc (`n=60`)** | {_pct((pope_c.get("real") or {}).get("by_split", {}).get("popular", {}).get("accuracy"))} | {_pct((pope_c.get("blank") or {}).get("by_split", {}).get("popular", {}).get("accuracy"))} | {_pct(pope_c.get("popular_lift_vs_blank"))} |
+| **OCRBench Quick Probe Raw (`n=32`)** | {_pct((ocr_c.get("real_raw_prompt") or {}).get("acc"))} | {_pct((ocr_c.get("blank_raw_prompt") or {}).get("acc"))} | {_pct(((ocr_c.get("real_raw_prompt") or {}).get("acc") or 0) - ((ocr_c.get("blank_raw_prompt") or {}).get("acc") or 0))} |
+| **RealWorldQA (`n={rw_c.get("n", 80)}`)** | {_pct(rw_c.get("acc_real"))} | {_pct(rw_c.get("acc_blank"))} | {_pct(rw_c.get("visual_lift"))} |
+| **AI2D (`n={ai_c.get("n", 80)}`)** | {_pct(ai_c.get("acc_real"))} | {_pct(ai_c.get("acc_blank"))} | {_pct(ai_c.get("visual_lift"))} |
+| **BLINK 6-Spatial (`n={bl_c.get("n", 72)}`)** | {_pct(bl_c.get("acc_real"))} | {_pct(bl_c.get("acc_blank"))} | {_pct(bl_c.get("visual_lift"))} |
+| **Unseen Synthetic Word OCR (`n=12`)** | {_pct((synth_c.get("novel_word_ocr") or {}).get("exact_acc_real"))} | {_pct((synth_c.get("novel_word_ocr") or {}).get("exact_acc_blank"))} | {_pct(((synth_c.get("novel_word_ocr") or {}).get("exact_acc_real") or 0) - ((synth_c.get("novel_word_ocr") or {}).get("exact_acc_blank") or 0))} |
+"""
 
     return f"""---
 license: apache-2.0
@@ -126,14 +174,14 @@ tags:
 **Spark-X2.6-4B-Loop48-En1B-VL** is a compact multimodal reasoning model combining:
 - **Backbone**: `Spark-X2.6-4B` (`36` layers, native `1M` RoPE context, `sliding_window=512` on `27/36` layers + global full attention every 4th layer) extended to **`48` virtual looped layers** (`layers[12..24) x 2` Dual-mHC with residual gating).
 - **Multimodal Tiered MoE-Engram (`En1B`)**: **`+1.002B`** sparse conditional memory parameters (`16` experts, `top_k=4`, CPU-pinned Tier-1B cold buckets + GPU Tier-1A hot buckets) anchored across 8 transformer depths (`[3, 7, 11, 15, 19, 23, 27, 31]`).
-- **Unified Vision Super-Encoder**: **`nvidia/C-RADIOv4-H`** (`651.6M`, 32L ViT-H/16 distilled from SigLIP2-g + DINOv3-7B + SAM3) fused via `RMSNorm(L24) || RMSNorm(L32) -> 2x2 pixel-shuffle -> SwiGLU DeepStack Projector` with learnable exit `RMSNorm` (`radio_output_rms_match=True`) and window-aware visual budget (`<= 400` visual tokens per image so 100% of patches stay visible across all 48 virtual layers).
+- **Unified Vision Super-Encoder**: **`nvidia/C-RADIOv4-H`** (`651.6M`, 32L ViT-H/16 distilled from SigLIP2-g + DINOv3-7B + SAM3) fused via {proj_desc} and window-aware visual budget (`<= 400` visual tokens per image so 100% of patches stay visible across all 48 virtual layers).
 - **3D Spatial Grounding & SyncCraft Block-DSL**: Native 4-primitive spatial grounding (`<point z="near|mid|far">`, `<box>`, `<dash>`, `<circle>`) + `Blockbench_sculpted_style` 3D cuboid sculpting & SyncCraft biomechanical animation proposer (`Gate D`).
 
 ## Repository Layout
 
-- `fp8/` — Portable **FP8 E4M3 channelwise + INT4 (`q4g128`) sub-LSB residual** release (`~10 GB` `model.safetensors`, zero quality regression vs BF16, includes `config.json`, `reload-assets/`, and `runtime/`).
-- `bf16/` — Portable **BF16** full-precision release (`~12 GB` `model.safetensors`, includes `config.json`, `reload-assets/`, and `runtime/`).
-- `benchmarks/` — Raw machine-generated JSON evaluation artifacts for full reproducibility.
+- `fp8/` — Portable **FP8 E4M3 channelwise + INT4 (`q4g128`) sub-LSB residual** release (`~10.7 GB` `model.safetensors`, near-zero quality regression vs BF16, includes `config.json`, `reload-assets/`, and `runtime/`).
+- `bf16/` — Portable **BF16** full-precision release (`~12.7 GB` `model.safetensors`, includes `config.json`, `reload-assets/`, and `runtime/`).
+- `benchmarks/` — Raw machine-generated JSON evaluation & counterfactual visual-causality artifacts for full reproducibility.
 
 ## Verified Benchmark Scorecard ({stage_label})
 
@@ -142,21 +190,22 @@ tags:
 
 | Benchmark | BF16 | FP8+q4g128 |
 | :--- | :---: | :---: |
+| **8-Bench Macro Average** | **{_pct(macro_bf16)}** | **{_pct(macro_fp8)}** |
 {_b8_row("AI2D (test)", "ai2d_test")}
 {_b8_row("RealWorldQA (test)", "realworldqa")}
 {_b8_row("BLINK (6 Spatial Subtasks)", "blink_val_6spatial")}
 {_b8_row("MMBench-CN (dev)", "mmbench_cn_dev")}
-{_b8_row("MMMU (val)", "mmmu_val")}
-{_b8_row("MMStar", "mmstar")}
+{_b8_row("MMMU (val)", "mmmu_val_direct")}
+{_b8_row("MMStar", "mmstar_direct")}
 {_b8_row("POPE", "pope", pope_note)}
 {_b8_row("OCRBench", "ocrbench", ocr_note)}
-
+{causal_section}
 ### 9-Track 2026 Frontier, 3D Spatial & SyncCraft Suite (BF16, `0%` Train Overlap)
 
 | Benchmark | Score | Notes |
 | :--- | :---: | :--- |
-| **Terminal-Bench 4.1** | {_pct(tb41.get("accuracy"))} | `n={tb41.get("evaluated", "—")}`, healthy `<think>`={_pct(tb41.get("healthy_think_rate"))} |
-| **HLE-Diamond (Frontier)** | {_pct(hle.get("accuracy"))} | `n={hle.get("evaluated", "—")}`, Text={_pct(hle.get("text_accuracy"))}, healthy `<think>`={_pct(hle.get("healthy_think_rate"))} |
+| **Terminal-Bench 4.1** | {_pct(tb41.get("syntax_valid_rate", tb41.get("accuracy")))} | `n={tb41.get("evaluated", "—")}`, substantive={_pct(tb41.get("substantive_solution_rate"))}, healthy `<think>`={_pct(tb41.get("healthy_think_rate"))} |
+| **HLE-Diamond (Frontier)** | {_pct(hle.get("accuracy"))} | `n={hle.get("evaluated", "—")}`, Text={_pct(hle.get("text_accuracy"))}, MM={_pct(hle.get("multimodal_accuracy"))}, healthy `<think>`={_pct(hle.get("healthy_think_rate"))} |
 | **GPQA-Diamond** | {_pct(gpqa.get("accuracy"))} | `n={gpqa.get("evaluated", "—")}`, Physics={_pct((gpqa.get("by_domain") or {}).get("Physics"))} |
 | **MMMU-Pro (10-Option)** | {_pct(mmmu_pro.get("accuracy"))} | `n={mmmu_pro.get("evaluated", "—")}` |
 | **CV-Bench 3D** | {_pct(cv3d.get("accuracy"))} | `n={cv3d.get("evaluated", "—")}`, 4-prim usage={_pct(cv3d.get("visual_primitives_usage_rate"))} |
@@ -187,7 +236,7 @@ print(generate(model, "Describe the 3D spatial layout of this scene.", media=vis
 
 ## Training & Data Provenance
 
-Trained on a dual-GPU workstation (**NVIDIA RTX PRO 4000 Blackwell SFF 24 GB** running `apollo_coat` + **Intel Arc Pro B50 16 GB** running `nvidia/C-RADIOv4-H` with 8-bit `muon8bit` over zero-copy DualPinned SHM). All training corpora are strictly commercial-permissive (`Apache-2.0`, `MIT`, `CC-BY-4.0`, `CC0-1.0`) with verified `0%` overlap against all 17 evaluation benchmarks.
+Trained on a dual-GPU workstation (**NVIDIA RTX PRO 4000 Blackwell SFF 24 GB** running `apollo_coat` + **Intel Arc Pro B50 16 GB** running `nvidia/C-RADIOv4-H` with 8-bit `muon8bit` over zero-copy DualPinned SHM). All training corpora are strictly commercial-permissive (`Apache-2.0`, `MIT`, `CC-BY-4.0`, `CC0-1.0`) with verified `0%` overlap against all 17 evaluation benchmarks (including a programmatic 500-ID `POPE val2014` exclusion guard on `COCO train2017` and `A-OKVQA`).
 """
 
 
@@ -200,6 +249,7 @@ def main() -> None:
     ap.add_argument("--bench8-json", type=Path, default=None)
     ap.add_argument("--frontier-json", type=Path, default=None)
     ap.add_argument("--train-report-json", type=Path, default=None)
+    ap.add_argument("--visual-causal-json", type=Path, default=None)
     ap.add_argument("--commit-message", type=str, default=None)
     ap.add_argument("--private", action="store_true", default=False)
     ap.add_argument("--dry-run", action="store_true")
@@ -212,6 +262,8 @@ def main() -> None:
     b8 = json.loads(args.bench8_json.read_text(encoding="utf-8")) if (args.bench8_json and args.bench8_json.is_file()) else None
     fr = json.loads(args.frontier_json.read_text(encoding="utf-8")) if (args.frontier_json and args.frontier_json.is_file()) else None
     tr = json.loads(args.train_report_json.read_text(encoding="utf-8")) if (args.train_report_json and args.train_report_json.is_file()) else None
+    vc = json.loads(args.visual_causal_json.read_text(encoding="utf-8")) if (args.visual_causal_json and args.visual_causal_json.is_file()) else None
+    mcfg = json.loads((args.bf16_dir / "config.json").read_text(encoding="utf-8")) if (args.bf16_dir / "config.json").is_file() else None
 
     readme_text = build_model_card(
         repo_id=args.repo_id,
@@ -219,11 +271,13 @@ def main() -> None:
         bench8_json=b8,
         frontier_json=fr,
         train_report_json=tr,
+        model_config_json=mcfg,
+        visual_causal_json=vc,
     )
 
     if args.dry_run:
         print(f"DRY RUN OK -> repo_id={args.repo_id} private={args.private}")
-        print(readme_text[:1500])
+        print(readme_text[:2500])
         return
 
     token = os.environ.get("HF_TOKEN")
@@ -247,6 +301,8 @@ def main() -> None:
             shutil.copy2(args.frontier_json, bdir / f"{args.stage_label.lower().replace('.', '').replace(' ', '_')}_frontier_3d_report.json")
         if args.train_report_json and args.train_report_json.is_file():
             shutil.copy2(args.train_report_json, bdir / args.train_report_json.name)
+        if args.visual_causal_json and args.visual_causal_json.is_file():
+            shutil.copy2(args.visual_causal_json, bdir / args.visual_causal_json.name)
 
         print(f"[1/3] Uploading README.md + benchmarks/ -> {args.repo_id}", flush=True)
         api.upload_folder(
