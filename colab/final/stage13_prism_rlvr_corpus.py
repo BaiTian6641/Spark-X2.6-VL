@@ -28,6 +28,7 @@ import random
 import re
 import sqlite3
 from typing import Any
+import zipfile
 
 import numpy as np
 from PIL import Image, ImageDraw
@@ -780,14 +781,14 @@ def build_cached_real_dense_and_reasoning_pairs(
     stage7_work_root: Path,
     token: str | None = None,
     max_docci: int = 1800,
-    max_chartqa: int = 2400,
-    max_scienceqa: int = 2000,
-    max_virl39k: int = 2400,
-    max_refcocog: int = 1600,
+    max_chartqa: int = 2600,
+    max_scienceqa: int = 2400,
+    max_virl39k: int = 3600,
+    max_refcocog: int = 0,
     seed: int = 20261319,
 ) -> list[tuple[dict[str, Any], dict[str, bytes]]]:
     """Load high-entropy real-photo dense captions (`DOCCI` from cached `stage7-b50` catalogue) +
-    workstation-cached `ChartQA`, `ScienceQA`, `ViRL39K`, and `RefCOCOg` pairs with zero eval overlap.
+    workstation-cached `ChartQA`, `ScienceQA`, and `ViRL39K` (`images.zip`) train splits with zero eval overlap.
     """
     from huggingface_hub import HfApi, hf_hub_download
     import pyarrow.parquet as pq
@@ -796,6 +797,27 @@ def build_cached_real_dense_and_reasoning_pairs(
 
     rng = random.Random(seed)
     out: list[tuple[dict[str, Any], dict[str, bytes]]] = []
+    hub_root = Path.home() / ".cache/huggingface/hub"
+
+    def _find_cached_or_download_train_parquet(repo_id: str, substr: str = "train") -> Path | None:
+        slug = "datasets--" + repo_id.replace("/", "--")
+        snap_dir = hub_root / slug / "snapshots"
+        if snap_dir.is_dir():
+            cands = sorted(p for p in snap_dir.rglob("*.parquet") if (not substr or substr in p.name.lower()))
+            if cands:
+                return cands[0]
+        try:
+            api = HfApi(token=token)
+            files = sorted(
+                s.rfilename
+                for s in (api.dataset_info(repo_id).siblings or [])
+                if s.rfilename.endswith(".parquet") and (not substr or substr in s.rfilename.lower())
+            )
+            if files:
+                return Path(hf_hub_download(repo_id, files[0], repo_type="dataset", token=token))
+        except Exception:
+            pass
+        return None
 
     # 1. Cached `DOCCI` dense real-photo paragraphs from `stage7-b50` SQLite (`factual_caption`)
     db_path = stage7_work_root / "metadata/corpus.sqlite"
@@ -859,44 +881,45 @@ def build_cached_real_dense_and_reasoning_pairs(
     chart_added = 0
     if max_chartqa > 0:
         try:
-            lp = hf_hub_download("HuggingFaceM4/ChartQA", "data/train-00000-of-00003.parquet", repo_type="dataset", token=token)
-            tbl = pq.read_table(lp).to_pylist()
-            rng.shuffle(tbl)
-            for r in tbl:
-                if chart_added >= max_chartqa:
-                    break
-                q = str(r.get("query") or "").strip()
-                lbl = r.get("label")
-                ans = str(lbl[0] if isinstance(lbl, list) and lbl else (lbl or "")).strip()
-                if not q or not ans or len(ans) > 80:
-                    continue
-                jpg = _reencode_rgb_jpeg(r.get("image"), max_side=896)
-                if jpg is None:
-                    continue
-                mem = f"s13_chartqa_{chart_added:05d}.jpg"
-                vkind = "numeric_exact" if re.fullmatch(r"-?\d+(?:\.\d+)?%?", ans) else "prism_exact"
-                out.append((
-                    {
-                        "id": f"stage13_chartqa_{chart_added:05d}",
-                        "source_group": "stage13_chartqa",
-                        "language": "en",
-                        "task": "stage13_chartqa_direct",
-                        "visual_kind": "independent_image",
-                        "frames": [mem],
-                        "enable_thinking": False,
-                        "prompt": f"{q}\nAnswer concisely based on the chart.",
-                        "answer": ans,
-                        "target": {"kind": "text", "text": ans},
-                        "metadata": {
-                            "source": "HuggingFaceM4/ChartQA",
-                            "license_spdx": "GPL-3.0/Apache-2.0",
-                            "pixel_indispensable": True,
-                            "verifier": {"kind": vkind, "gold": ans},
+            lp = _find_cached_or_download_train_parquet("HuggingFaceM4/ChartQA", "train")
+            if lp is not None:
+                tbl = pq.read_table(lp).to_pylist()
+                rng.shuffle(tbl)
+                for r in tbl:
+                    if chart_added >= max_chartqa:
+                        break
+                    q = str(r.get("query") or "").strip()
+                    lbl = r.get("label")
+                    ans = str(lbl[0] if isinstance(lbl, list) and lbl else (lbl or "")).strip()
+                    if not q or not ans or len(ans) > 80:
+                        continue
+                    jpg = _reencode_rgb_jpeg(r.get("image"), max_side=896)
+                    if jpg is None:
+                        continue
+                    mem = f"s13_chartqa_{chart_added:05d}.jpg"
+                    vkind = "numeric_exact" if re.fullmatch(r"-?\d+(?:\.\d+)?%?", ans) else "prism_exact"
+                    out.append((
+                        {
+                            "id": f"stage13_chartqa_{chart_added:05d}",
+                            "source_group": "stage13_chartqa",
+                            "language": "en",
+                            "task": "stage13_chartqa_direct",
+                            "visual_kind": "independent_image",
+                            "frames": [mem],
+                            "enable_thinking": False,
+                            "prompt": f"{q}\nAnswer concisely based on the chart.",
+                            "answer": ans,
+                            "target": {"kind": "text", "text": ans},
+                            "metadata": {
+                                "source": "HuggingFaceM4/ChartQA",
+                                "license_spdx": "GPL-3.0/Apache-2.0",
+                                "pixel_indispensable": True,
+                                "verifier": {"kind": vkind, "gold": ans},
+                            },
                         },
-                    },
-                    {mem: jpg},
-                ))
-                chart_added += 1
+                        {mem: jpg},
+                    ))
+                    chart_added += 1
         except Exception as exc:
             emit("stage13_chartqa_warning", error=str(exc)[:160])
 
@@ -904,171 +927,124 @@ def build_cached_real_dense_and_reasoning_pairs(
     sci_added = 0
     if max_scienceqa > 0:
         try:
-            lp = hf_hub_download("derek-thomas/ScienceQA", "data/train-00000-of-00001-1028f23e353fbe3e.parquet", repo_type="dataset", token=token)
-            tbl = pq.read_table(lp).to_pylist()
-            rng.shuffle(tbl)
-            for r in tbl:
-                if sci_added >= max_scienceqa:
-                    break
-                if r.get("image") is None:
-                    continue
-                q = str(r.get("question") or "").strip()
-                choices = r.get("choices") or []
-                ans_idx = r.get("answer")
-                if not q or not choices or ans_idx is None or not (0 <= int(ans_idx) < len(choices)):
-                    continue
-                jpg = _reencode_rgb_jpeg(r.get("image"), max_side=768)
-                if jpg is None:
-                    continue
-                letters = [chr(ord("A") + k) for k in range(len(choices))]
-                opt_block = "\n".join(f"({letters[k]}) {choices[k]}" for k in range(len(choices)))
-                gold_ltr = letters[int(ans_idx)]
-                hint = str(r.get("hint") or "").strip()
-                prm = (f"{hint}\n" if hint else "") + f"{q}\nOptions:\n{opt_block}\nAnswer with only the option letter ({', '.join(letters)}) in the format: Answer: <letter>"
-                mem = f"s13_sciqa_{sci_added:05d}.jpg"
-                out.append((
-                    {
-                        "id": f"stage13_scienceqa_{sci_added:05d}",
-                        "source_group": "stage13_scienceqa",
-                        "language": "en",
-                        "task": "stage13_scienceqa_diagram",
-                        "visual_kind": "independent_image",
-                        "frames": [mem],
-                        "enable_thinking": False,
-                        "prompt": prm,
-                        "answer": f"Answer: {gold_ltr}",
-                        "target": {"kind": "text", "text": gold_ltr},
-                        "metadata": {
-                            "source": "derek-thomas/ScienceQA",
-                            "license_spdx": "CC-BY-NC-SA-4.0/MIT",
-                            "pixel_indispensable": True,
-                            "verifier": {"kind": "mcq_letter", "gold": gold_ltr},
-                        },
-                    },
-                    {mem: jpg},
-                ))
-                sci_added += 1
-        except Exception as exc:
-            emit("stage13_scienceqa_warning", error=str(exc)[:160])
-
-    # 4. Cached `TIGER-Lab/ViRL39K` (train split ONLY, real multimodal reasoning + verifiable answers!)
-    virl_added = 0
-    if max_virl39k > 0:
-        try:
-            api = HfApi(token=token)
-            v_pqs = sorted(
-                s.rfilename for s in (api.dataset_info("TIGER-Lab/ViRL39K").siblings or [])
-                if s.rfilename.endswith(".parquet")
-            )
-            if v_pqs:
-                lp = hf_hub_download("TIGER-Lab/ViRL39K", v_pqs[0], repo_type="dataset", token=token)
+            lp = _find_cached_or_download_train_parquet("derek-thomas/ScienceQA", "train")
+            if lp is not None:
                 tbl = pq.read_table(lp).to_pylist()
                 rng.shuffle(tbl)
                 for r in tbl:
-                    if virl_added >= max_virl39k:
+                    if sci_added >= max_scienceqa:
                         break
-                    q = str(r.get("question") or "").replace("<image>", "").strip()
-                    ans = str(r.get("answer") or "").strip()
-                    # Strip `\boxed{...}` cleanly
-                    bm = re.search(r"\\boxed\{([^{}]+)\}", ans)
-                    if bm:
-                        ans = bm.group(1).strip()
-                    imgs = r.get("image") or r.get("images")
-                    raw_im = imgs[0] if isinstance(imgs, list) and imgs else imgs
-                    if not q or not ans or len(ans) > 64 or raw_im is None:
+                    if r.get("image") is None:
                         continue
-                    jpg = _reencode_rgb_jpeg(raw_im, max_side=768)
+                    q = str(r.get("question") or "").strip()
+                    choices = r.get("choices") or []
+                    ans_idx = r.get("answer")
+                    if not q or not choices or ans_idx is None or not (0 <= int(ans_idx) < len(choices)):
+                        continue
+                    jpg = _reencode_rgb_jpeg(r.get("image"), max_side=768)
                     if jpg is None:
                         continue
-                    vkind = "mcq_letter" if (len(ans) == 1 and ans.upper() in "ABCDE") else (
-                        "numeric_exact" if re.fullmatch(r"-?\d+(?:\.\d+)?", ans) else "prism_exact"
-                    )
-                    mem = f"s13_virl_{virl_added:05d}.jpg"
+                    letters = [chr(ord("A") + k) for k in range(len(choices))]
+                    opt_block = "\n".join(f"({letters[k]}) {choices[k]}" for k in range(len(choices)))
+                    gold_ltr = letters[int(ans_idx)]
+                    hint = str(r.get("hint") or "").strip()
+                    prm = (f"{hint}\n" if hint else "") + f"{q}\nOptions:\n{opt_block}\nAnswer with only the option letter ({', '.join(letters)}) in the format: Answer: <letter>"
+                    mem = f"s13_sciqa_{sci_added:05d}.jpg"
                     out.append((
                         {
-                            "id": f"stage13_virl39k_{virl_added:05d}",
-                            "source_group": "stage13_virl39k",
+                            "id": f"stage13_scienceqa_{sci_added:05d}",
+                            "source_group": "stage13_scienceqa",
                             "language": "en",
-                            "task": "stage13_virl39k_reasoning",
+                            "task": "stage13_scienceqa_diagram",
                             "visual_kind": "independent_image",
                             "frames": [mem],
                             "enable_thinking": False,
-                            "prompt": f"{q}\nAnswer concisely.",
-                            "answer": ans,
-                            "target": {"kind": "text", "text": ans},
+                            "prompt": prm,
+                            "answer": f"Answer: {gold_ltr}",
+                            "target": {"kind": "text", "text": gold_ltr},
                             "metadata": {
-                                "source": "TIGER-Lab/ViRL39K",
-                                "license_spdx": "Apache-2.0",
+                                "source": "derek-thomas/ScienceQA",
+                                "license_spdx": "CC-BY-NC-SA-4.0/MIT",
                                 "pixel_indispensable": True,
-                                "verifier": {"kind": vkind, "gold": ans},
+                                "verifier": {"kind": "mcq_letter", "gold": gold_ltr},
                             },
                         },
                         {mem: jpg},
                     ))
-                    virl_added += 1
+                    sci_added += 1
+        except Exception as exc:
+            emit("stage13_scienceqa_warning", error=str(exc)[:160])
+
+    # 4. Cached `TIGER-Lab/ViRL39K` (`39Krelease.parquet` + `images.zip`, strictly excluding any eval benchmark sources!)
+    virl_added = 0
+    virl_excluded_eval = 0
+    _eval_blocklist = ("ai2d", "realworld", "mmstar", "mmmu", "pope", "ocrbench", "blink", "cvbench", "cv-bench", "3dsr", "mmbench", "hallusion")
+    if max_virl39k > 0:
+        try:
+            lp = _find_cached_or_download_train_parquet("TIGER-Lab/ViRL39K", "")
+            if lp is not None:
+                zip_p = lp.parent / "images.zip"
+                zf = zipfile.ZipFile(zip_p, "r") if zip_p.is_file() else None
+                try:
+                    tbl = pq.read_table(lp, columns=["question", "answer", "source", "category", "image"]).to_pylist()
+                    rng.shuffle(tbl)
+                    for r in tbl:
+                        if virl_added >= max_virl39k:
+                            break
+                        src_l = str(r.get("source") or "").lower()
+                        if any(tok in src_l for tok in _eval_blocklist):
+                            virl_excluded_eval += 1
+                            continue
+                        q = str(r.get("question") or "").replace("<image>", "").strip()
+                        ans = str(r.get("answer") or "").strip()
+                        bm = re.search(r"\\boxed\{([^{}]+)\}", ans)
+                        if bm:
+                            ans = bm.group(1).strip()
+                        imgs = r.get("image")
+                        raw_im = imgs[0] if isinstance(imgs, list) and imgs else imgs
+                        if not q or not ans or len(ans) > 64 or raw_im is None:
+                            continue
+                        if isinstance(raw_im, str):
+                            if zf is None:
+                                continue
+                            try:
+                                raw_im = zf.read(raw_im)
+                            except KeyError:
+                                continue
+                        jpg = _reencode_rgb_jpeg(raw_im, max_side=768)
+                        if jpg is None:
+                            continue
+                        vkind = "mcq_letter" if (len(ans) == 1 and ans.upper() in "ABCDE") else (
+                            "numeric_exact" if re.fullmatch(r"-?\d+(?:\.\d+)?", ans) else "prism_exact"
+                        )
+                        mem = f"s13_virl_{virl_added:05d}.jpg"
+                        out.append((
+                            {
+                                "id": f"stage13_virl39k_{virl_added:05d}",
+                                "source_group": "stage13_virl39k",
+                                "language": "en",
+                                "task": "stage13_virl39k_reasoning",
+                                "visual_kind": "independent_image",
+                                "frames": [mem],
+                                "enable_thinking": False,
+                                "prompt": f"{q}\nAnswer concisely.",
+                                "answer": ans,
+                                "target": {"kind": "text", "text": ans},
+                                "metadata": {
+                                    "source": f"TIGER-Lab/ViRL39K:{r.get('source') or 'unknown'}",
+                                    "license_spdx": "Apache-2.0",
+                                    "pixel_indispensable": True,
+                                    "verifier": {"kind": vkind, "gold": ans},
+                                },
+                            },
+                            {mem: jpg},
+                        ))
+                        virl_added += 1
+                finally:
+                    if zf is not None:
+                        zf.close()
         except Exception as exc:
             emit("stage13_virl39k_warning", error=str(exc)[:160])
-
-    # 5. Cached `jxu124/refcocog` (0%-POPE-overlap real-photo referring expressions!)
-    ref_added = 0
-    if max_refcocog > 0:
-        try:
-            pope_ids = _fetch_pope_val2014_image_ids(token=token)
-            api = HfApi(token=token)
-            r_pqs = sorted(
-                s.rfilename for s in (api.dataset_info("jxu124/refcocog").siblings or [])
-                if s.rfilename.endswith(".parquet") and "train" in s.rfilename
-            )
-            if r_pqs:
-                lp = hf_hub_download("jxu124/refcocog", r_pqs[0], repo_type="dataset", token=token)
-                tbl = pq.read_table(lp).to_pylist()
-                rng.shuffle(tbl)
-                for r in tbl:
-                    if ref_added >= max_refcocog:
-                        break
-                    iid = r.get("image_id")
-                    if iid is not None and int(iid) in pope_ids:
-                        continue
-                    sents = r.get("sentences") or []
-                    sent = ""
-                    if isinstance(sents, list) and sents:
-                        s0 = sents[0]
-                        sent = str(s0.get("raw") if isinstance(s0, dict) else s0).strip()
-                    elif isinstance(sents, str):
-                        sent = sents.strip()
-                    bb = r.get("bbox")
-                    if not sent or not isinstance(bb, (list, tuple)) or len(bb) < 4:
-                        continue
-                    raw_im = r.get("image")
-                    jpg = _reencode_rgb_jpeg(raw_im, max_side=768)
-                    if jpg is None:
-                        continue
-                    im_tmp = Image.open(io.BytesIO(jpg))
-                    w, h = im_tmp.size
-                    x1 = max(0, min(999, int(round(float(bb[0]) * 1000.0 / max(1, w)))))
-                    y1 = max(0, min(999, int(round(float(bb[1]) * 1000.0 / max(1, h)))))
-                    x2 = max(x1, min(999, int(round(float(bb[0] + bb[2]) * 1000.0 / max(1, w)))))
-                    y2 = max(y1, min(999, int(round(float(bb[1] + bb[3]) * 1000.0 / max(1, h)))))
-                    mem = f"s13_refcoco_{ref_added:05d}.jpg"
-                    out.append((
-                        {
-                            "id": f"stage13_refcocog_{ref_added:05d}",
-                            "source_group": "stage13_refcocog",
-                            "language": "en",
-                            "task": "stage13_refcocog_grounding",
-                            "visual_kind": "independent_image",
-                            "frames": [mem],
-                            "enable_thinking": False,
-                            "prompt": f"Describe the region at <box x1=\"{x1}\" y1=\"{y1}\" x2=\"{x2}\" y2=\"{y2}\"/> in this photo.",
-                            "answer": sent,
-                            "target": {"kind": "text", "text": sent},
-                            "metadata": {"source": "jxu124/refcocog", "license_spdx": "CC-BY-4.0", "pixel_indispensable": True},
-                        },
-                        {mem: jpg},
-                    ))
-                    ref_added += 1
-        except Exception as exc:
-            emit("stage13_refcocog_warning", error=str(exc)[:160])
 
     rng.shuffle(out)
     emit(
@@ -1078,6 +1054,6 @@ def build_cached_real_dense_and_reasoning_pairs(
         chartqa=chart_added,
         scienceqa=sci_added,
         virl39k=virl_added,
-        refcocog=ref_added,
+        virl39k_excluded_eval_src=virl_excluded_eval,
     )
     return out
