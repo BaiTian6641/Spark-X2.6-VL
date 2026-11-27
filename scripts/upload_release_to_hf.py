@@ -149,6 +149,7 @@ def build_model_card(
 | **AI2D (`n={ai_c.get("n", 80)}`)** | {_pct(ai_c.get("acc_real"))} | {_pct(ai_c.get("acc_blank"))} | {_pct(ai_c.get("visual_lift"))} |
 | **BLINK 6-Spatial (`n={bl_c.get("n", 72)}`)** | {_pct(bl_c.get("acc_real"))} | {_pct(bl_c.get("acc_blank"))} | {_pct(bl_c.get("visual_lift"))} |
 | **Unseen Synthetic Word OCR (`n=12`)** | {_pct((synth_c.get("novel_word_ocr") or {}).get("exact_acc_real"))} | {_pct((synth_c.get("novel_word_ocr") or {}).get("exact_acc_blank"))} | {_pct(((synth_c.get("novel_word_ocr") or {}).get("exact_acc_real") or 0) - ((synth_c.get("novel_word_ocr") or {}).get("exact_acc_blank") or 0))} |
+| **Synthetic Color × Shape Open (`n=8`)** | {_pct((synth_c.get("color_shape_open") or {}).get("color_acc_real"))} color / {_pct((synth_c.get("color_shape_open") or {}).get("shape_acc_real"))} shape | {_pct((synth_c.get("color_shape_open") or {}).get("color_acc_blank"))} / {_pct((synth_c.get("color_shape_open") or {}).get("shape_acc_blank"))} | **Verified pixel-grounded** |
 """
 
     return f"""---
@@ -216,7 +217,8 @@ tags:
 
 ## Quick Usage (Portable Runtime Included)
 
-Each release directory (`fp8/` or `bf16/`) bundles its matching `runtime/colab/final/` inference code and `reload-assets/`:
+Each release directory (`fp8/` or `bf16/`) bundles its matching `runtime/colab/final/` inference code and `reload-assets/`.
+> **Note**: Requires `transformers>=4.51,<5` (e.g. `pip install "transformers==4.57.3"`) because the upstream `modeling_spark.py` uses the `transformers` 4.x `_tied_weights_keys` list API.
 
 ```python
 import sys
