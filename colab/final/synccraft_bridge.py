@@ -88,76 +88,80 @@ def _ensure_synccraft_importable() -> None:
 _ensure_synccraft_importable()
 ensure_synccraft_importable = _ensure_synccraft_importable
 
-from synccraft.audit.offscreen_renderer import CAMERA_PRESETS, render_world_observation  # noqa: E402
-from synccraft.audit.sync_audit import audit_scene  # noqa: E402
-from synccraft.data_gen.taxonomy_catalog import normalize_clean_room_family_id  # noqa: E402
-from synccraft.dsl.ast_nodes import (  # noqa: E402
-    Attach,
-    BehaviorDecl,
-    Bone,
-    Box,
-    ClipDecl,
-    IKChainDecl,
-    IKDriveDecl,
-    KinematicsDecl,
-    Meta,
-    Palette,
-    Place,
-    Program,
-    TrackDecl,
-    validate_program,
-)
-from synccraft.dsl.parser import format_program, parse_program  # noqa: E402
-from synccraft.kinematics.musculoskeletal import (  # noqa: E402
-    audit_behavior_clip,
-    evaluate_behavior_clip,
-)
-from synccraft.kinematics.se3_chain import Scene, compile_geometry, compile_posed_geometry  # noqa: E402
-from synccraft.shading.compiler import compile_vanilla_atlas, encode_rgba_png  # noqa: E402
-from synccraft.shading.uv_packer import allocate_uv_layout  # noqa: E402
-from synccraft.surface.contracts import (  # noqa: E402
-    EnvironmentState,
-    MaterialProgram,
-    MaterialSpec,
-    StyleConfig,
-    WorldState,
-)
-from synccraft.surface.domain import build_surface_domain, initialize_surface_state  # noqa: E402
-from synccraft.data_gen.curriculum_and_assistant import (  # noqa: E402
-    coarsen_program_to_tier,
-    ensure_concise_texture_program,
-)
-from synccraft.world.artist_loop import (  # noqa: E402
-    analyze_artist_project,
-    enhance_artist_project_step,
-)
-from synccraft.world.exemplars import (  # noqa: E402
-    COLOSSAL_WALKING_CITADEL_DSL,
-    SCULPTED_ELDER_WYVERN_DSL,
-    build_articulated_mechanism_world,
-    build_biological_creature_world,
-    build_colossal_walking_citadel_world,
-    build_sculpted_elder_wyvern_world,
-)
-from synccraft.world.trajectory_dataset import (  # noqa: E402
-    decode_record_observation_image,
-    score_world_capability_completion,
-)
-from synccraft.world.inverse_inference import (  # noqa: E402
-    APPROVED_NONCOMMERCIAL_RESEARCH_LICENSES,
-    APPROVED_PERMISSIVE_LICENSES,
-    BANNED_PROVENANCE_TOKENS,
-    AssetProvenance,
-    LicenseGateError,
-    scan_text_for_noai_markers,
-    verify_asset_provenance,
-)
-from synccraft.world.transitions import (  # noqa: E402
-    ApplyRubbingAction,
-    SetPoseAction,
-    action_from_dict,
-    step_world,
-)
+try:
+    from synccraft.audit.offscreen_renderer import CAMERA_PRESETS, render_world_observation  # noqa: E402
+    from synccraft.audit.sync_audit import audit_scene  # noqa: E402
+    from synccraft.data_gen.taxonomy_catalog import normalize_clean_room_family_id  # noqa: E402
+    from synccraft.dsl.ast_nodes import (  # noqa: E402
+        Attach,
+        BehaviorDecl,
+        Bone,
+        Box,
+        ClipDecl,
+        IKChainDecl,
+        IKDriveDecl,
+        KinematicsDecl,
+        Meta,
+        Palette,
+        Place,
+        Program,
+        TrackDecl,
+        validate_program,
+    )
+    from synccraft.dsl.parser import format_program, parse_program  # noqa: E402
+    from synccraft.kinematics.musculoskeletal import (  # noqa: E402
+        audit_behavior_clip,
+        evaluate_behavior_clip,
+    )
+    from synccraft.kinematics.se3_chain import Scene, compile_geometry, compile_posed_geometry  # noqa: E402
+    from synccraft.shading.compiler import compile_vanilla_atlas, encode_rgba_png  # noqa: E402
+    from synccraft.shading.uv_packer import allocate_uv_layout  # noqa: E402
+    from synccraft.surface.contracts import (  # noqa: E402
+        EnvironmentState,
+        MaterialProgram,
+        MaterialSpec,
+        StyleConfig,
+        WorldState,
+    )
+    from synccraft.surface.domain import build_surface_domain, initialize_surface_state  # noqa: E402
+    from synccraft.data_gen.curriculum_and_assistant import (  # noqa: E402
+        coarsen_program_to_tier,
+        ensure_concise_texture_program,
+    )
+    from synccraft.world.artist_loop import (  # noqa: E402
+        analyze_artist_project,
+        enhance_artist_project_step,
+    )
+    from synccraft.world.exemplars import (  # noqa: E402
+        COLOSSAL_WALKING_CITADEL_DSL,
+        SCULPTED_ELDER_WYVERN_DSL,
+        build_articulated_mechanism_world,
+        build_biological_creature_world,
+        build_colossal_walking_citadel_world,
+        build_sculpted_elder_wyvern_world,
+    )
+    from synccraft.world.trajectory_dataset import (  # noqa: E402
+        decode_record_observation_image,
+        score_world_capability_completion,
+    )
+    from synccraft.world.inverse_inference import (  # noqa: E402
+        APPROVED_NONCOMMERCIAL_RESEARCH_LICENSES,
+        APPROVED_PERMISSIVE_LICENSES,
+        BANNED_PROVENANCE_TOKENS,
+        AssetProvenance,
+        LicenseGateError,
+        scan_text_for_noai_markers,
+        verify_asset_provenance,
+    )
+    from synccraft.world.transitions import (  # noqa: E402
+        ApplyRubbingAction,
+        SetPoseAction,
+        action_from_dict,
+        step_world,
+    )
+    _SYNCCRAFT_AVAILABLE = True
+except ImportError:
+    _SYNCCRAFT_AVAILABLE = False
 
 SYNCCRAFT_TASKS: tuple[str, ...] = (
     "synccraft_part_grounding",

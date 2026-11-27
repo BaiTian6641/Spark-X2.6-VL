@@ -14,6 +14,9 @@ def manifest(directory):
     for p in sorted(directory.rglob('*')):
         if p.is_symlink(): raise ValueError('Artifact symlinks are forbidden')
         if not p.is_file(): continue
+        rel_parts = p.relative_to(directory).parts
+        if '.cache' in rel_parts or '__pycache__' in rel_parts:
+            continue
         name=p.relative_to(directory).as_posix(); safe_relative(name)
         if any(v in name.lower() for v in ('.env','credential','secret','private-upload','token.txt')): raise ValueError('Secret path in artifact')
         files.append({'path':name,'bytes':p.stat().st_size,'sha256':sha(p)})

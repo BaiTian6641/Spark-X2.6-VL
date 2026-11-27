@@ -464,6 +464,8 @@ def _export_stage8_releases(
     for p in radio_dir.rglob("*"):
         if not p.is_file():
             continue
+        if ".cache" in p.relative_to(radio_dir).parts or "__pycache__" in p.parts:
+            continue
         if p.suffix in (".safetensors", ".bin", ".pt", ".tar"):
             continue
         rel = p.relative_to(radio_dir)
